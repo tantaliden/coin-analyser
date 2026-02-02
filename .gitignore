@@ -1,0 +1,20 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Node
+node_modules/
+dist/
+
+# Logs
+logs/
+*.log
+
+# Alt/Backup
+alt/
+
+# IDE
+.vscode/
+.idea/
