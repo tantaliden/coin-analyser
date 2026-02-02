@@ -1,0 +1,355 @@
+"""
+SEARCH ROUTES - Event Search, Candles
+"""
+
+import json
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Optional, List
+import pytz
+from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Depends, Query
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from shared.database import get_coins_db, get_app_db
+from auth.auth import get_current_user
+
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+with open(ROOT_DIR / 'settings.json') as f:
+    SETTINGS = json.load(f)
+
+BERLIN_TZ = pytz.timezone('Europe/Berlin')
+ALLOWED_DURATIONS = [30, 60, 90, 120, 180, 240, 300, 330, 360, 420, 480, 540, 600]
+
+router = APIRouter(prefix="/api/v1/search", tags=["search"])
+
+# === MODELS ===
+
+class EventSearchRequest(BaseModel):
+    symbols: Optional[List[str]] = None
+    start_date: str
+    end_date: str
+    target_percent: float = Field(default=5.0, ge=0.1, le=100.0)
+    duration_minutes: int = Field(default=120, ge=10, le=1440)
+    search_interval: str = Field(default="1m")
+    direction: str = Field(default="up")
+    limit: Optional[int] = Field(default=None, ge=1, le=100000)
+    offset: int = Field(default=0, ge=0)
+
+# === HELPERS ===
+
+def get_table_for_interval(interval: str) -> str:
+    mapping = {
+        '1m': 'klines', '2m': 'agg_2m', '5m': 'agg_5m', '10m': 'agg_10m',
+        '15m': 'agg_15m', '30m': 'agg_30m', '1h': 'agg_1h', '2h': 'agg_2h',
+        '4h': 'agg_4h', '6h': 'agg_6h', '12h': 'agg_12h', '1d': 'agg_1d',
+        '3d': 'agg_3d', '7d': 'agg_7d', '14d': 'agg_14d', '30d': 'agg_30d',
+        '1mo': 'agg_1mo', '2mo': 'agg_2mo', '3mo': 'agg_3mo', '6mo': 'agg_6mo',
+        '1y': 'agg_1y', '2y': 'agg_2y', '3y': 'agg_3y',
+    }
+    return mapping.get(interval, 'klines')
+
+# === ROUTES ===
+
+@router.get("/events")
+async def search_events_get(
+    duration_minutes: int = 120,
+    min_percent: float = 5.0,
+    max_percent: float = 100.0,
+    direction: str = "up",
+    groups: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 10000,
+    current_user: dict = Depends(get_current_user)
+):
+    if not start_date:
+        start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    if not end_date:
+        end_date = datetime.now().strftime("%Y-%m-%d")
+    
+    try:
+        if 'T' in start_date:
+            start_date = start_date.split('T')[0]
+        if 'T' in end_date:
+            end_date = end_date.split('T')[0]
+        start_dt = BERLIN_TZ.localize(datetime.strptime(start_date, "%Y-%m-%d"))
+        end_dt = BERLIN_TZ.localize(datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date format: {e}")
+    
+    if duration_minutes not in ALLOWED_DURATIONS:
+        raise HTTPException(status_code=400, detail=f"Invalid duration_minutes. Allowed: {ALLOWED_DURATIONS}")
+    
+    if direction not in ['up', 'down', 'both']:
+        raise HTTPException(status_code=400, detail="direction must be 'up', 'down', or 'both'")
+    
+    symbols = []
+    if groups:
+        group_ids = [int(g) for g in groups.split(',') if g.strip().isdigit()]
+        if group_ids:
+            with get_app_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT DISTINCT symbol FROM coin_group_items WHERE group_id = ANY(%s)", (group_ids,))
+                    symbols = [row['symbol'] for row in cur.fetchall()]
+    
+    pct_column = f"pct_{duration_minutes}m"
+    events = []
+    
+    with get_coins_db() as conn:
+        with conn.cursor() as cur:
+            if not symbols:
+                cur.execute("SELECT DISTINCT symbol FROM kline_metrics ORDER BY symbol")
+                symbols = [row['symbol'] for row in cur.fetchall()]
+            
+            for symbol in symbols:
+                if len(events) >= limit:
+                    break
+                
+                if direction == 'up':
+                    query = f"""
+                        SELECT open_time, {pct_column} as change_pct FROM kline_metrics
+                        WHERE symbol = %s AND open_time >= %s AND open_time < %s
+                          AND {pct_column} >= %s AND {pct_column} <= %s AND {pct_column} IS NOT NULL
+                        ORDER BY open_time
+                    """
+                    cur.execute(query, (symbol, start_dt, end_dt, min_percent, max_percent))
+                elif direction == 'down':
+                    query = f"""
+                        SELECT open_time, {pct_column} as change_pct FROM kline_metrics
+                        WHERE symbol = %s AND open_time >= %s AND open_time < %s
+                          AND {pct_column} <= %s AND {pct_column} >= %s AND {pct_column} IS NOT NULL
+                        ORDER BY open_time
+                    """
+                    cur.execute(query, (symbol, start_dt, end_dt, -min_percent, -max_percent))
+                else:
+                    query = f"""
+                        SELECT open_time, {pct_column} as change_pct FROM kline_metrics
+                        WHERE symbol = %s AND open_time >= %s AND open_time < %s
+                          AND (({pct_column} >= %s AND {pct_column} <= %s) OR ({pct_column} <= %s AND {pct_column} >= %s))
+                          AND {pct_column} IS NOT NULL
+                        ORDER BY open_time
+                    """
+                    cur.execute(query, (symbol, start_dt, end_dt, min_percent, max_percent, -min_percent, -max_percent))
+                
+                hits = cur.fetchall()
+                if not hits:
+                    continue
+                
+                last_event_end = None
+                for hit in hits:
+                    if len(events) >= limit:
+                        break
+                    
+                    event_end_time = hit['open_time']
+                    event_start_time = event_end_time - timedelta(minutes=duration_minutes)
+                    
+                    event_start_berlin = event_start_time.astimezone(BERLIN_TZ) if event_start_time.tzinfo else BERLIN_TZ.localize(event_start_time)
+                    if event_start_berlin < start_dt or event_start_berlin > end_dt:
+                        continue
+                    
+                    if last_event_end and event_start_time < last_event_end:
+                        continue
+                    
+                    events.append({
+                        "id": f"{symbol}_{event_start_time.strftime('%Y%m%d%H%M')}",
+                        "symbol": symbol,
+                        "event_start": event_start_time.isoformat(),
+                        "event_end": event_end_time.isoformat(),
+                        "change_percent": round(float(hit['change_pct']), 2),
+                        "duration_minutes": duration_minutes,
+                        "direction": direction
+                    })
+                    last_event_end = event_end_time
+    
+    return {
+        "results": events,
+        "total": len(events),
+        "filters": {"duration_minutes": duration_minutes, "min_percent": min_percent, "max_percent": max_percent,
+                    "direction": direction, "start_date": start_date, "end_date": end_date}
+    }
+
+@router.post("/events")
+async def search_events(request: EventSearchRequest, current_user: dict = Depends(get_current_user)):
+    if request.duration_minutes not in ALLOWED_DURATIONS:
+        raise HTTPException(status_code=400, detail=f"Invalid duration_minutes. Allowed: {ALLOWED_DURATIONS}")
+    
+    if request.direction not in ['up', 'down']:
+        raise HTTPException(status_code=400, detail="direction must be 'up' or 'down'")
+    
+    try:
+        start_dt = BERLIN_TZ.localize(datetime.strptime(request.start_date, "%Y-%m-%d"))
+        end_dt = BERLIN_TZ.localize(datetime.strptime(request.end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    
+    pct_column = f"pct_{request.duration_minutes}m"
+    events = []
+    
+    with get_coins_db() as conn:
+        with conn.cursor() as cur:
+            if request.symbols:
+                symbols = request.symbols
+            else:
+                cur.execute("SELECT DISTINCT symbol FROM kline_metrics ORDER BY symbol")
+                symbols = [row['symbol'] for row in cur.fetchall()]
+            
+            for symbol in symbols:
+                if request.limit and len(events) >= request.limit + request.offset:
+                    break
+                
+                if request.direction == 'up':
+                    query = f"""
+                        SELECT open_time, {pct_column} as change_pct FROM kline_metrics
+                        WHERE symbol = %s AND open_time >= %s AND open_time < %s
+                          AND {pct_column} >= %s AND {pct_column} IS NOT NULL
+                        ORDER BY open_time
+                    """
+                    cur.execute(query, (symbol, start_dt, end_dt, request.target_percent))
+                else:
+                    query = f"""
+                        SELECT open_time, {pct_column} as change_pct FROM kline_metrics
+                        WHERE symbol = %s AND open_time >= %s AND open_time < %s
+                          AND {pct_column} <= %s AND {pct_column} IS NOT NULL
+                        ORDER BY open_time
+                    """
+                    cur.execute(query, (symbol, start_dt, end_dt, -request.target_percent))
+                
+                hits = cur.fetchall()
+                if not hits:
+                    continue
+                
+                last_event_end = None
+                for hit in hits:
+                    if request.limit and len(events) >= request.limit + request.offset:
+                        break
+                    
+                    event_end_time = hit['open_time']
+                    event_start_time = event_end_time - timedelta(minutes=request.duration_minutes)
+                    
+                    event_start_berlin = event_start_time.astimezone(BERLIN_TZ) if event_start_time.tzinfo else BERLIN_TZ.localize(event_start_time)
+                    if event_start_berlin < start_dt or event_start_berlin > end_dt:
+                        continue
+                    
+                    if last_event_end and event_start_time < last_event_end:
+                        continue
+                    
+                    cur.execute("""
+                        SELECT open_time, open, high, low, close, volume, trades
+                        FROM klines WHERE symbol = %s AND interval = '1m'
+                          AND open_time >= %s AND open_time <= %s
+                        ORDER BY open_time
+                    """, (symbol, event_start_time, event_end_time))
+                    
+                    candles = cur.fetchall()
+                    if len(candles) < 2:
+                        continue
+                    
+                    start_price = float(candles[0]['open'])
+                    end_price = float(candles[-1]['close'])
+                    if start_price == 0:
+                        continue
+                    
+                    total_volume = sum(float(c['volume']) for c in candles)
+                    trades_count = sum(int(c['trades'] or 0) for c in candles)
+                    
+                    max_price = max(float(c['high']) for c in candles)
+                    min_price = min(float(c['low']) for c in candles)
+                    volatility_pct = ((max_price - min_price) / start_price) * 100 if start_price > 0 else 0
+                    
+                    running_max = float(candles[0]['high'])
+                    max_drawdown = 0.0
+                    for c in candles:
+                        if float(c['high']) > running_max:
+                            running_max = float(c['high'])
+                        drawdown = ((running_max - float(c['low'])) / running_max) * 100 if running_max > 0 else 0
+                        if drawdown > max_drawdown:
+                            max_drawdown = drawdown
+                    
+                    events.append({
+                        "id": f"{symbol}_{candles[0]['open_time'].strftime('%Y%m%d%H%M')}",
+                        "symbol": symbol,
+                        "event_start": candles[0]['open_time'].astimezone(BERLIN_TZ).strftime('%Y-%m-%d %H:%M'),
+                        "event_end": candles[-1]['open_time'].astimezone(BERLIN_TZ).strftime('%Y-%m-%d %H:%M'),
+                        "start_price": start_price,
+                        "end_price": end_price,
+                        "change_percent": round(float(hit['change_pct']), 2),
+                        "duration_minutes": request.duration_minutes,
+                        "volume": round(total_volume, 2),
+                        "trades_count": trades_count,
+                        "volatility_pct": round(volatility_pct, 2),
+                        "max_drawdown_pct": round(max_drawdown, 2),
+                        "candles_count": len(candles),
+                        "avg_volume_per_candle": round(total_volume / len(candles), 2)
+                    })
+                    last_event_end = event_end_time
+    
+    if request.direction == 'up':
+        events.sort(key=lambda x: x['change_percent'], reverse=True)
+    else:
+        events.sort(key=lambda x: x['change_percent'], reverse=False)
+    
+    total = len(events)
+    if request.limit:
+        events = events[request.offset:request.offset + request.limit]
+    elif request.offset:
+        events = events[request.offset:]
+    
+    return {
+        "events": events, "total": total, "limit": request.limit, "offset": request.offset,
+        "parameters": {"start_date": request.start_date, "end_date": request.end_date,
+                       "target_percent": request.target_percent, "duration_minutes": request.duration_minutes,
+                       "direction": request.direction}
+    }
+
+@router.get("/candles")
+async def get_candles(
+    symbol: str,
+    start: str,
+    end: str,
+    interval: str = "1m",
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+        end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid datetime format")
+    
+    table = get_table_for_interval(interval)
+    time_col = 'open_time' if table == 'klines' else 'bucket'
+    
+    with get_coins_db() as conn:
+        with conn.cursor() as cur:
+            if table == 'klines':
+                query = f"""
+                    SELECT {time_col} as time, open, high, low, close, volume, trades, quote_asset_volume, taker_buy_base, taker_buy_quote
+                    FROM {table} WHERE symbol = %s AND interval = '1m' AND {time_col} >= %s AND {time_col} <= %s
+                    ORDER BY {time_col}
+                """
+            else:
+                query = f"""
+                    SELECT {time_col} as time, open, high, low, close, volume, number_of_trades as trades, quote_asset_volume, taker_buy_base_asset_volume as taker_buy_base, taker_buy_quote_asset_volume as taker_buy_quote
+                    FROM {table} WHERE symbol = %s AND {time_col} >= %s AND {time_col} <= %s
+                    ORDER BY {time_col}
+                """
+            cur.execute(query, (symbol, start_dt, end_dt))
+            rows = cur.fetchall()
+    
+    candles = []
+    for row in rows:
+        candles.append({
+            "time": int(row['time'].timestamp()),
+            "open": float(row['open']),
+            "high": float(row['high']),
+            "low": float(row['low']),
+            "close": float(row['close']),
+            "volume": float(row['volume']),
+            "trades": int(row['trades'] or 0),
+            "quote_asset_volume": float(row['quote_asset_volume'] or 0),
+            "taker_buy_base": float(row['taker_buy_base'] or 0),
+            "taker_buy_quote": float(row['taker_buy_quote'] or 0)
+        })
+    
+    return {"symbol": symbol, "interval": interval, "candles": candles, "count": len(candles)}

@@ -22,7 +22,7 @@ _pools = {}
 def _get_pool(db_name: str) -> ThreadedConnectionPool:
     """Holt oder erstellt Connection Pool für eine DB."""
     if db_name not in _pools:
-        cfg = SETTINGS['databases'][db_name]
+        cfg = SETTINGS['database'][db_name]
         _pools[db_name] = ThreadedConnectionPool(
             minconn=cfg['pool']['min'],
             maxconn=cfg['pool']['max'],
