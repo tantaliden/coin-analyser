@@ -29,7 +29,10 @@ export const useAuthStore = create(
         }
       },
 
-      logout: () => {
+      logout: async () => {
+        try {
+          await api.post('/api/v1/auth/logout')
+        } catch {}
         set({ 
           user: null, 
           accessToken: null, 
@@ -49,6 +52,17 @@ export const useAuthStore = create(
           set({ user: response.data, isAuthenticated: true })
           return true
         } catch {
+          // Token abgelaufen - versuche Refresh
+          const { refreshToken } = get()
+          if (refreshToken) {
+            try {
+              const refreshResponse = await api.post('/api/v1/auth/refresh', null, {
+                params: { refresh_token: refreshToken }
+              })
+              set({ accessToken: refreshResponse.data.access_token })
+              return true
+            } catch {}
+          }
           get().logout()
           return false
         }
