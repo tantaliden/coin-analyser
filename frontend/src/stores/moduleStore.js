@@ -3,34 +3,33 @@ import api from '../utils/api'
 
 const DEFAULT_LAYOUTS = {
   lg: [
-    { i: 'search', x: 0, y: 0, w: 4, h: 12 },
-    { i: 'searchResults', x: 4, y: 0, w: 8, h: 12 },
-    { i: 'chart', x: 0, y: 12, w: 12, h: 16 },
+    { i: 'search', x: 0, y: 0, w: 3, h: 14 },
+    { i: 'searchResults', x: 3, y: 0, w: 9, h: 14 },
+    { i: 'chart', x: 0, y: 14, w: 12, h: 16 },
   ]
 }
 
 const MODULE_DEFAULTS = ['search', 'searchResults', 'chart']
 
+// Nur fertige Module - keine Placeholder!
+const AVAILABLE_MODULES = [
+  { id: 'search', label: 'Suche' },
+  { id: 'searchResults', label: 'Suchergebnisse' },
+  { id: 'chart', label: 'Chart' },
+]
+
 export const useModuleStore = create((set, get) => ({
   activeModules: MODULE_DEFAULTS,
   currentLayout: DEFAULT_LAYOUTS,
-  availableModules: [
-    { id: 'search', label: 'Suche' },
-    { id: 'searchResults', label: 'Suchergebnisse' },
-    { id: 'chart', label: 'Chart' },
-    { id: 'indicators', label: 'Indikatoren' },
-    { id: 'sets', label: 'Indikator-Sets' },
-    { id: 'groups', label: 'Coingruppen' },
-    { id: 'wallet', label: 'Wallet' },
-    { id: 'bot', label: 'Trading Bot' },
-  ],
+  availableModules: AVAILABLE_MODULES,
 
-  // Modul öffnen
   openModule: (moduleId) => {
-    const { activeModules, currentLayout } = get()
+    const { activeModules, currentLayout, availableModules } = get()
+    
+    // Nur registrierte Module erlauben
+    if (!availableModules.find(m => m.id === moduleId)) return
     if (activeModules.includes(moduleId)) return
 
-    // Default Position für neues Modul
     const newLayout = {
       i: moduleId,
       x: 0,
@@ -48,7 +47,6 @@ export const useModuleStore = create((set, get) => ({
     })
   },
 
-  // Modul schließen
   closeModule: (moduleId) => {
     const { activeModules, currentLayout } = get()
     set({
@@ -60,12 +58,10 @@ export const useModuleStore = create((set, get) => ({
     })
   },
 
-  // Layout ändern
   setCurrentLayout: (layouts) => {
     set({ currentLayout: layouts })
   },
 
-  // Layout speichern
   saveLayout: async () => {
     const { currentLayout, activeModules } = get()
     try {
@@ -80,7 +76,6 @@ export const useModuleStore = create((set, get) => ({
     }
   },
 
-  // Layout vom Backend laden
   loadFromBackend: async () => {
     try {
       const response = await api.get('/api/v1/user/layout')
@@ -91,6 +86,7 @@ export const useModuleStore = create((set, get) => ({
         })
       }
     } catch (error) {
+      // Kein Fallback - wenn Backend nicht erreichbar, Default-Layout bleibt
       console.error('Failed to load layout:', error)
     }
   }

@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo } from 'react'
-import { Grid, RefreshCw, BarChart3, TrendingUp } from 'lucide-react'
+import { Grid, RefreshCw, TrendingUp } from 'lucide-react'
 import { useSearchStore } from '../stores/searchStore'
 import { useConfigStore } from '../stores/configStore'
 import api from '../utils/api'
@@ -8,54 +8,67 @@ import { CANDLE_TIMEFRAMES, aggregateCandles, calculateDerivedValues, getEventCo
 
 export default function ChartModule() {
   const { selectedEvents, prehistoryMinutes, setPrehistoryMinutes } = useSearchStore()
-  const { getEventColors } = useConfigStore()
+  const { getTimeframeOptions } = useConfigStore()
 
-  const [mode, setMode] = useState('grid') // grid | overlay
-  const [chartType, setChartType] = useState('line') // line | candle
+  const [mode, setMode] = useState('grid')
+  const [chartType, setChartType] = useState('line')
   const [candleTimeframe, setCandleTimeframe] = useState('1m')
   const [loading, setLoading] = useState(false)
   const [chartData, setChartData] = useState({})
   const [showVolume, setShowVolume] = useState(false)
+  const [error, setError] = useState(null)
 
-  // Events die angezeigt werden (max 32)
   const displayEvents = useMemo(() => selectedEvents.slice(0, 32), [selectedEvents])
 
-  // Daten laden wenn Events sich ändern
   useEffect(() => {
     if (displayEvents.length === 0) {
       setChartData({})
       return
     }
     loadChartData()
-  }, [displayEvents, prehistoryMinutes])
+  }, [displayEvents, prehistoryMinutes, candleTimeframe])
 
   const loadChartData = async () => {
     setLoading(true)
+    setError(null)
     const newData = {}
 
     for (const event of displayEvents) {
       try {
+        // Event-Start parsen und Zeitraum berechnen
+        const eventStart = new Date(event.event_start.replace(' ', 'T'))
+        const start = new Date(eventStart.getTime() - prehistoryMinutes * 60 * 1000)
+        const end = new Date(eventStart.getTime() + event.duration_minutes * 60 * 1000)
+
         const response = await api.get('/api/v1/search/candles', {
           params: {
             symbol: event.symbol,
-            start_time: event.start_time,
-            prehistory_minutes: prehistoryMinutes,
-            duration_minutes: event.duration_minutes,
+            start: start.toISOString(),
+            end: end.toISOString(),
+            interval: candleTimeframe
           }
         })
 
         const candles = response.data.candles || []
-        const tfMinutes = CANDLE_TIMEFRAMES.find(t => t.key === candleTimeframe)?.minutes || 1
-        const aggregated = aggregateCandles(candles, tfMinutes)
-        const withDerived = calculateDerivedValues(aggregated)
+        if (candles.length === 0) continue
+
+        // Relative Zeit berechnen (0 = Event-Start)
+        const eventStartTs = eventStart.getTime() / 1000
+        const withRelativeTime = candles.map(c => ({
+          ...c,
+          relativeTime: c.time - eventStartTs
+        }))
+
+        const withDerived = calculateDerivedValues(withRelativeTime)
 
         newData[event.id] = {
           event,
           candles: withDerived,
-          eventStartTime: event.start_time,
+          eventStartTime: eventStartTs
         }
-      } catch (error) {
-        console.error(`Failed to load candles for ${event.symbol}:`, error)
+      } catch (err) {
+        console.error(`Failed to load candles for ${event.symbol}:`, err)
+        setError(`Fehler beim Laden von ${event.symbol}`)
       }
     }
 
@@ -75,7 +88,6 @@ export default function ChartModule() {
     <div className="h-full flex flex-col">
       {/* Controls */}
       <div className="flex items-center gap-3 p-2 border-b border-gray-700 flex-wrap">
-        {/* Mode Toggle */}
         <div className="flex gap-1">
           <button
             onClick={() => setMode('grid')}
@@ -93,7 +105,6 @@ export default function ChartModule() {
           </button>
         </div>
 
-        {/* Chart Type */}
         <select
           value={chartType}
           onChange={(e) => setChartType(e.target.value)}
@@ -103,7 +114,6 @@ export default function ChartModule() {
           <option value="candle">Kerzen</option>
         </select>
 
-        {/* Timeframe */}
         <select
           value={candleTimeframe}
           onChange={(e) => setCandleTimeframe(e.target.value)}
@@ -114,7 +124,6 @@ export default function ChartModule() {
           ))}
         </select>
 
-        {/* Prehistory */}
         <div className="flex items-center gap-1">
           <span className="text-xs text-gray-400">Vorlauf:</span>
           <input
@@ -128,7 +137,6 @@ export default function ChartModule() {
           <span className="text-xs text-gray-400">min</span>
         </div>
 
-        {/* Volume Toggle */}
         <label className="flex items-center gap-1 text-xs">
           <input
             type="checkbox"
@@ -138,7 +146,6 @@ export default function ChartModule() {
           Volume
         </label>
 
-        {/* Refresh */}
         <button
           onClick={loadChartData}
           disabled={loading}
@@ -152,6 +159,13 @@ export default function ChartModule() {
           {displayEvents.length} Charts
         </span>
       </div>
+
+      {/* Error */}
+      {error && (
+        <div className="p-2 text-red-400 text-sm bg-red-900/30">
+          {error}
+        </div>
+      )}
 
       {/* Chart Grid */}
       <div className="flex-1 overflow-auto p-2">
@@ -176,8 +190,8 @@ export default function ChartModule() {
                     style={{ borderLeftColor: getEventColor(idx), borderLeftWidth: 3 }}
                   >
                     <span className="font-mono font-semibold">{event.symbol}</span>
-                    <span className={event.percent_change >= 0 ? 'text-green-400' : 'text-red-400'}>
-                      {event.percent_change >= 0 ? '+' : ''}{event.percent_change?.toFixed(2)}%
+                    <span className={event.change_percent >= 0 ? 'text-green-400' : 'text-red-400'}>
+                      {event.change_percent >= 0 ? '+' : ''}{event.change_percent?.toFixed(2)}%
                     </span>
                   </div>
                   <ChartCanvas

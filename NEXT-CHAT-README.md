@@ -1,41 +1,59 @@
-# COIN-ANALYSER Status - 02.02.2026
+# COIN-ANALYSER Status - 09.02.2026
 
 ## AKTUELLER STAND
 
-Backend ist FERTIG und läuft auf Port 8002.
+### Backend (Port 8002) ✅
+- Service: coin-analyser-api.service (running)
+- 9 Module: auth, meta, search, groups, coins, indicators, user, wallet, bot
+- 1776 Zeilen total (vs alte main.py mit 4867 Zeilen)
 
-### Getestet und funktioniert:
-- `curl http://localhost:8002/` → OK
-- `curl http://localhost:8002/api/v1/meta/health` → Beide DBs connected
-- `curl http://localhost:8002/api/v1/meta/config` → Config OK
+### Frontend (Port 3002) ✅
+- Service: coin-analyser-frontend.service (running)
+- 23 Dateien, 1355 Zeilen total (vs altes Frontend 7299 Zeilen)
+- Keine Datei über 200 Zeilen (altes ChartModule hatte 1011!)
 
-### Service:
-- Systemd: coin-analyser-api.service (enabled, running)
-- Port: 8002
-- Pfad: /opt/coin/backend/
+### Services laufen:
+```bash
+systemctl status coin-analyser-api coin-analyser-frontend
+```
 
-### GitHub:
-- https://github.com/tantaliden/coin-analyser
-- Letzter Commit: "Backend modules complete"
-
-### Module (alle fertig):
-auth, meta, search, groups, coins, indicators, user, wallet, bot
-
-### Datenbanken:
-- coins (klines) - volker_admin
-- analyser_app (users, indicators) - volker_admin
+### Getestet:
+```bash
+curl http://localhost:8002/api/v1/meta/health  # Backend OK
+curl http://localhost:3002                       # Frontend OK
+```
 
 ## NÄCHSTE SCHRITTE
 
-1. Nginx für coin.tantaliden.de → localhost:8002
-2. Frontend aufsetzen (Port 3002)
-3. Alte analyser-api Services stoppen (Data-Ingestors laufen lassen!)
+1. **Nginx** für coin.tantaliden.de einrichten
+2. **Backend /api/v1/meta/config** Endpoint prüfen (Frontend braucht ihn)
+3. **Module vervollständigen** (Indicators, Sets, Wallet, Bot sind Platzhalter)
 
-## WICHTIGE PFADE
+## STRUKTUR
 
-- Neues Projekt: /opt/coin/
-- Altes Projekt: /opt/analyser/ (READ ONLY)
-- Settings: /opt/coin/settings.json
-- Venv: /opt/coin/venv/
+```
+/opt/coin/
+├── naming.js          # Single Source of Truth
+├── router.js          # Module Loader  
+├── settings.json      # Konfiguration
+├── index.js           # Entry Point
+├── backend/           # 1776 Zeilen, 9 Module
+│   ├── app.py
+│   ├── auth/
+│   ├── meta/
+│   ├── search/
+│   └── ...
+└── frontend/          # 1355 Zeilen, 23 Dateien
+    └── src/
+        ├── components/
+        ├── modules/
+        │   ├── chart/     # ChartCanvas + Utils ausgelagert
+        │   └── ...
+        └── stores/
+```
 
-## 4-FILE PRINZIP EINHALTEN!
+## 4-FILE PRINZIP ✅
+
+Keine Datei über 500 Zeilen im Backend.
+Keine Datei über 200 Zeilen im Frontend.
+Config kommt vom Backend via /api/v1/meta/config.

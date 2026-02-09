@@ -4,6 +4,7 @@ import axios from 'axios'
 export const useConfigStore = create((set, get) => ({
   config: null,
   isLoaded: false,
+  loadError: null,
 
   loadConfig: async () => {
     try {
@@ -19,51 +20,56 @@ export const useConfigStore = create((set, get) => ({
         })
       }
       
-      set({ config, isLoaded: true })
+      set({ config, isLoaded: true, loadError: null })
       return config
     } catch (error) {
-      console.error('Failed to load config:', error)
-      // Fallback-Config
-      set({ 
-        config: { 
-          labels: {}, 
-          ui: {}, 
-          modules: {},
-          klineMetricsDurations: [30, 60, 90, 120, 180, 240, 300, 360, 420, 480, 540, 600]
-        }, 
-        isLoaded: true 
-      })
+      // Kein Fallback - Fehler anzeigen
+      const errorMsg = error.response?.data?.detail || error.message || 'Config konnte nicht geladen werden'
+      set({ config: null, isLoaded: true, loadError: errorMsg })
+      throw error
     }
   },
 
-  // Label Getter
   getLabel: (key, lang = 'de') => {
     const { config } = get()
-    const label = config?.labels?.[key]
+    if (!config?.labels) return key
+    const label = config.labels[key]
     if (!label) return key
     return label[lang] || label.de || key
   },
 
-  // Module Config
-  getModuleConfig: (moduleId) => get().config?.modules?.[moduleId] || {},
+  getModuleConfig: (moduleId) => {
+    const { config } = get()
+    return config?.modules?.[moduleId] || {}
+  },
 
-  // Search Defaults
-  getSearchDefaults: () => get().config?.search || {},
+  getSearchDefaults: () => {
+    const { config } = get()
+    return config?.search || {}
+  },
 
-  // Timeframe Options
-  getTimeframeOptions: () => get().config?.timeframes?.chartOptions || ['1m', '5m', '15m', '1h', '4h', '1d'],
+  getTimeframeOptions: () => {
+    const { config } = get()
+    return config?.timeframes?.chartOptions || ['1m', '5m', '15m', '1h', '4h', '1d']
+  },
 
-  // KLine Metrics Durations (für Event-Suche)
-  getKlineMetricsDurations: () => get().config?.klineMetricsDurations || [30, 60, 90, 120, 180, 240, 300, 360, 420, 480, 540, 600],
+  getKlineMetricsDurations: () => {
+    const { config } = get()
+    return config?.klineMetricsDurations || []
+  },
 
-  // Indicator Fields
-  getIndicatorFields: () => get().config?.indicatorFields || [],
+  getIndicatorFields: () => {
+    const { config } = get()
+    return config?.indicatorFields || []
+  },
 
-  // Event Colors für Charts
-  getEventColors: () => get().config?.eventColors || [
-    '#3b82f6', '#22c55e', '#f59e0b', '#a855f7', '#ef4444', 
-    '#06b6d4', '#f97316', '#ec4899', '#84cc16', '#14b8a6'
-  ],
+  getEventColors: () => {
+    const { config } = get()
+    return config?.eventColors || [
+      '#3b82f6', '#22c55e', '#f59e0b', '#a855f7', '#ef4444', 
+      '#06b6d4', '#f97316', '#ec4899', '#84cc16', '#14b8a6'
+    ]
+  },
 
   getEventColor: (index) => {
     const colors = get().getEventColors()

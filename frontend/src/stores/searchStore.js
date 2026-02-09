@@ -7,8 +7,8 @@ export const useSearchStore = create((set, get) => ({
     direction: 'up',
     targetPercent: 5,
     durationMinutes: 120,
-    dateFrom: null,
-    dateTo: null,
+    startDate: '',
+    endDate: '',
     symbols: [],
     groupId: null
   },
@@ -24,25 +24,29 @@ export const useSearchStore = create((set, get) => ({
   // Chart Einstellungen
   prehistoryMinutes: 720,
 
-  // Suchparameter setzen
   setSearchParams: (params) => {
     set({ searchParams: { ...get().searchParams, ...params } })
   },
 
-  // Suche ausführen
   search: async () => {
     const { searchParams } = get()
     set({ isSearching: true, searchError: null })
+    
+    // Validierung
+    if (!searchParams.startDate || !searchParams.endDate) {
+      set({ searchError: 'Start- und Enddatum erforderlich', isSearching: false })
+      throw new Error('Start- und Enddatum erforderlich')
+    }
     
     try {
       const response = await api.post('/api/v1/search/events', {
         direction: searchParams.direction,
         target_percent: searchParams.targetPercent,
         duration_minutes: searchParams.durationMinutes,
-        date_from: searchParams.dateFrom,
-        date_to: searchParams.dateTo,
+        start_date: searchParams.startDate,
+        end_date: searchParams.endDate,
         symbols: searchParams.symbols.length > 0 ? searchParams.symbols : null,
-        group_id: searchParams.groupId
+        limit: 1000
       })
       
       set({ 
@@ -51,8 +55,9 @@ export const useSearchStore = create((set, get) => ({
       })
       return response.data
     } catch (error) {
+      const errorMsg = error.response?.data?.detail || error.message || 'Suche fehlgeschlagen'
       set({ 
-        searchError: error.response?.data?.detail || 'Suche fehlgeschlagen',
+        searchError: errorMsg,
         isSearching: false,
         results: []
       })
@@ -60,12 +65,10 @@ export const useSearchStore = create((set, get) => ({
     }
   },
 
-  // Events auswählen (für Chart)
   selectEvents: (events) => {
     set({ selectedEvents: events })
   },
 
-  // Event hinzufügen/entfernen
   toggleEvent: (event) => {
     const { selectedEvents } = get()
     const exists = selectedEvents.find(e => e.id === event.id)
@@ -76,12 +79,10 @@ export const useSearchStore = create((set, get) => ({
     }
   },
 
-  // Prehistory für Chart
   setPrehistoryMinutes: (minutes) => {
     set({ prehistoryMinutes: minutes })
   },
 
-  // State zurücksetzen
   clearResults: () => {
     set({ results: [], selectedEvents: [], searchError: null })
   }

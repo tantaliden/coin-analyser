@@ -5,7 +5,7 @@ import { formatPercent, formatDateTime, formatVolume } from '../utils/format'
 
 export default function SearchResultsModule() {
   const { results, selectedEvents, toggleEvent, selectEvents } = useSearchStore()
-  const [sortField, setSortField] = useState('percent_change')
+  const [sortField, setSortField] = useState('change_percent')
   const [sortDir, setSortDir] = useState('desc')
 
   const sortedResults = useMemo(() => {
@@ -33,7 +33,7 @@ export default function SearchResultsModule() {
     if (allSelected) {
       selectEvents([])
     } else {
-      selectEvents(results.slice(0, 32)) // Max 32 für Charts
+      selectEvents(results.slice(0, 32))
     }
   }
 
@@ -70,9 +70,9 @@ export default function SearchResultsModule() {
             </th>
             <th 
               className="p-2 text-right cursor-pointer hover:text-blue-400"
-              onClick={() => handleSort('percent_change')}
+              onClick={() => handleSort('change_percent')}
             >
-              % <SortIcon field="percent_change" />
+              % <SortIcon field="change_percent" />
             </th>
             <th 
               className="p-2 text-right cursor-pointer hover:text-blue-400"
@@ -84,13 +84,13 @@ export default function SearchResultsModule() {
               className="p-2 text-right cursor-pointer hover:text-blue-400"
               onClick={() => handleSort('volume')}
             >
-              Volumen <SortIcon field="volume" />
+              Vol <SortIcon field="volume" />
             </th>
-            <th className="p-2 text-left">Zeit</th>
+            <th className="p-2 text-left">Start</th>
           </tr>
         </thead>
         <tbody>
-          {sortedResults.map((event, idx) => (
+          {sortedResults.map((event) => (
             <tr 
               key={event.id}
               onClick={() => toggleEvent(event)}
@@ -99,17 +99,20 @@ export default function SearchResultsModule() {
               }`}
             >
               <td className="p-2">
-                {isSelected(event) ? <Check size={14} className="text-blue-400" /> : <Square size={14} className="text-gray-500" />}
+                {isSelected(event) 
+                  ? <Check size={14} className="text-blue-400" /> 
+                  : <Square size={14} className="text-gray-500" />
+                }
               </td>
               <td className="p-2 font-mono">{event.symbol}</td>
               <td className={`p-2 text-right font-mono ${
-                event.percent_change >= 0 ? 'text-green-400' : 'text-red-400'
+                event.change_percent >= 0 ? 'text-green-400' : 'text-red-400'
               }`}>
-                {formatPercent(event.percent_change)}
+                {formatPercent(event.change_percent)}
               </td>
               <td className="p-2 text-right">{event.duration_minutes}m</td>
               <td className="p-2 text-right font-mono">{formatVolume(event.volume)}</td>
-              <td className="p-2 text-gray-400">{formatDateTime(event.start_time)}</td>
+              <td className="p-2 text-gray-400 text-xs">{event.event_start}</td>
             </tr>
           ))}
         </tbody>

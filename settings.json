@@ -11,7 +11,8 @@
       "origins": [
         "http://localhost:3002",
         "http://217.154.192.66:3002",
-        "https://coin.tantaliden.de"
+        "http://tresor.tantaliden.com",
+        "https://tresor.tantaliden.com"
       ]
     }
   },
