@@ -6,24 +6,35 @@ import Taskbar from './Taskbar'
 import ModuleWrapper from './ModuleWrapper'
 import { useModuleStore } from '../stores/moduleStore'
 
-// Nur fertige Module importieren
+// Alle Module importieren
 import SearchModule from '../modules/SearchModule'
 import SearchResultsModule from '../modules/SearchResultsModule'
 import ChartModule from '../modules/ChartModule'
+import IndicatorsModule from '../modules/indicators/IndicatorsModule'
+import GroupsModule from '../modules/groups/GroupsModule'
+import WalletModule from '../modules/wallet/WalletModule'
+import BotModule from '../modules/bot/BotModule'
 
 const ResponsiveGridLayout = WidthProvider(Responsive)
 
-// Nur fertige Module registrieren
 const MODULE_COMPONENTS = {
   search: SearchModule,
   searchResults: SearchResultsModule,
   chart: ChartModule,
+  indicators: IndicatorsModule,
+  groups: GroupsModule,
+  wallet: WalletModule,
+  bot: BotModule,
 }
 
 const MODULE_TITLES = {
   search: 'Suche',
   searchResults: 'Suchergebnisse',
   chart: 'Chart',
+  indicators: 'Indikatoren',
+  groups: 'Coin-Gruppen',
+  wallet: 'Wallet',
+  bot: 'Trading Bot',
 }
 
 export default function Dashboard() {

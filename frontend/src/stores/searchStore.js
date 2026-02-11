@@ -2,26 +2,20 @@ import { create } from 'zustand'
 import api from '../utils/api'
 
 export const useSearchStore = create((set, get) => ({
-  // Suchparameter
   searchParams: {
     direction: 'up',
     targetPercent: 5,
+    maxPercent: 100,
     durationMinutes: 120,
     startDate: '',
     endDate: '',
-    symbols: [],
-    groupId: null
+    groupIds: []
   },
-  
-  // Suchergebnisse
+
   results: [],
   isSearching: false,
   searchError: null,
-  
-  // Ausgewählte Events für Chart
   selectedEvents: [],
-  
-  // Chart Einstellungen
   prehistoryMinutes: 720,
 
   setSearchParams: (params) => {
@@ -31,36 +25,36 @@ export const useSearchStore = create((set, get) => ({
   search: async () => {
     const { searchParams } = get()
     set({ isSearching: true, searchError: null })
-    
-    // Validierung
+
     if (!searchParams.startDate || !searchParams.endDate) {
       set({ searchError: 'Start- und Enddatum erforderlich', isSearching: false })
       throw new Error('Start- und Enddatum erforderlich')
     }
-    
+
     try {
-      const response = await api.post('/api/v1/search/events', {
+      const params = {
         direction: searchParams.direction,
-        target_percent: searchParams.targetPercent,
+        min_percent: searchParams.targetPercent,
+        max_percent: searchParams.maxPercent || 100,
         duration_minutes: searchParams.durationMinutes,
         start_date: searchParams.startDate,
         end_date: searchParams.endDate,
-        symbols: searchParams.symbols.length > 0 ? searchParams.symbols : null,
-        limit: 1000
-      })
-      
-      set({ 
-        results: response.data.events || [], 
-        isSearching: false 
+        limit: 10000
+      }
+      if (searchParams.groupIds?.length > 0) {
+        params.groups = searchParams.groupIds.join(',')
+      }
+
+      const response = await api.get('/api/v1/search/events', { params })
+
+      set({
+        results: response.data.results || [],
+        isSearching: false
       })
       return response.data
     } catch (error) {
       const errorMsg = error.response?.data?.detail || error.message || 'Suche fehlgeschlagen'
-      set({ 
-        searchError: errorMsg,
-        isSearching: false,
-        results: []
-      })
+      set({ searchError: errorMsg, isSearching: false, results: [] })
       throw error
     }
   },
@@ -75,6 +69,7 @@ export const useSearchStore = create((set, get) => ({
     if (exists) {
       set({ selectedEvents: selectedEvents.filter(e => e.id !== event.id) })
     } else {
+      if (selectedEvents.length >= 32) return
       set({ selectedEvents: [...selectedEvents, event] })
     }
   },

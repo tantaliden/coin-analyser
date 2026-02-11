@@ -11,11 +11,15 @@ const DEFAULT_LAYOUTS = {
 
 const MODULE_DEFAULTS = ['search', 'searchResults', 'chart']
 
-// Nur fertige Module - keine Placeholder!
+// Alle Module - Labels aus naming.js über config
 const AVAILABLE_MODULES = [
   { id: 'search', label: 'Suche' },
   { id: 'searchResults', label: 'Suchergebnisse' },
   { id: 'chart', label: 'Chart' },
+  { id: 'indicators', label: 'Indikatoren' },
+  { id: 'groups', label: 'Coin-Gruppen' },
+  { id: 'wallet', label: 'Wallet' },
+  { id: 'bot', label: 'Trading Bot' },
 ]
 
 export const useModuleStore = create((set, get) => ({
@@ -25,18 +29,11 @@ export const useModuleStore = create((set, get) => ({
 
   openModule: (moduleId) => {
     const { activeModules, currentLayout, availableModules } = get()
-    
-    // Nur registrierte Module erlauben
     if (!availableModules.find(m => m.id === moduleId)) return
     if (activeModules.includes(moduleId)) return
 
-    const newLayout = {
-      i: moduleId,
-      x: 0,
-      y: Math.max(...(currentLayout.lg?.map(l => l.y + l.h) || [0]), 0),
-      w: 6,
-      h: 10
-    }
+    const maxY = Math.max(...(currentLayout.lg?.map(l => l.y + l.h) || [0]), 0)
+    const newLayout = { i: moduleId, x: 0, y: maxY, w: 6, h: 12 }
 
     set({
       activeModules: [...activeModules, moduleId],
@@ -65,9 +62,8 @@ export const useModuleStore = create((set, get) => ({
   saveLayout: async () => {
     const { currentLayout, activeModules } = get()
     try {
-      await api.post('/api/v1/user/layout', { 
-        layout: currentLayout, 
-        activeModules 
+      await api.put('/api/v1/user/state', {
+        module_layouts: currentLayout.lg || []
       })
       return true
     } catch (error) {
@@ -78,15 +74,18 @@ export const useModuleStore = create((set, get) => ({
 
   loadFromBackend: async () => {
     try {
-      const response = await api.get('/api/v1/user/layout')
-      if (response.data?.layout) {
+      const response = await api.get('/api/v1/user/state')
+      const layouts = response.data?.module_layouts
+      if (layouts && Array.isArray(layouts) && layouts.length > 0) {
+        const moduleIds = layouts.map(l => l.i).filter(id =>
+          AVAILABLE_MODULES.some(m => m.id === id)
+        )
         set({
-          currentLayout: response.data.layout,
-          activeModules: response.data.activeModules || MODULE_DEFAULTS
+          currentLayout: { lg: layouts },
+          activeModules: moduleIds.length > 0 ? moduleIds : MODULE_DEFAULTS
         })
       }
     } catch (error) {
-      // Kein Fallback - wenn Backend nicht erreichbar, Default-Layout bleibt
       console.error('Failed to load layout:', error)
     }
   }
