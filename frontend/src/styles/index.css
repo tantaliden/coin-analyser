@@ -94,3 +94,31 @@ input:focus, select:focus, button:focus {
 .input:focus {
   border-color: var(--color-accent-blue);
 }
+
+/* === Resize Handles auf allen Kanten === */
+.react-grid-item > .react-resizable-handle {
+  position: absolute;
+  z-index: 10;
+}
+
+/* Ecken */
+.react-grid-item > .react-resizable-handle-se { bottom: 0; right: 0; cursor: se-resize; width: 12px; height: 12px; }
+.react-grid-item > .react-resizable-handle-sw { bottom: 0; left: 0; cursor: sw-resize; width: 12px; height: 12px; }
+.react-grid-item > .react-resizable-handle-ne { top: 0; right: 0; cursor: ne-resize; width: 12px; height: 12px; }
+.react-grid-item > .react-resizable-handle-nw { top: 0; left: 0; cursor: nw-resize; width: 12px; height: 12px; }
+
+/* Kanten */
+.react-grid-item > .react-resizable-handle-e { right: 0; top: 0; height: 100%; width: 6px; cursor: e-resize; }
+.react-grid-item > .react-resizable-handle-w { left: 0; top: 0; height: 100%; width: 6px; cursor: w-resize; }
+.react-grid-item > .react-resizable-handle-n { top: 0; left: 0; width: 100%; height: 6px; cursor: n-resize; }
+.react-grid-item > .react-resizable-handle-s { bottom: 0; left: 0; width: 100%; height: 6px; cursor: s-resize; }
+
+/* Hover-Effekt */
+.react-grid-item > .react-resizable-handle:hover {
+  background: rgba(59, 130, 246, 0.3);
+}
+
+/* Default SVG-Icon entfernen */
+.react-grid-item > .react-resizable-handle::after {
+  content: none !important;
+}

@@ -1,86 +1,86 @@
 {
-    "app": {
-        "name": "Coin-Analyser",
-        "version": "2.0.0",
-        "environment": "production",
-        "debug": false
+  "app": {
+    "name": "Coin-Analyser",
+    "version": "2.0.0",
+    "environment": "production",
+    "debug": false
+  },
+  "server": {
+    "api": {
+      "host": "0.0.0.0",
+      "port": 8002
     },
-    "server": {
-        "api": {
-            "host": "0.0.0.0",
-            "port": 8002
-        },
-        "frontend": {
-            "host": "0.0.0.0",
-            "port": 3002,
-            "allowedHosts": [
-                "tresor.tantaliden.com",
-                "localhost",
-                "217.154.192.66"
-            ]
-        },
-        "cors": {
-            "origins": [
-                "http://localhost:3002",
-                "http://217.154.192.66:3002",
-                "http://tresor.tantaliden.com",
-                "https://tresor.tantaliden.com"
-            ]
-        }
+    "frontend": {
+      "host": "0.0.0.0",
+      "port": 3002,
+      "allowedHosts": [
+        "tresor.tantaliden.com",
+        "localhost",
+        "217.154.192.66"
+      ]
     },
-    "databases": {
-        "coins": {
-            "type": "timescaledb",
-            "host": "localhost",
-            "port": 5432,
-            "name": "coins",
-            "user": "api_reader",
-            "password": "ApiReader2025!Secure",
-            "ssl": false,
-            "pool": {
-                "min": 2,
-                "max": 10
-            }
-        },
-        "app": {
-            "type": "postgres",
-            "host": "localhost",
-            "port": 5432,
-            "name": "analyser_app",
-            "user": "app_user",
-            "password": "AppUser2025!Secure",
-            "ssl": false,
-            "pool": {
-                "min": 2,
-                "max": 10
-            }
-        }
-    },
-    "binance": {
-        "readOnly": true,
-        "liveApiUrl": "https://api.binance.com",
-        "visionApi": "https://data.binance.vision/data/spot",
-        "apiKey": "7UrAjGlMsOlcRwbg9LGp0vRRJ8f5RUJl0xfBtmfVSDkA67jbXgzzSRxoM0kDnE8k",
-        "apiSecret": "OePih1wAHODqo3DZ1sJDIpWI39nDE9m5BjLED9xjs26uGBD8qhWbPw67tFPC8uuC"
-    },
-    "auth": {
-        "jwtSecret": "CHANGE_THIS_TO_A_SECURE_RANDOM_STRING_IN_PRODUCTION_MIN_32_CHARS",
-        "jwtExpiryMinutes": 60,
-        "refreshExpiryDays": 7,
-        "encryptionKey": "mbGAQkIXEkBp3gJP+71gnCih6ZPAcgeC"
-    },
-    "search": {
-        "defaultTargetPercent": 5.0,
-        "defaultDurationMinutes": 120,
-        "defaultDirection": "up"
-    },
-    "trading": {
-        "defaultAmountUsdt": 50,
-        "minAmountUsdt": 11,
-        "defaultMinProbability": 80
-    },
-    "logging": {
-        "level": "info",
-        "apiLog": "/opt/coin/logs/api.log"
+    "cors": {
+      "origins": [
+        "http://localhost:3002",
+        "http://217.154.192.66:3002",
+        "http://tresor.tantaliden.com",
+        "https://tresor.tantaliden.com"
+      ]
     }
+  },
+  "databases": {
+    "coins": {
+      "type": "timescaledb",
+      "host": "localhost",
+      "port": 5432,
+      "name": "coins",
+      "user": "api_reader",
+      "password": "ApiReader2025!Secure",
+      "ssl": false,
+      "pool": {
+        "min": 2,
+        "max": 10
+      }
+    },
+    "app": {
+      "type": "postgres",
+      "host": "localhost",
+      "port": 5432,
+      "name": "analyser_app",
+      "user": "app_user",
+      "password": "AppUser2025!Secure",
+      "ssl": false,
+      "pool": {
+        "min": 2,
+        "max": 10
+      }
+    }
+  },
+  "binance": {
+    "readOnly": true,
+    "liveApiUrl": "https://api.binance.com",
+    "visionApi": "https://data.binance.vision/data/spot",
+    "apiKey": "7UrAjGlMsOlcRwbg9LGp0vRRJ8f5RUJl0xfBtmfVSDkA67jbXgzzSRxoM0kDnE8k",
+    "apiSecret": "OePih1wAHODqo3DZ1sJDIpWI39nDE9m5BjLED9xjs26uGBD8qhWbPw67tFPC8uuC"
+  },
+  "auth": {
+    "jwtSecret": "CHANGE_THIS_TO_A_SECURE_RANDOM_STRING_IN_PRODUCTION_MIN_32_CHARS",
+    "jwtExpiryMinutes": 60,
+    "refreshExpiryDays": 7,
+    "encryptionKey": "default_key_change_me!!!!!"
+  },
+  "search": {
+    "defaultTargetPercent": 5.0,
+    "defaultDurationMinutes": 120,
+    "defaultDirection": "up"
+  },
+  "trading": {
+    "defaultAmountUsdt": 50,
+    "minAmountUsdt": 11,
+    "defaultMinProbability": 80
+  },
+  "logging": {
+    "level": "info",
+    "apiLog": "/opt/coin/logs/api.log"
+  }
 }

@@ -6,7 +6,6 @@ import Taskbar from './Taskbar'
 import ModuleWrapper from './ModuleWrapper'
 import { useModuleStore } from '../stores/moduleStore'
 
-// Alle Module importieren
 import SearchModule from '../modules/SearchModule'
 import SearchResultsModule from '../modules/SearchResultsModule'
 import ChartModule from '../modules/ChartModule'
@@ -18,40 +17,30 @@ import BotModule from '../modules/bot/BotModule'
 const ResponsiveGridLayout = WidthProvider(Responsive)
 
 const MODULE_COMPONENTS = {
-  search: SearchModule,
-  searchResults: SearchResultsModule,
-  chart: ChartModule,
-  indicators: IndicatorsModule,
-  groups: GroupsModule,
-  wallet: WalletModule,
-  bot: BotModule,
+  search: SearchModule, searchResults: SearchResultsModule, chart: ChartModule,
+  indicators: IndicatorsModule, groups: GroupsModule, wallet: WalletModule, bot: BotModule,
 }
 
 const MODULE_TITLES = {
-  search: 'Suche',
-  searchResults: 'Suchergebnisse',
-  chart: 'Chart',
-  indicators: 'Indikatoren',
-  groups: 'Coin-Gruppen',
-  wallet: 'Wallet',
-  bot: 'Trading Bot',
+  search: 'Suche', searchResults: 'Suchergebnisse', chart: 'Chart',
+  indicators: 'Indikatoren', groups: 'Coin-Gruppen', wallet: 'Wallet', bot: 'Trading Bot',
 }
 
 export default function Dashboard() {
-  const { activeModules, currentLayout, setCurrentLayout } = useModuleStore()
+  const { activeModules, currentLayout, setCurrentLayout, isLocked } = useModuleStore()
 
-  const handleLayoutChange = useCallback((_, allLayouts) => {
-    if (allLayouts.lg) {
+  const handleLayoutChange = useCallback((layout, allLayouts) => {
+    if (!isLocked && allLayouts.lg) {
       setCurrentLayout(allLayouts)
     }
-  }, [setCurrentLayout])
+  }, [setCurrentLayout, isLocked])
 
   const filteredLayouts = {
     lg: (currentLayout.lg || []).filter(item => activeModules.includes(item.i))
   }
 
   return (
-    <div className="min-h-screen flex flex-col">
+    <div className="h-screen flex flex-col">
       <Taskbar />
       <main className="flex-1 p-2 overflow-auto">
         <ResponsiveGridLayout
@@ -63,6 +52,9 @@ export default function Dashboard() {
           onLayoutChange={handleLayoutChange}
           draggableHandle=".module-header"
           margin={[8, 8]}
+          isDraggable={!isLocked}
+          isResizable={!isLocked}
+          resizeHandles={['se', 'sw', 'ne', 'nw', 'e', 'w', 'n', 's']}
         >
           {activeModules.map(moduleId => {
             const Component = MODULE_COMPONENTS[moduleId]
