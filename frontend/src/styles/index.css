@@ -95,30 +95,77 @@ input:focus, select:focus, button:focus {
   border-color: var(--color-accent-blue);
 }
 
-/* === Resize Handles auf allen Kanten === */
+
+/* === Resize Handles - alle Kanten voll nutzbar === */
+
+/* Basis: alle Handles unsichtbar aber voll funktional */
 .react-grid-item > .react-resizable-handle {
-  position: absolute;
+  position: absolute !important;
   z-index: 10;
+  opacity: 0;
+  transition: opacity 0.15s;
 }
 
-/* Ecken */
-.react-grid-item > .react-resizable-handle-se { bottom: 0; right: 0; cursor: se-resize; width: 12px; height: 12px; }
-.react-grid-item > .react-resizable-handle-sw { bottom: 0; left: 0; cursor: sw-resize; width: 12px; height: 12px; }
-.react-grid-item > .react-resizable-handle-ne { top: 0; right: 0; cursor: ne-resize; width: 12px; height: 12px; }
-.react-grid-item > .react-resizable-handle-nw { top: 0; left: 0; cursor: nw-resize; width: 12px; height: 12px; }
-
-/* Kanten */
-.react-grid-item > .react-resizable-handle-e { right: 0; top: 0; height: 100%; width: 6px; cursor: e-resize; }
-.react-grid-item > .react-resizable-handle-w { left: 0; top: 0; height: 100%; width: 6px; cursor: w-resize; }
-.react-grid-item > .react-resizable-handle-n { top: 0; left: 0; width: 100%; height: 6px; cursor: n-resize; }
-.react-grid-item > .react-resizable-handle-s { bottom: 0; left: 0; width: 100%; height: 6px; cursor: s-resize; }
-
-/* Hover-Effekt */
-.react-grid-item > .react-resizable-handle:hover {
-  background: rgba(59, 130, 246, 0.3);
+/* Beim Hover über das Grid-Item: Handles sichtbar */
+.react-grid-item:hover > .react-resizable-handle {
+  opacity: 1;
 }
 
-/* Default SVG-Icon entfernen */
+/* SVG-Icon entfernen */
 .react-grid-item > .react-resizable-handle::after {
   content: none !important;
+  display: none !important;
+}
+
+/* Kanten: schmale Streifen über gesamte Länge */
+.react-grid-item > .react-resizable-handle-n {
+  top: 0 !important; left: 0 !important; right: 0 !important;
+  width: 100% !important; height: 6px !important;
+  margin: 0 !important; transform: none !important;
+  cursor: n-resize !important;
+}
+.react-grid-item > .react-resizable-handle-s {
+  bottom: 0 !important; left: 0 !important; right: 0 !important;
+  width: 100% !important; height: 6px !important;
+  margin: 0 !important; transform: none !important;
+  cursor: s-resize !important;
+}
+.react-grid-item > .react-resizable-handle-e {
+  top: 0 !important; right: 0 !important; bottom: 0 !important;
+  width: 6px !important; height: 100% !important;
+  margin: 0 !important; transform: none !important;
+  cursor: e-resize !important;
+}
+.react-grid-item > .react-resizable-handle-w {
+  top: 0 !important; left: 0 !important; bottom: 0 !important;
+  width: 6px !important; height: 100% !important;
+  margin: 0 !important; transform: none !important;
+  cursor: w-resize !important;
+}
+
+/* Ecken: kleine Quadrate */
+.react-grid-item > .react-resizable-handle-se {
+  bottom: 0 !important; right: 0 !important;
+  width: 12px !important; height: 12px !important;
+  transform: none !important; cursor: se-resize !important;
+}
+.react-grid-item > .react-resizable-handle-sw {
+  bottom: 0 !important; left: 0 !important;
+  width: 12px !important; height: 12px !important;
+  transform: none !important; cursor: sw-resize !important;
+}
+.react-grid-item > .react-resizable-handle-ne {
+  top: 0 !important; right: 0 !important;
+  width: 12px !important; height: 12px !important;
+  transform: none !important; cursor: ne-resize !important;
+}
+.react-grid-item > .react-resizable-handle-nw {
+  top: 0 !important; left: 0 !important;
+  width: 12px !important; height: 12px !important;
+  transform: none !important; cursor: nw-resize !important;
+}
+
+/* Hover-Highlight auf Handles */
+.react-grid-item > .react-resizable-handle:hover {
+  background: rgba(59, 130, 246, 0.25) !important;
 }

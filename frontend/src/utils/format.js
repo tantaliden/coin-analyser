@@ -57,3 +57,12 @@ export const formatDateTime = (date) => {
     hour: '2-digit', minute: '2-digit'
   })
 }
+
+// Zahl-Formatierung mit Dezimalstellen
+export const formatNumber = (value, decimals = 2) => {
+  if (value === null || value === undefined) return '-'
+  const num = parseFloat(value)
+  if (isNaN(num)) return '-'
+  if (decimals === 0) return num.toLocaleString('de-DE', { maximumFractionDigits: 0 })
+  return num.toLocaleString('de-DE', { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
+}
