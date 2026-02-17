@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Play, Square, TrendingUp, TrendingDown, Settings, RefreshCw, Trash2, AlertCircle, CheckCircle, XCircle, Clock, Loader2, ArrowUp, ArrowDown, Rocket, X, EyeOff, Eye } from 'lucide-react'
+import { Play, Square, TrendingUp, TrendingDown, Settings, RefreshCw, Trash2, AlertCircle, CheckCircle, XCircle, Clock, Loader2, ArrowUp, ArrowDown } from 'lucide-react'
 import api from '../utils/api'
 
 const STATUS_ICONS = {
@@ -21,7 +21,7 @@ const COLUMNS = [
   { key: 'stop_loss_pct',   label: 'SL%',     width: 44,  align: 'right' },
   { key: 'confidence',      label: 'Conf',    width: 38,  align: 'right' },
   { key: 'detected_at',     label: 'Erkannt', width: 82,  align: 'right' },
-  { key: 'actions',         label: '',        width: 48,  align: 'center', sortable: false },
+  { key: 'actions',         label: '',        width: 24,  align: 'center', sortable: false },
 ]
 
 export default function MomentumModule() {
@@ -33,8 +33,6 @@ export default function MomentumModule() {
   const [activePredictions, setActivePredictions] = useState(0)
   const [loading, setLoading] = useState(false)
   const [statusFilter, setStatusFilter] = useState('')
-  const [hideShort, setHideShort] = useState(false)
-  const [hideTradedFilter, setHideTradedFilter] = useState(true)
   const [showSettings, setShowSettings] = useState(false)
   const [editConfig, setEditConfig] = useState({})
   const [groups, setGroups] = useState([])
@@ -43,10 +41,6 @@ export default function MomentumModule() {
   const [lastUpdate, setLastUpdate] = useState(null)
   const [showOptLog, setShowOptLog] = useState(false)
   const [optLog, setOptLog] = useState([])
-  const [tradeDialog, setTradeDialog] = useState(null)
-  const [tradeLoading, setTradeLoading] = useState(false)
-  const [tradeResult, setTradeResult] = useState(null)
-  const [statsDirection, setStatsDirection] = useState('')
 
   const loadConfig = useCallback(async () => {
     try {
@@ -60,14 +54,12 @@ export default function MomentumModule() {
     try {
       const params = { limit: 200 }
       if (statusFilter) params.status = statusFilter
-      if (hideShort) params.direction = 'long'
-      if (hideTradedFilter) params.hide_traded = true
       const res = await api.get('/api/v1/momentum/predictions', { params })
       setPredictions(res.data.predictions || [])
       setTotalPredictions(res.data.total || 0)
       setLastUpdate(new Date())
     } catch (err) { console.error('Predictions load failed:', err) }
-  }, [statusFilter, hideShort, hideTradedFilter])
+  }, [statusFilter])
 
   const loadStats = useCallback(async () => {
     try {
@@ -97,7 +89,7 @@ export default function MomentumModule() {
     return () => clearInterval(interval)
   }, [loadConfig, loadPredictions, loadStats, loadGroups])
 
-  useEffect(() => { loadPredictions() }, [statusFilter, hideShort, hideTradedFilter])
+  useEffect(() => { loadPredictions() }, [statusFilter])
 
   const toggleScanner = async () => {
     if (!config) return
@@ -128,38 +120,6 @@ export default function MomentumModule() {
   const cancelPrediction = async (id) => {
     try { await api.delete(`/api/v1/momentum/predictions/${id}`); loadPredictions(); loadStats() }
     catch (err) { console.error('Cancel failed:', err) }
-  }
-
-  const openTradeDialog = (prediction) => {
-    setTradeDialog({
-      prediction_id: prediction.prediction_id,
-      symbol: prediction.symbol,
-      direction: prediction.direction,
-      entry_price: prediction.entry_price,
-      current_price: prediction.current_price,
-      take_profit_pct: Number(prediction.take_profit_pct),
-      stop_loss_pct: Number(prediction.stop_loss_pct),
-      confidence: prediction.confidence,
-    })
-    setTradeResult(null)
-  }
-
-  const executeTrade = async () => {
-    if (!tradeDialog) return
-    setTradeLoading(true)
-    setTradeResult(null)
-    try {
-      const res = await api.post(`/api/v1/momentum/trade/${tradeDialog.prediction_id}`, {
-        take_profit_pct: tradeDialog.take_profit_pct,
-        stop_loss_pct: tradeDialog.stop_loss_pct,
-      })
-      setTradeResult({ success: true, data: res.data })
-      loadPredictions()
-    } catch (err) {
-      const msg = err.response?.data?.detail || err.response?.data?.error || err.message
-      setTradeResult({ success: false, error: msg })
-    }
-    setTradeLoading(false)
   }
 
   const handleSort = (key) => {
@@ -206,7 +166,7 @@ export default function MomentumModule() {
 
   const renderCell = (p, col) => {
     switch (col.key) {
-      case 'status': return <span style={{ display: 'flex', justifyContent: 'center' }}>{STATUS_ICONS[p.status]}{p.traded && <span title="Gehandelt" style={{ marginLeft: 2, fontSize: '0.5rem', color: '#f59e0b' }}>$</span>}</span>
+      case 'status': return <span style={{ display: 'flex', justifyContent: 'center' }}>{STATUS_ICONS[p.status]}</span>
       case 'direction': return p.direction === 'long'
         ? <TrendingUp size={13} style={{ color: '#22c55e' }} />
         : <TrendingDown size={13} style={{ color: '#ef4444' }} />
@@ -223,26 +183,12 @@ export default function MomentumModule() {
       case 'stop_loss_pct': return <span style={{ color: '#ef4444' }}>{Number(p.stop_loss_pct).toFixed(1)}</span>
       case 'confidence': return <span>{p.confidence}</span>
       case 'detected_at': return <span style={{ color: 'var(--color-muted)', fontSize: '0.5625rem' }}>{formatTime(p.detected_at)}</span>
-      case 'actions': return p.status === 'active' ? (
-        <span style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
-          {p.direction === 'long' && !p.traded && (
-            <button onClick={() => openTradeDialog(p)} title="An Tradebot übergeben"
-              style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
-              <Rocket size={11} style={{ color: '#3b82f6' }} />
-            </button>
-          )}
-          <button onClick={() => cancelPrediction(p.prediction_id)} title="Löschen"
-            style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
-            <Trash2 size={11} style={{ color: '#ef4444' }} />
-          </button>
-        </span>
-      ) : null
+      case 'actions': return p.status === 'active'
+        ? <button onClick={() => cancelPrediction(p.prediction_id)} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}><Trash2 size={11} style={{ color: '#ef4444' }} /></button>
+        : null
       default: return '-'
     }
   }
-
-  // Stats nach direction filtern
-  const getStatsKey = (period) => statsDirection ? `${statsDirection}_${period}` : period
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 5, fontSize: '0.75rem' }}>
@@ -260,11 +206,6 @@ export default function MomentumModule() {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
           {lastUpdate && <span style={{ fontSize: '0.5625rem', color: 'var(--color-muted)' }}>{lastUpdate.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>}
-          <button onClick={() => setHideShort(!hideShort)} title={hideShort ? 'Short anzeigen' : 'Short ausblenden'}
-            style={{ ...s.btn, background: hideShort ? '#f59e0b' : 'var(--color-bg)', color: hideShort ? '#fff' : 'var(--color-text)' }}>
-            {hideShort ? <Eye size={12} /> : <EyeOff size={12} />}
-            <span style={{ fontSize: '0.5625rem' }}>S</span>
-          </button>
           <button onClick={() => { loadPredictions(); loadStats() }} style={{ ...s.btn, background: 'var(--color-bg)' }}><RefreshCw size={12} /></button>
           <button onClick={() => setShowSettings(!showSettings)} style={{ ...s.btn, background: showSettings ? '#3b82f6' : 'var(--color-bg)', color: showSettings ? '#fff' : 'var(--color-text)' }}><Settings size={12} /></button>
         </div>
@@ -284,6 +225,8 @@ export default function MomentumModule() {
                 {groups.map(g => <option key={g.id || g.group_id} value={g.id || g.group_id}>{g.name}</option>)}
               </select>
             </div>
+
+            {/* TP/SL Modus */}
             <div style={{ gridColumn: '1/-1', borderTop: '1px solid var(--color-border)', paddingTop: 6, marginTop: 2 }}>
               <div style={s.label}>TP/SL Modus</div>
               <div style={{ display: 'flex', gap: 4, marginTop: 3 }}>
@@ -295,32 +238,38 @@ export default function MomentumModule() {
                 ))}
               </div>
             </div>
+
             {editConfig.tp_sl_mode === 'fixed' && <>
               <div><div style={s.label}>TP %</div><input type="number" step="0.5" value={editConfig.fixed_tp_pct || 5} onChange={e => setEditConfig({...editConfig, fixed_tp_pct: parseFloat(e.target.value)})} style={s.input} /></div>
               <div><div style={s.label}>SL %</div><input type="number" step="0.5" value={editConfig.fixed_sl_pct || 2} onChange={e => setEditConfig({...editConfig, fixed_sl_pct: parseFloat(e.target.value)})} style={s.input} /></div>
             </>}
+
             {editConfig.tp_sl_mode === 'range' && <>
               <div><div style={s.label}>TP Min %</div><input type="number" step="0.5" value={editConfig.range_tp_min || 5} onChange={e => setEditConfig({...editConfig, range_tp_min: parseFloat(e.target.value)})} style={s.input} /></div>
               <div><div style={s.label}>TP Max %</div><input type="number" step="0.5" value={editConfig.range_tp_max || 15} onChange={e => setEditConfig({...editConfig, range_tp_max: parseFloat(e.target.value)})} style={s.input} /></div>
               <div><div style={s.label}>SL Min %</div><input type="number" step="0.5" value={editConfig.range_sl_min || 2} onChange={e => setEditConfig({...editConfig, range_sl_min: parseFloat(e.target.value)})} style={s.input} /></div>
               <div><div style={s.label}>SL Max %</div><input type="number" step="0.5" value={editConfig.range_sl_max || 6} onChange={e => setEditConfig({...editConfig, range_sl_max: parseFloat(e.target.value)})} style={s.input} /></div>
             </>}
+
             {editConfig.tp_sl_mode === 'dynamic' && <>
               <div><div style={s.label}>Min. Target %</div><input type="number" step="0.5" value={editConfig.min_target_pct || 5} onChange={e => setEditConfig({...editConfig, min_target_pct: parseFloat(e.target.value)})} style={s.input} /></div>
               <div><div style={s.label}>Max SL %</div><input type="number" step="0.5" value={editConfig.stop_loss_pct || 2} onChange={e => setEditConfig({...editConfig, stop_loss_pct: parseFloat(e.target.value)})} style={s.input} /></div>
             </>}
           </div>
           <button onClick={saveConfig} disabled={loading} style={{ ...s.btn, background: '#3b82f6', color: '#fff', justifyContent: 'center' }}>Speichern</button>
+
+          {/* Optimierungen */}
           <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: 6, marginTop: 2 }}>
             <button onClick={() => { setShowOptLog(!showOptLog); if (!showOptLog) loadOptLog() }}
               style={{ ...s.btn, fontSize: '0.5625rem', background: 'var(--color-surface)', color: 'var(--color-muted)', width: '100%', justifyContent: 'center' }}>
               {showOptLog ? 'Optimierungen ausblenden' : 'Optimierungen anzeigen'}
             </button>
+
             {showOptLog && (
               <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 250, overflow: 'auto' }}>
                 {optLog.length === 0 ? (
                   <div style={{ fontSize: '0.625rem', color: 'var(--color-muted)', textAlign: 'center', padding: 8 }}>
-                    Noch keine Optimierungen. Läuft täglich um 08:00 und 20:00.
+                    Noch keine Optimierungen. Läuft täglich um 08:00 und 20:00 (mind. 10 resolved Predictions nötig).
                   </div>
                 ) : optLog.map(o => (
                   <div key={o.optimization_id} style={{ padding: 6, background: 'var(--color-surface)', borderRadius: 4, border: '1px solid var(--color-border)', fontSize: '0.625rem' }}>
@@ -335,11 +284,18 @@ export default function MomentumModule() {
                     <div style={{ color: 'var(--color-muted)', lineHeight: 1.4 }}>
                       <div>{o.total_predictions} Predictions: {o.total_tp} TP, {o.total_sl} SL, {o.total_expired} Exp → <span style={{ fontWeight: 600 }}>{o.current_hit_rate}%</span></div>
                       {o.best_variant && (
-                        <div style={{ marginTop: 2 }}>Beste: <span style={{ color: '#3b82f6' }}>{o.best_variant.label || JSON.stringify(o.best_variant)}</span> → <span style={{ fontWeight: 600, color: '#22c55e' }}>{o.best_sim_hit_rate}%</span></div>
+                        <div style={{ marginTop: 2 }}>
+                          Beste Variante: <span style={{ color: '#3b82f6' }}>{o.best_variant.label || JSON.stringify(o.best_variant)}</span>
+                          {' → '}<span style={{ fontWeight: 600, color: '#22c55e' }}>{o.best_sim_hit_rate}%</span>
+                          {' '}({o.best_sim_eliminated} eliminiert, {o.best_sim_tp_lost} TP verloren)
+                        </div>
                       )}
                       {o.changes_applied && Object.keys(o.changes_applied).length > 0 && (
-                        <div style={{ marginTop: 2, color: '#f59e0b' }}>Änderungen: {Object.entries(o.changes_applied).map(([k, v]) => `${k}: ${v.old} → ${v.new}`).join(', ')}</div>
+                        <div style={{ marginTop: 2, color: '#f59e0b' }}>
+                          Änderungen: {Object.entries(o.changes_applied).map(([k, v]) => `${k}: ${v.old} → ${v.new}`).join(', ')}
+                        </div>
                       )}
+                      {o.reason && <div style={{ marginTop: 2, fontStyle: 'italic' }}>{o.reason}</div>}
                     </div>
                   </div>
                 ))}
@@ -350,12 +306,12 @@ export default function MomentumModule() {
       )}
 
       {/* Stats Bar */}
-      {stats[getStatsKey('all')] && (
-        <div style={{ display: 'flex', gap: 8, padding: '3px 0', flexWrap: 'wrap', alignItems: 'center' }}>
-          <div><span style={s.label}>Gesamt: </span><span style={s.value}>{stats[getStatsKey('all')].total_predictions}</span></div>
-          <div><span style={s.label}>Treffer: </span><span style={{ ...s.value, color: '#22c55e' }}>{stats[getStatsKey('all')].hit_rate_pct}%</span></div>
-          <div><span style={s.label}>Ø Result: </span><span style={{ ...s.value, color: (stats[getStatsKey('all')].avg_result_pct || 0) >= 0 ? '#22c55e' : '#ef4444' }}>{formatPct(stats[getStatsKey('all')].avg_result_pct)}</span></div>
-          <div><span style={s.label}>Best: </span><span style={{ ...s.value, color: '#22c55e' }}>{formatPct(stats[getStatsKey('all')].best_result_pct)}</span></div>
+      {stats.all && (
+        <div style={{ display: 'flex', gap: 8, padding: '3px 0', flexWrap: 'wrap' }}>
+          <div><span style={s.label}>Gesamt: </span><span style={s.value}>{stats.all.total_predictions}</span></div>
+          <div><span style={s.label}>Treffer: </span><span style={{ ...s.value, color: '#22c55e' }}>{stats.all.hit_rate_pct}%</span></div>
+          <div><span style={s.label}>Ø Result: </span><span style={{ ...s.value, color: (stats.all.avg_result_pct || 0) >= 0 ? '#22c55e' : '#ef4444' }}>{formatPct(stats.all.avg_result_pct)}</span></div>
+          <div><span style={s.label}>Best: </span><span style={{ ...s.value, color: '#22c55e' }}>{formatPct(stats.all.best_result_pct)}</span></div>
         </div>
       )}
 
@@ -377,18 +333,6 @@ export default function MomentumModule() {
         </div>
       )}
 
-      {/* Stats Direction Filter */}
-      {tab === 'stats' && (
-        <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
-          {[['', 'Gesamt'], ['long', 'Long'], ['short', 'Short']].map(([key, label]) => (
-            <button key={key} onClick={() => setStatsDirection(key)}
-              style={{ ...s.btn, background: statsDirection === key ? '#3b82f6' : 'var(--color-bg)', color: statsDirection === key ? '#fff' : 'var(--color-text)', fontSize: '0.5625rem', padding: '2px 5px' }}>
-              {label}
-            </button>
-          ))}
-        </div>
-      )}
-
       {/* Content */}
       <div style={{ flex: 1, overflow: 'auto' }}>
         {tab === 'predictions' && (
@@ -400,18 +344,22 @@ export default function MomentumModule() {
                     {COLUMNS.map(col => (
                       <th key={col.key} onClick={() => col.sortable !== false && handleSort(col.key)}
                         style={{ ...s.th, width: col.width, textAlign: col.align, cursor: col.sortable === false ? 'default' : 'pointer' }}>
-                        <span style={{ display: 'inline-flex', alignItems: 'center' }}>{col.label}<SortIcon col={col.key} /></span>
+                        <span style={{ display: 'inline-flex', alignItems: 'center' }}>
+                          {col.label}<SortIcon col={col.key} />
+                        </span>
                       </th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
                   {sortedPredictions.map(p => (
-                    <tr key={p.prediction_id} style={{ borderBottom: '1px solid var(--color-border)', opacity: p.traded ? 0.5 : 1 }}
+                    <tr key={p.prediction_id} style={{ borderBottom: '1px solid var(--color-border)' }}
                       onMouseEnter={e => e.currentTarget.style.background = 'var(--color-bg)'}
                       onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
                       {COLUMNS.map(col => (
-                        <td key={col.key} style={{ ...s.td, textAlign: col.align, width: col.width }}>{renderCell(p, col)}</td>
+                        <td key={col.key} style={{ ...s.td, textAlign: col.align, width: col.width }}>
+                          {renderCell(p, col)}
+                        </td>
                       ))}
                     </tr>
                   ))}
@@ -422,11 +370,11 @@ export default function MomentumModule() {
         {tab === 'stats' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: 4 }}>
             {['24h', '7d', '30d', 'all'].map(period => {
-              const st = stats[getStatsKey(period)]
+              const st = stats[period]
               if (!st) return <div key={period} style={{ color: 'var(--color-muted)' }}>{period}: Keine Daten</div>
               return (
                 <div key={period} style={{ padding: 8, background: 'var(--color-bg)', borderRadius: 6, border: '1px solid var(--color-border)' }}>
-                  <div style={{ fontWeight: 600, marginBottom: 4 }}>{period}{statsDirection ? ` (${statsDirection})` : ''}</div>
+                  <div style={{ fontWeight: 600, marginBottom: 4 }}>{period}</div>
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 4 }}>
                     <div><span style={s.label}>Total</span><br/><span style={s.value}>{st.total_predictions}</span></div>
                     <div><span style={s.label}>Treffer</span><br/><span style={{ ...s.value, color: '#22c55e' }}>{st.correct_predictions} ({st.hit_rate_pct}%)</span></div>
@@ -441,73 +389,6 @@ export default function MomentumModule() {
           </div>
         )}
       </div>
-
-      {/* Trade Dialog */}
-      {tradeDialog && (
-        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.6)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-          onClick={(e) => { if (e.target === e.currentTarget && !tradeLoading) setTradeDialog(null) }}>
-          <div style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)', borderRadius: 8, padding: 16, width: 320, maxWidth: '90vw' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-              <span style={{ fontWeight: 700, fontSize: '0.875rem' }}>
-                <Rocket size={14} style={{ marginRight: 6, color: '#3b82f6' }} />
-                Trade: {tradeDialog.symbol.replace('USDT', '')}
-              </span>
-              <button onClick={() => !tradeLoading && setTradeDialog(null)} style={{ background: 'none', border: 'none', cursor: 'pointer' }}><X size={16} /></button>
-            </div>
-
-            {tradeResult?.success ? (
-              <div style={{ padding: 12, background: 'rgba(34,197,94,0.1)', borderRadius: 6, border: '1px solid rgba(34,197,94,0.3)' }}>
-                <div style={{ color: '#22c55e', fontWeight: 700, marginBottom: 8 }}>Trade ausgeführt!</div>
-                <div style={{ fontSize: '0.75rem', display: 'flex', flexDirection: 'column', gap: 3 }}>
-                  <div>Gekauft: <b>{tradeResult.data.sell_qty}</b> @ <b>{tradeResult.data.buy_price}</b></div>
-                  <div>Amount: <b>{tradeResult.data.amount_usdt} USDT</b></div>
-                  <div style={{ color: '#22c55e' }}>TP: {tradeResult.data.tp_price} ({tradeResult.data.tp_pct}%)</div>
-                  <div style={{ color: '#ef4444' }}>SL: {tradeResult.data.sl_price} ({tradeResult.data.sl_pct}%)</div>
-                </div>
-                <button onClick={() => setTradeDialog(null)} style={{ ...s.btn, background: 'var(--color-bg)', justifyContent: 'center', width: '100%', marginTop: 10 }}>Schließen</button>
-              </div>
-            ) : (
-              <>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 12 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem' }}>
-                    <span style={s.label}>Entry (aktuell)</span>
-                    <span style={{ fontWeight: 600 }}>{formatPrice(tradeDialog.current_price || tradeDialog.entry_price)}</span>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem' }}>
-                    <span style={s.label}>Confidence</span>
-                    <span style={{ fontWeight: 600 }}>{tradeDialog.confidence}</span>
-                  </div>
-                  <div>
-                    <div style={s.label}>Take Profit %</div>
-                    <input type="number" step="0.5" min="0.5" value={tradeDialog.take_profit_pct}
-                      onChange={e => setTradeDialog({...tradeDialog, take_profit_pct: parseFloat(e.target.value) || 0})} style={s.input} />
-                  </div>
-                  <div>
-                    <div style={s.label}>Stop Loss %</div>
-                    <input type="number" step="0.5" min="0.5" value={tradeDialog.stop_loss_pct}
-                      onChange={e => setTradeDialog({...tradeDialog, stop_loss_pct: parseFloat(e.target.value) || 0})} style={s.input} />
-                  </div>
-                </div>
-
-                {tradeResult?.error && (
-                  <div style={{ padding: 8, background: 'rgba(239,68,68,0.1)', borderRadius: 4, border: '1px solid rgba(239,68,68,0.3)', fontSize: '0.6875rem', color: '#ef4444', marginBottom: 8 }}>
-                    {tradeResult.error}
-                  </div>
-                )}
-
-                <div style={{ display: 'flex', gap: 6 }}>
-                  <button onClick={() => setTradeDialog(null)} disabled={tradeLoading}
-                    style={{ ...s.btn, flex: 1, justifyContent: 'center', background: 'var(--color-bg)' }}>Abbrechen</button>
-                  <button onClick={executeTrade} disabled={tradeLoading}
-                    style={{ ...s.btn, flex: 1, justifyContent: 'center', background: '#22c55e', color: '#fff', fontWeight: 700 }}>
-                    {tradeLoading ? <Loader2 size={14} className="spin" /> : <><Rocket size={14} /> Kaufen</>}
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-      )}
     </div>
   )
 }
