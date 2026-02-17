@@ -44,16 +44,13 @@ async def get_wallet_balance(current_user: dict = Depends(get_current_user)):
         return {"error": "Kein gültiger API Key konfiguriert"}
     try:
         account = client.get_account()
-        usdt_balance, usdc_balance, usdc_free, positions_value = 0.0, 0.0, 0.0, 0.0
+        usdt_balance, positions_value = 0.0, 0.0
         for asset in account.get('balances', []):
             total = float(asset['free']) + float(asset['locked'])
             if total > 0:
                 if asset['asset'] == 'USDT':
                     usdt_balance = total
-                elif asset['asset'] == 'USDC':
-                    usdc_balance = total
-                    usdc_free = float(asset['free'])
-                else:
+                elif asset['asset'] != 'USDC':
                     try:
                         ticker = client.get_symbol_ticker(symbol=f"{asset['asset']}USDT")
                         positions_value += total * float(ticker['price'])
@@ -61,10 +58,8 @@ async def get_wallet_balance(current_user: dict = Depends(get_current_user)):
                         pass
         return {
             "usdt_balance": round(usdt_balance, 2),
-            "usdc_balance": round(usdc_balance, 2),
-            "usdc_free": round(usdc_free, 2),
             "positions_value": round(positions_value, 2),
-            "total_portfolio": round(usdt_balance + usdc_balance + positions_value, 2)
+            "total_portfolio": round(usdt_balance + positions_value, 2)
         }
     except BinanceAPIException as e:
         return {"error": f"Binance API Fehler: {e.message}"}
@@ -282,57 +277,3 @@ async def get_realized_pnl(days: int = 7, current_user: dict = Depends(get_curre
         "total_buys": round(total_buys, 2),
         "period_days": days
     }
-
-
-
-class ConvertRequest(BaseModel):
-    amount: Optional[float] = None  # None = max
-
-
-@router.post("/convert-usdc")
-async def convert_usdc_to_usdt(request: ConvertRequest, current_user: dict = Depends(get_current_user)):
-    """USDC → USDT per Spot Market Sell (USDCUSDT)"""
-    client = get_user_binance_client(current_user['user_id'])
-    if not client:
-        return {"error": "Kein gültiger API Key konfiguriert"}
-    try:
-        # Free USDC Balance holen
-        balance = client.get_asset_balance(asset='USDC')
-        free_usdc = float(balance.get('free', 0)) if balance else 0
-
-        if free_usdc < 5:
-            return {"error": f"Zu wenig USDC verfügbar ({free_usdc:.2f}). Minimum: 5 USDC"}
-
-        # Menge bestimmen (ganze Zahlen, stepSize=1)
-        if request.amount and request.amount > 0:
-            sell_qty = min(int(request.amount), int(free_usdc))
-        else:
-            sell_qty = int(free_usdc)  # Max
-
-        if sell_qty < 5:
-            return {"error": f"Menge {sell_qty} USDC unter Minimum (5)"}
-
-        # Market Sell USDCUSDT = USDC verkaufen, USDT erhalten
-        order = client.create_order(
-            symbol='USDCUSDT',
-            side='SELL',
-            type='MARKET',
-            quantity=sell_qty
-        )
-
-        filled_qty = float(order.get('executedQty', 0))
-        received_usdt = float(order.get('cummulativeQuoteQty', 0))
-
-        print(f"[WALLET] User {current_user['user_id']} converted {filled_qty} USDC → {received_usdt:.2f} USDT")
-
-        return {
-            "status": "success",
-            "usdc_sold": filled_qty,
-            "usdt_received": round(received_usdt, 2),
-            "order_id": order.get('orderId')
-        }
-    except BinanceAPIException as e:
-        return {"error": f"Binance API Fehler: {e.message}"}
-    except Exception as e:
-        print(f"[WALLET] Convert error: {e}")
-        return {"error": str(e)}
