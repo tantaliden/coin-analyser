@@ -19,6 +19,7 @@ const AVAILABLE_MODULES = [
   { id: 'groups', label: 'Coin-Gruppen' },
   { id: 'wallet', label: 'Wallet' },
   { id: 'bot', label: 'Trading Bot' },
+  { id: 'momentum', label: 'Momentum Scanner' },
 ]
 
 export const useModuleStore = create((set, get) => ({

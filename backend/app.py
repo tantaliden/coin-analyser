@@ -35,6 +35,7 @@ from indicators import router as indicators_router
 from user import router as user_router
 from wallet import router as wallet_router
 from bot import router as bot_router
+from momentum import router as momentum_router
 
 # Include routers
 app.include_router(auth_router)
@@ -46,6 +47,7 @@ app.include_router(indicators_router)
 app.include_router(user_router)
 app.include_router(wallet_router)
 app.include_router(bot_router)
+app.include_router(momentum_router)
 
 @app.get("/")
 async def root():

@@ -1,0 +1,394 @@
+import { useState, useEffect, useCallback } from 'react'
+import { Play, Square, TrendingUp, TrendingDown, Settings, RefreshCw, Trash2, AlertCircle, CheckCircle, XCircle, Clock, Loader2, ArrowUp, ArrowDown } from 'lucide-react'
+import api from '../utils/api'
+
+const STATUS_ICONS = {
+  active: <Clock size={13} style={{ color: '#3b82f6' }} />,
+  hit_tp: <CheckCircle size={13} style={{ color: '#22c55e' }} />,
+  hit_sl: <XCircle size={13} style={{ color: '#ef4444' }} />,
+  invalidated: <AlertCircle size={13} style={{ color: '#f59e0b' }} />,
+  expired: <Clock size={13} style={{ color: '#6b7280' }} />
+}
+
+const COLUMNS = [
+  { key: 'status',          label: 'Status',  width: 50,  align: 'center' },
+  { key: 'direction',       label: 'Dir',     width: 32,  align: 'center' },
+  { key: 'symbol',          label: 'Symbol',  width: 80,  align: 'left' },
+  { key: 'entry_price',     label: 'Entry',   width: 76,  align: 'right' },
+  { key: 'current_price',   label: 'Kurs',    width: 76,  align: 'right' },
+  { key: 'current_pct',     label: 'P/L',     width: 54,  align: 'right' },
+  { key: 'take_profit_pct', label: 'TP%',     width: 44,  align: 'right' },
+  { key: 'stop_loss_pct',   label: 'SL%',     width: 44,  align: 'right' },
+  { key: 'confidence',      label: 'Conf',    width: 38,  align: 'right' },
+  { key: 'detected_at',     label: 'Erkannt', width: 82,  align: 'right' },
+  { key: 'actions',         label: '',        width: 24,  align: 'center', sortable: false },
+]
+
+export default function MomentumModule() {
+  const [tab, setTab] = useState('predictions')
+  const [config, setConfig] = useState(null)
+  const [predictions, setPredictions] = useState([])
+  const [totalPredictions, setTotalPredictions] = useState(0)
+  const [stats, setStats] = useState({})
+  const [activePredictions, setActivePredictions] = useState(0)
+  const [loading, setLoading] = useState(false)
+  const [statusFilter, setStatusFilter] = useState('')
+  const [showSettings, setShowSettings] = useState(false)
+  const [editConfig, setEditConfig] = useState({})
+  const [groups, setGroups] = useState([])
+  const [sortCol, setSortCol] = useState('detected_at')
+  const [sortDir, setSortDir] = useState('desc')
+  const [lastUpdate, setLastUpdate] = useState(null)
+  const [showOptLog, setShowOptLog] = useState(false)
+  const [optLog, setOptLog] = useState([])
+
+  const loadConfig = useCallback(async () => {
+    try {
+      const res = await api.get('/api/v1/momentum/config')
+      setConfig(res.data)
+      setEditConfig(res.data)
+    } catch (err) { console.error('Config load failed:', err) }
+  }, [])
+
+  const loadPredictions = useCallback(async () => {
+    try {
+      const params = { limit: 200 }
+      if (statusFilter) params.status = statusFilter
+      const res = await api.get('/api/v1/momentum/predictions', { params })
+      setPredictions(res.data.predictions || [])
+      setTotalPredictions(res.data.total || 0)
+      setLastUpdate(new Date())
+    } catch (err) { console.error('Predictions load failed:', err) }
+  }, [statusFilter])
+
+  const loadStats = useCallback(async () => {
+    try {
+      const res = await api.get('/api/v1/momentum/stats')
+      setStats(res.data.stats || {})
+      setActivePredictions(res.data.active_predictions || 0)
+    } catch (err) { console.error('Stats load failed:', err) }
+  }, [])
+
+  const loadGroups = useCallback(async () => {
+    try {
+      const res = await api.get('/api/v1/groups')
+      setGroups(res.data.groups || res.data || [])
+    } catch (err) { console.error('Groups load failed:', err) }
+  }, [])
+
+  const loadOptLog = useCallback(async () => {
+    try {
+      const res = await api.get('/api/v1/momentum/optimizations')
+      setOptLog(res.data || [])
+    } catch (err) { console.error('OptLog load failed:', err) }
+  }, [])
+
+  useEffect(() => {
+    loadConfig(); loadPredictions(); loadStats(); loadGroups()
+    const interval = setInterval(() => { loadPredictions(); loadStats() }, 15000)
+    return () => clearInterval(interval)
+  }, [loadConfig, loadPredictions, loadStats, loadGroups])
+
+  useEffect(() => { loadPredictions() }, [statusFilter])
+
+  const toggleScanner = async () => {
+    if (!config) return
+    setLoading(true)
+    try {
+      const res = await api.put('/api/v1/momentum/config', { is_active: !config.is_active })
+      setConfig(res.data); setEditConfig(res.data)
+    } catch (err) { console.error('Toggle failed:', err) }
+    setLoading(false)
+  }
+
+  const saveConfig = async () => {
+    setLoading(true)
+    try {
+      const updates = {}
+      for (const k of ['idle_seconds','min_target_pct','stop_loss_pct','min_confidence','scan_all_symbols','coin_group_id','tp_sl_mode','fixed_tp_pct','fixed_sl_pct','range_tp_min','range_tp_max','range_sl_min','range_sl_max']) {
+        if (editConfig[k] !== config[k]) updates[k] = editConfig[k]
+      }
+      if (Object.keys(updates).length) {
+        const res = await api.put('/api/v1/momentum/config', updates)
+        setConfig(res.data); setEditConfig(res.data)
+      }
+      setShowSettings(false)
+    } catch (err) { console.error('Save failed:', err) }
+    setLoading(false)
+  }
+
+  const cancelPrediction = async (id) => {
+    try { await api.delete(`/api/v1/momentum/predictions/${id}`); loadPredictions(); loadStats() }
+    catch (err) { console.error('Cancel failed:', err) }
+  }
+
+  const handleSort = (key) => {
+    if (key === 'actions') return
+    if (sortCol === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    else { setSortCol(key); setSortDir('asc') }
+  }
+
+  const sortedPredictions = [...predictions].sort((a, b) => {
+    let va = a[sortCol], vb = b[sortCol]
+    if (sortCol === 'symbol') { va = va || ''; vb = vb || ''; return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va) }
+    if (sortCol === 'detected_at') { va = new Date(va || 0).getTime(); vb = new Date(vb || 0).getTime() }
+    if (sortCol === 'status') { const order = { active: 0, hit_tp: 1, hit_sl: 2, invalidated: 3, expired: 4 }; va = order[va] ?? 5; vb = order[vb] ?? 5 }
+    if (va == null) va = -Infinity; if (vb == null) vb = -Infinity
+    return sortDir === 'asc' ? (va > vb ? 1 : -1) : (va < vb ? 1 : -1)
+  })
+
+  const formatPrice = (p) => {
+    if (p == null) return '-'
+    const n = Number(p)
+    if (n < 0.01) return n.toFixed(8)
+    if (n < 1) return n.toFixed(6)
+    if (n < 100) return n.toFixed(4)
+    return n.toFixed(2)
+  }
+  const formatPct = (p) => p != null ? `${p >= 0 ? '+' : ''}${Number(p).toFixed(1)}%` : '-'
+  const formatTime = (t) => t ? new Date(t).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-'
+
+  const s = {
+    label: { fontSize: '0.6875rem', color: 'var(--color-muted)' },
+    value: { fontSize: '0.8125rem', fontWeight: 600 },
+    input: { width: '100%', padding: '4px 8px', fontSize: '0.75rem', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 4, color: 'var(--color-text)' },
+    select: { width: '100%', padding: '4px 8px', fontSize: '0.75rem', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 4, color: 'var(--color-text)' },
+    btn: { padding: '4px 10px', fontSize: '0.75rem', borderRadius: 4, border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 },
+    tab: (active) => ({ padding: '4px 10px', fontSize: '0.75rem', cursor: 'pointer', border: 'none', borderBottom: active ? '2px solid #3b82f6' : '2px solid transparent', background: 'none', color: active ? 'var(--color-text)' : 'var(--color-muted)', fontWeight: active ? 600 : 400 }),
+    th: { padding: '3px 4px', fontSize: '0.5625rem', fontWeight: 600, color: 'var(--color-muted)', textTransform: 'uppercase', letterSpacing: '0.03em', cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap', borderBottom: '1px solid var(--color-border)' },
+    td: { padding: '3px 4px', fontSize: '0.6875rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+  }
+
+  const SortIcon = ({ col }) => {
+    if (sortCol !== col) return null
+    return sortDir === 'asc' ? <ArrowUp size={9} style={{ marginLeft: 1 }} /> : <ArrowDown size={9} style={{ marginLeft: 1 }} />
+  }
+
+  const renderCell = (p, col) => {
+    switch (col.key) {
+      case 'status': return <span style={{ display: 'flex', justifyContent: 'center' }}>{STATUS_ICONS[p.status]}</span>
+      case 'direction': return p.direction === 'long'
+        ? <TrendingUp size={13} style={{ color: '#22c55e' }} />
+        : <TrendingDown size={13} style={{ color: '#ef4444' }} />
+      case 'symbol': return <span style={{ fontWeight: 600 }}>{p.symbol.replace('USDT', '')}</span>
+      case 'entry_price': return <span style={{ color: 'var(--color-muted)' }}>{formatPrice(p.entry_price)}</span>
+      case 'current_price': return <span style={{ fontWeight: 500 }}>{formatPrice(p.current_price)}</span>
+      case 'current_pct': {
+        const v = p.current_pct
+        if (v == null) return '-'
+        const color = v > 0 ? '#22c55e' : v < 0 ? '#ef4444' : 'var(--color-muted)'
+        return <span style={{ color, fontWeight: 600 }}>{formatPct(v)}</span>
+      }
+      case 'take_profit_pct': return <span style={{ color: '#22c55e' }}>{Number(p.take_profit_pct).toFixed(1)}</span>
+      case 'stop_loss_pct': return <span style={{ color: '#ef4444' }}>{Number(p.stop_loss_pct).toFixed(1)}</span>
+      case 'confidence': return <span>{p.confidence}</span>
+      case 'detected_at': return <span style={{ color: 'var(--color-muted)', fontSize: '0.5625rem' }}>{formatTime(p.detected_at)}</span>
+      case 'actions': return p.status === 'active'
+        ? <button onClick={() => cancelPrediction(p.prediction_id)} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}><Trash2 size={11} style={{ color: '#ef4444' }} /></button>
+        : null
+      default: return '-'
+    }
+  }
+
+  return (
+    <div style={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 5, fontSize: '0.75rem' }}>
+      
+      {/* Header */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <button onClick={toggleScanner} disabled={loading}
+            style={{ ...s.btn, background: config?.is_active ? '#ef4444' : '#22c55e', color: '#fff' }}>
+            {loading ? <Loader2 size={14} className="spin" /> : config?.is_active ? <><Square size={14} /> Stop</> : <><Play size={14} /> Start</>}
+          </button>
+          <span style={{ fontSize: '0.625rem', color: config?.is_active ? '#22c55e' : 'var(--color-muted)' }}>
+            {config?.is_active ? `Scannt (${activePredictions} aktiv)` : 'Gestoppt'}
+          </span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          {lastUpdate && <span style={{ fontSize: '0.5625rem', color: 'var(--color-muted)' }}>{lastUpdate.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>}
+          <button onClick={() => { loadPredictions(); loadStats() }} style={{ ...s.btn, background: 'var(--color-bg)' }}><RefreshCw size={12} /></button>
+          <button onClick={() => setShowSettings(!showSettings)} style={{ ...s.btn, background: showSettings ? '#3b82f6' : 'var(--color-bg)', color: showSettings ? '#fff' : 'var(--color-text)' }}><Settings size={12} /></button>
+        </div>
+      </div>
+
+      {/* Settings */}
+      {showSettings && (
+        <div style={{ padding: 8, background: 'var(--color-bg)', borderRadius: 6, border: '1px solid var(--color-border)', display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+            <div><div style={s.label}>Min. Confidence</div><input type="number" value={editConfig.min_confidence || 60} onChange={e => setEditConfig({...editConfig, min_confidence: parseInt(e.target.value)})} style={s.input} /></div>
+            <div><div style={s.label}>Idle (Sek.)</div><input type="number" value={editConfig.idle_seconds || 60} onChange={e => setEditConfig({...editConfig, idle_seconds: parseInt(e.target.value)})} style={s.input} /></div>
+            <div style={{ gridColumn: '1/-1' }}>
+              <div style={s.label}>Coin-Gruppe</div>
+              <select value={editConfig.scan_all_symbols ? 'all' : (editConfig.coin_group_id || 'all')}
+                onChange={e => { if (e.target.value === 'all') setEditConfig({...editConfig, scan_all_symbols: true, coin_group_id: null}); else setEditConfig({...editConfig, scan_all_symbols: false, coin_group_id: parseInt(e.target.value)}) }} style={s.select}>
+                <option value="all">Alle Symbole</option>
+                {groups.map(g => <option key={g.id || g.group_id} value={g.id || g.group_id}>{g.name}</option>)}
+              </select>
+            </div>
+
+            {/* TP/SL Modus */}
+            <div style={{ gridColumn: '1/-1', borderTop: '1px solid var(--color-border)', paddingTop: 6, marginTop: 2 }}>
+              <div style={s.label}>TP/SL Modus</div>
+              <div style={{ display: 'flex', gap: 4, marginTop: 3 }}>
+                {['dynamic', 'fixed', 'range'].map(m => (
+                  <button key={m} onClick={() => setEditConfig({...editConfig, tp_sl_mode: m})}
+                    style={{ ...s.btn, fontSize: '0.5625rem', padding: '2px 8px', background: editConfig.tp_sl_mode === m ? '#3b82f6' : 'var(--color-surface)', color: editConfig.tp_sl_mode === m ? '#fff' : 'var(--color-text)' }}>
+                    {m === 'dynamic' ? 'Dynamisch (ATR)' : m === 'fixed' ? 'Fest' : 'Bereich'}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {editConfig.tp_sl_mode === 'fixed' && <>
+              <div><div style={s.label}>TP %</div><input type="number" step="0.5" value={editConfig.fixed_tp_pct || 5} onChange={e => setEditConfig({...editConfig, fixed_tp_pct: parseFloat(e.target.value)})} style={s.input} /></div>
+              <div><div style={s.label}>SL %</div><input type="number" step="0.5" value={editConfig.fixed_sl_pct || 2} onChange={e => setEditConfig({...editConfig, fixed_sl_pct: parseFloat(e.target.value)})} style={s.input} /></div>
+            </>}
+
+            {editConfig.tp_sl_mode === 'range' && <>
+              <div><div style={s.label}>TP Min %</div><input type="number" step="0.5" value={editConfig.range_tp_min || 5} onChange={e => setEditConfig({...editConfig, range_tp_min: parseFloat(e.target.value)})} style={s.input} /></div>
+              <div><div style={s.label}>TP Max %</div><input type="number" step="0.5" value={editConfig.range_tp_max || 15} onChange={e => setEditConfig({...editConfig, range_tp_max: parseFloat(e.target.value)})} style={s.input} /></div>
+              <div><div style={s.label}>SL Min %</div><input type="number" step="0.5" value={editConfig.range_sl_min || 2} onChange={e => setEditConfig({...editConfig, range_sl_min: parseFloat(e.target.value)})} style={s.input} /></div>
+              <div><div style={s.label}>SL Max %</div><input type="number" step="0.5" value={editConfig.range_sl_max || 6} onChange={e => setEditConfig({...editConfig, range_sl_max: parseFloat(e.target.value)})} style={s.input} /></div>
+            </>}
+
+            {editConfig.tp_sl_mode === 'dynamic' && <>
+              <div><div style={s.label}>Min. Target %</div><input type="number" step="0.5" value={editConfig.min_target_pct || 5} onChange={e => setEditConfig({...editConfig, min_target_pct: parseFloat(e.target.value)})} style={s.input} /></div>
+              <div><div style={s.label}>Max SL %</div><input type="number" step="0.5" value={editConfig.stop_loss_pct || 2} onChange={e => setEditConfig({...editConfig, stop_loss_pct: parseFloat(e.target.value)})} style={s.input} /></div>
+            </>}
+          </div>
+          <button onClick={saveConfig} disabled={loading} style={{ ...s.btn, background: '#3b82f6', color: '#fff', justifyContent: 'center' }}>Speichern</button>
+
+          {/* Optimierungen */}
+          <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: 6, marginTop: 2 }}>
+            <button onClick={() => { setShowOptLog(!showOptLog); if (!showOptLog) loadOptLog() }}
+              style={{ ...s.btn, fontSize: '0.5625rem', background: 'var(--color-surface)', color: 'var(--color-muted)', width: '100%', justifyContent: 'center' }}>
+              {showOptLog ? 'Optimierungen ausblenden' : 'Optimierungen anzeigen'}
+            </button>
+
+            {showOptLog && (
+              <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 250, overflow: 'auto' }}>
+                {optLog.length === 0 ? (
+                  <div style={{ fontSize: '0.625rem', color: 'var(--color-muted)', textAlign: 'center', padding: 8 }}>
+                    Noch keine Optimierungen. Läuft täglich um 08:00 und 20:00 (mind. 10 resolved Predictions nötig).
+                  </div>
+                ) : optLog.map(o => (
+                  <div key={o.optimization_id} style={{ padding: 6, background: 'var(--color-surface)', borderRadius: 4, border: '1px solid var(--color-border)', fontSize: '0.625rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+                      <span style={{ fontWeight: 600 }}>{new Date(o.run_at).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
+                      <span style={{ padding: '0 4px', borderRadius: 3, fontSize: '0.5625rem', fontWeight: 600,
+                        background: o.recommendation === 'apply' ? 'rgba(34,197,94,0.15)' : 'rgba(107,114,128,0.15)',
+                        color: o.recommendation === 'apply' ? '#22c55e' : 'var(--color-muted)' }}>
+                        {o.applied ? 'ANGEWENDET' : o.recommendation === 'apply' ? 'EMPFOHLEN' : 'KEINE ÄNDERUNG'}
+                      </span>
+                    </div>
+                    <div style={{ color: 'var(--color-muted)', lineHeight: 1.4 }}>
+                      <div>{o.total_predictions} Predictions: {o.total_tp} TP, {o.total_sl} SL, {o.total_expired} Exp → <span style={{ fontWeight: 600 }}>{o.current_hit_rate}%</span></div>
+                      {o.best_variant && (
+                        <div style={{ marginTop: 2 }}>
+                          Beste Variante: <span style={{ color: '#3b82f6' }}>{o.best_variant.label || JSON.stringify(o.best_variant)}</span>
+                          {' → '}<span style={{ fontWeight: 600, color: '#22c55e' }}>{o.best_sim_hit_rate}%</span>
+                          {' '}({o.best_sim_eliminated} eliminiert, {o.best_sim_tp_lost} TP verloren)
+                        </div>
+                      )}
+                      {o.changes_applied && Object.keys(o.changes_applied).length > 0 && (
+                        <div style={{ marginTop: 2, color: '#f59e0b' }}>
+                          Änderungen: {Object.entries(o.changes_applied).map(([k, v]) => `${k}: ${v.old} → ${v.new}`).join(', ')}
+                        </div>
+                      )}
+                      {o.reason && <div style={{ marginTop: 2, fontStyle: 'italic' }}>{o.reason}</div>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Stats Bar */}
+      {stats.all && (
+        <div style={{ display: 'flex', gap: 8, padding: '3px 0', flexWrap: 'wrap' }}>
+          <div><span style={s.label}>Gesamt: </span><span style={s.value}>{stats.all.total_predictions}</span></div>
+          <div><span style={s.label}>Treffer: </span><span style={{ ...s.value, color: '#22c55e' }}>{stats.all.hit_rate_pct}%</span></div>
+          <div><span style={s.label}>Ø Result: </span><span style={{ ...s.value, color: (stats.all.avg_result_pct || 0) >= 0 ? '#22c55e' : '#ef4444' }}>{formatPct(stats.all.avg_result_pct)}</span></div>
+          <div><span style={s.label}>Best: </span><span style={{ ...s.value, color: '#22c55e' }}>{formatPct(stats.all.best_result_pct)}</span></div>
+        </div>
+      )}
+
+      {/* Tabs */}
+      <div style={{ display: 'flex', gap: 0, borderBottom: '1px solid var(--color-border)' }}>
+        <button onClick={() => setTab('predictions')} style={s.tab(tab === 'predictions')}>Predictions ({totalPredictions})</button>
+        <button onClick={() => setTab('stats')} style={s.tab(tab === 'stats')}>Statistik</button>
+      </div>
+
+      {/* Filter */}
+      {tab === 'predictions' && (
+        <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
+          {['', 'active', 'hit_tp', 'hit_sl', 'invalidated', 'expired'].map(st => (
+            <button key={st} onClick={() => setStatusFilter(st)}
+              style={{ ...s.btn, background: statusFilter === st ? '#3b82f6' : 'var(--color-bg)', color: statusFilter === st ? '#fff' : 'var(--color-text)', fontSize: '0.5625rem', padding: '2px 5px' }}>
+              {st === '' ? 'Alle' : st === 'hit_tp' ? 'TP ✓' : st === 'hit_sl' ? 'SL ✗' : st === 'active' ? 'Aktiv' : st === 'invalidated' ? 'Invalid.' : 'Expired'}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Content */}
+      <div style={{ flex: 1, overflow: 'auto' }}>
+        {tab === 'predictions' && (
+          sortedPredictions.length === 0
+            ? <div style={{ textAlign: 'center', color: 'var(--color-muted)', padding: 20 }}>Keine Predictions</div>
+            : <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
+                <thead>
+                  <tr>
+                    {COLUMNS.map(col => (
+                      <th key={col.key} onClick={() => col.sortable !== false && handleSort(col.key)}
+                        style={{ ...s.th, width: col.width, textAlign: col.align, cursor: col.sortable === false ? 'default' : 'pointer' }}>
+                        <span style={{ display: 'inline-flex', alignItems: 'center' }}>
+                          {col.label}<SortIcon col={col.key} />
+                        </span>
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedPredictions.map(p => (
+                    <tr key={p.prediction_id} style={{ borderBottom: '1px solid var(--color-border)' }}
+                      onMouseEnter={e => e.currentTarget.style.background = 'var(--color-bg)'}
+                      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                      {COLUMNS.map(col => (
+                        <td key={col.key} style={{ ...s.td, textAlign: col.align, width: col.width }}>
+                          {renderCell(p, col)}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+        )}
+
+        {tab === 'stats' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: 4 }}>
+            {['24h', '7d', '30d', 'all'].map(period => {
+              const st = stats[period]
+              if (!st) return <div key={period} style={{ color: 'var(--color-muted)' }}>{period}: Keine Daten</div>
+              return (
+                <div key={period} style={{ padding: 8, background: 'var(--color-bg)', borderRadius: 6, border: '1px solid var(--color-border)' }}>
+                  <div style={{ fontWeight: 600, marginBottom: 4 }}>{period}</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 4 }}>
+                    <div><span style={s.label}>Total</span><br/><span style={s.value}>{st.total_predictions}</span></div>
+                    <div><span style={s.label}>Treffer</span><br/><span style={{ ...s.value, color: '#22c55e' }}>{st.correct_predictions} ({st.hit_rate_pct}%)</span></div>
+                    <div><span style={s.label}>Falsch</span><br/><span style={{ ...s.value, color: '#ef4444' }}>{st.incorrect_predictions}</span></div>
+                    <div><span style={s.label}>Ø Result</span><br/><span style={s.value}>{formatPct(st.avg_result_pct)}</span></div>
+                    <div><span style={s.label}>Best</span><br/><span style={{ ...s.value, color: '#22c55e' }}>{formatPct(st.best_result_pct)}</span></div>
+                    <div><span style={s.label}>Worst</span><br/><span style={{ ...s.value, color: '#ef4444' }}>{formatPct(st.worst_result_pct)}</span></div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}

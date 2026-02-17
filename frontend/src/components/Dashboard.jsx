@@ -13,17 +13,18 @@ import IndicatorsModule from '../modules/indicators/IndicatorsModule'
 import GroupsModule from '../modules/groups/GroupsModule'
 import WalletModule from '../modules/wallet/WalletModule'
 import BotModule from '../modules/bot/BotModule'
+import MomentumModule from '../modules/MomentumModule'
 
 const ResponsiveGridLayout = WidthProvider(Responsive)
 
 const MODULE_COMPONENTS = {
   search: SearchModule, searchResults: SearchResultsModule, chart: ChartModule,
-  indicators: IndicatorsModule, groups: GroupsModule, wallet: WalletModule, bot: BotModule,
+  indicators: IndicatorsModule, groups: GroupsModule, wallet: WalletModule, bot: BotModule, momentum: MomentumModule,
 }
 
 const MODULE_TITLES = {
   search: 'Suche', searchResults: 'Suchergebnisse', chart: 'Chart',
-  indicators: 'Indikatoren', groups: 'Coin-Gruppen', wallet: 'Wallet', bot: 'Trading Bot',
+  indicators: 'Indikatoren', groups: 'Coin-Gruppen', wallet: 'Wallet', bot: 'Trading Bot', momentum: 'Momentum Scanner',
 }
 
 export default function Dashboard() {
