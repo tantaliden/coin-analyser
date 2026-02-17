@@ -291,7 +291,7 @@ class ConvertRequest(BaseModel):
 
 @router.post("/convert-usdc")
 async def convert_usdc_to_usdt(request: ConvertRequest, current_user: dict = Depends(get_current_user)):
-    """USDC → USDT per Spot Market Sell (USDCUSDT)"""
+    """USDC → USDT per Binance Convert API (gebührenfrei, EU-kompatibel)"""
     client = get_user_binance_client(current_user['user_id'])
     if not client:
         return {"error": "Kein gültiger API Key konfiguriert"}
@@ -303,35 +303,54 @@ async def convert_usdc_to_usdt(request: ConvertRequest, current_user: dict = Dep
         if free_usdc < 5:
             return {"error": f"Zu wenig USDC verfügbar ({free_usdc:.2f}). Minimum: 5 USDC"}
 
-        # Menge bestimmen (ganze Zahlen, stepSize=1)
+        # Menge bestimmen
         if request.amount and request.amount > 0:
-            sell_qty = min(int(request.amount), int(free_usdc))
+            convert_amount = min(request.amount, free_usdc)
         else:
-            sell_qty = int(free_usdc)  # Max
+            convert_amount = free_usdc  # Max
 
-        if sell_qty < 5:
-            return {"error": f"Menge {sell_qty} USDC unter Minimum (5)"}
+        if convert_amount < 5:
+            return {"error": f"Menge {convert_amount:.2f} USDC unter Minimum (5)"}
 
-        # Market Sell USDCUSDT = USDC verkaufen, USDT erhalten
-        order = client.create_order(
-            symbol='USDCUSDT',
-            side='SELL',
-            type='MARKET',
-            quantity=sell_qty
+        # Schritt 1: Quote anfordern
+        quote = client.convert_request_quote(
+            fromAsset='USDC',
+            toAsset='USDT',
+            fromAmount=f"{convert_amount:.2f}"
         )
 
-        filled_qty = float(order.get('executedQty', 0))
-        received_usdt = float(order.get('cummulativeQuoteQty', 0))
+        quote_id = quote.get('quoteId')
+        if not quote_id:
+            error_msg = quote.get('msg', quote.get('message', str(quote)))
+            return {"error": f"Convert Quote fehlgeschlagen: {error_msg}"}
 
-        print(f"[WALLET] User {current_user['user_id']} converted {filled_qty} USDC → {received_usdt:.2f} USDT")
+        to_amount = float(quote.get('toAmount', 0))
+        ratio = quote.get('ratio', '1')
 
-        return {
-            "status": "success",
-            "usdc_sold": filled_qty,
-            "usdt_received": round(received_usdt, 2),
-            "order_id": order.get('orderId')
-        }
+        print(f"[WALLET] Convert Quote: {convert_amount:.2f} USDC → {to_amount:.2f} USDT (ratio: {ratio}, quoteId: {quote_id})")
+
+        # Schritt 2: Quote akzeptieren
+        result = client.convert_accept_quote(quoteId=quote_id)
+
+        order_status = result.get('orderStatus', 'UNKNOWN')
+        order_id = result.get('orderId', '')
+
+        if order_status in ('SUCCESS', 'ACCEPT_SUCCESS', 'PROCESS'):
+            print(f"[WALLET] User {current_user['user_id']} converted {convert_amount:.2f} USDC → {to_amount:.2f} USDT (orderId: {order_id})")
+            return {
+                "status": "success",
+                "usdc_sold": round(convert_amount, 2),
+                "usdt_received": round(to_amount, 2),
+                "order_id": str(order_id),
+                "ratio": ratio
+            }
+        else:
+            return {"error": f"Convert fehlgeschlagen: Status={order_status}"}
+
     except BinanceAPIException as e:
+        # Fallback: Spot Trade versuchen falls Convert nicht verfügbar
+        if 'not authorized' in str(e.message).lower() or 'not permitted' in str(e.message).lower():
+            return {"error": f"Convert API nicht verfügbar für diesen Account: {e.message}"}
         return {"error": f"Binance API Fehler: {e.message}"}
     except Exception as e:
         print(f"[WALLET] Convert error: {e}")
