@@ -394,17 +394,7 @@ export default function MomentumModule() {
         </div>
       )}
 
-      {/* Stats Direction Filter */}
-      {tab === 'stats' && (
-        <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
-          {[['', 'Gesamt'], ['long', 'Long'], ['short', 'Short']].map(([key, label]) => (
-            <button key={key} onClick={() => setStatsDirection(key)}
-              style={{ ...s.btn, background: statsDirection === key ? '#3b82f6' : 'var(--color-bg)', color: statsDirection === key ? '#fff' : 'var(--color-text)', fontSize: '0.5625rem', padding: '2px 5px' }}>
-              {label}
-            </button>
-          ))}
-        </div>
-      )}
+
 
       {/* Content */}
       <div style={{ flex: 1, overflow: 'auto' }}>
@@ -437,42 +427,33 @@ export default function MomentumModule() {
         )}
 
         {tab === 'stats' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: 4 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: 4 }}>
             {['24h', '7d', '30d', 'all'].map(period => {
               const st = stats[getStatsKey(period)]
-              const stL = stats[statsDirection ? getStatsKey(period) : `long_${period}`]
-              const stS = stats[statsDirection ? getStatsKey(period) : `short_${period}`]
-              if (!st) return <div key={period} style={{ color: 'var(--color-muted)' }}>{period}: Keine Daten</div>
-              const StatBlock = ({data, label, color}) => !data ? null : (
-                <div style={{ flex: 1, padding: 6, background: 'var(--color-surface)', borderRadius: 4, border: `1px solid ${color}22` }}>
-                  <div style={{ fontWeight: 600, fontSize: '0.625rem', color, marginBottom: 3 }}>{label}</div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, fontSize: '0.625rem' }}>
-                    <div><span style={s.label}>Total</span> <span style={s.value}>{data.total_predictions}</span></div>
-                    <div><span style={s.label}>Hit</span> <span style={{ ...s.value, color: '#22c55e' }}>{data.hit_rate_pct}%</span></div>
-                    <div><span style={s.label}>Ø</span> <span style={{ ...s.value, color: (data.avg_result_pct||0) >= 0 ? '#22c55e' : '#ef4444' }}>{formatPct(data.avg_result_pct)}</span></div>
-                    <div><span style={s.label}>Best</span> <span style={{ ...s.value, color: '#22c55e' }}>{formatPct(data.best_result_pct)}</span></div>
+              const stL = stats[`long_${period}`]
+              const stS = stats[`short_${period}`]
+              if (!st) return <div key={period} style={{ color: 'var(--color-muted)', fontSize: '0.6875rem' }}>{period}: Keine Daten</div>
+              const Row = ({data, label, color, icon}) => {
+                if (!data || !data.total_predictions) return null
+                const rPct = data.avg_result_pct || 0
+                return (
+                  <div style={{ display: 'grid', gridTemplateColumns: '52px 1fr 1fr 1fr 1fr', gap: 4, alignItems: 'center', padding: '3px 0', fontSize: '0.625rem' }}>
+                    <span style={{ fontWeight: 600, color }}>{icon} {label}</span>
+                    <span>{data.total_predictions} <span style={s.label}>pred</span></span>
+                    <span style={{ color: '#22c55e', fontWeight: 600 }}>{data.hit_rate_pct}% <span style={s.label}>hit</span></span>
+                    <span style={{ color: rPct >= 0 ? '#22c55e' : '#ef4444' }}>{formatPct(rPct)} <span style={s.label}>avg</span></span>
+                    <span><span style={{ color: '#22c55e' }}>{formatPct(data.best_result_pct)}</span> / <span style={{ color: '#ef4444' }}>{formatPct(data.worst_result_pct)}</span></span>
                   </div>
-                </div>
-              )
+                )
+              }
               return (
-                <div key={period} style={{ padding: 8, background: 'var(--color-bg)', borderRadius: 6, border: '1px solid var(--color-border)' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                    <span style={{ fontWeight: 600 }}>{period}</span>
-                    <span style={{ fontSize: '0.625rem' }}>{st.total_predictions} Pred | <span style={{ color: '#22c55e' }}>{st.hit_rate_pct}%</span> | Ø {formatPct(st.avg_result_pct)}</span>
+                <div key={period} style={{ padding: '6px 8px', background: 'var(--color-bg)', borderRadius: 6, border: '1px solid var(--color-border)' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                    <span style={{ fontWeight: 700, fontSize: '0.75rem' }}>{period === 'all' ? 'Gesamt' : period}</span>
+                    <span style={{ fontSize: '0.5625rem', color: 'var(--color-muted)' }}>{st.total_predictions} Pred | <span style={{ color: '#22c55e' }}>{st.hit_rate_pct}%</span> | Ø {formatPct(st.avg_result_pct)}</span>
                   </div>
-                  {!statsDirection && (
-                    <div style={{ display: 'flex', gap: 4 }}>
-                      <StatBlock data={stL} label="LONG" color="#22c55e" />
-                      <StatBlock data={stS} label="SHORT" color="#ef4444" />
-                    </div>
-                  )}
-                  {statsDirection && (
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 4 }}>
-                      <div><span style={s.label}>Treffer</span><br/><span style={{ ...s.value, color: '#22c55e' }}>{st.correct_predictions} ({st.hit_rate_pct}%)</span></div>
-                      <div><span style={s.label}>Ø Result</span><br/><span style={s.value}>{formatPct(st.avg_result_pct)}</span></div>
-                      <div><span style={s.label}>Best/Worst</span><br/><span style={{ ...s.value, color: '#22c55e' }}>{formatPct(st.best_result_pct)}</span> / <span style={{ color: '#ef4444' }}>{formatPct(st.worst_result_pct)}</span></div>
-                    </div>
-                  )}
+                  <Row data={stL} label="Long" color="#22c55e" icon="▲" />
+                  <Row data={stS} label="Short" color="#ef4444" icon="▼" />
                 </div>
               )
             })}
