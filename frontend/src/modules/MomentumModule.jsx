@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback } from 'react'
 import { Play, Square, TrendingUp, TrendingDown, Settings, RefreshCw, Trash2, AlertCircle, CheckCircle, XCircle, Clock, Loader2, ArrowUp, ArrowDown, Rocket, X, EyeOff, Eye } from 'lucide-react'
 import api from '../utils/api'
 
@@ -48,6 +48,7 @@ export default function MomentumModule() {
   const [tradeLoading, setTradeLoading] = useState(false)
   const [tradeResult, setTradeResult] = useState(null)
   const [statsDirection, setStatsDirection] = useState('')
+  const [expandedId, setExpandedId] = useState(null)
 
   const loadConfig = useCallback(async () => {
     try {
@@ -413,15 +414,68 @@ export default function MomentumModule() {
                   </tr>
                 </thead>
                 <tbody>
-                  {sortedPredictions.map(p => (
-                    <tr key={p.prediction_id} style={{ borderBottom: '1px solid var(--color-border)', opacity: p.traded ? 0.5 : 1 }}
-                      onMouseEnter={e => e.currentTarget.style.background = 'var(--color-bg)'}
-                      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-                      {COLUMNS.map(col => (
-                        <td key={col.key} style={{ ...s.td, textAlign: col.align, width: col.width }}>{renderCell(p, col)}</td>
-                      ))}
-                    </tr>
-                  ))}
+                  {sortedPredictions.map(p => {
+                    const isExp = expandedId === p.prediction_id
+                    const sl_sims = p.correction_data?.sl_simulations
+                    const hasDetail = p.status !== 'active' && (p.max_favorable_pct || p.peak_pct)
+                    return (
+                      <React.Fragment key={p.prediction_id}>
+                        <tr style={{ borderBottom: isExp ? 'none' : '1px solid var(--color-border)', opacity: p.traded ? 0.6 : 1, cursor: hasDetail ? 'pointer' : 'default' }}
+                          onClick={() => hasDetail && setExpandedId(isExp ? null : p.prediction_id)}
+                          onMouseEnter={e => e.currentTarget.style.background = 'var(--color-bg)'}
+                          onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                          {COLUMNS.map(col => (
+                            <td key={col.key} style={{ ...s.td, textAlign: col.align, width: col.width }}>{renderCell(p, col)}</td>
+                          ))}
+                        </tr>
+                        {isExp && (
+                          <tr style={{ borderBottom: '1px solid var(--color-border)' }}>
+                            <td colSpan={COLUMNS.length} style={{ padding: '6px 8px', background: 'var(--color-bg)', fontSize: '0.625rem' }}>
+                              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6, marginBottom: sl_sims ? 6 : 0 }}>
+                                <div>
+                                  <span style={s.label}>Peak</span><br/>
+                                  <span style={{ color: '#3b82f6', fontWeight: 600 }}>{formatPct(p.max_favorable_pct || p.peak_pct)}</span>
+                                </div>
+                                <div>
+                                  <span style={s.label}>Drawdown</span><br/>
+                                  <span style={{ color: '#ef4444', fontWeight: 600 }}>{formatPct(p.max_adverse_pct || p.trough_pct)}</span>
+                                </div>
+                                <div>
+                                  <span style={s.label}>Result</span><br/>
+                                  <span style={{ color: (p.actual_result_pct||0) >= 0 ? '#22c55e' : '#ef4444', fontWeight: 600 }}>{formatPct(p.actual_result_pct)}</span>
+                                  <span style={{ marginLeft: 4, color: 'var(--color-muted)' }}>{p.status === 'hit_tp' ? 'TP' : p.status === 'hit_sl' ? 'SL' : p.status}</span>
+                                </div>
+                                <div>
+                                  <span style={s.label}>Optimal SL</span><br/>
+                                  {p.correction_data?.optimal_sl 
+                                    ? <span style={{ color: '#f59e0b', fontWeight: 600 }}>{p.correction_data.optimal_sl}% → {formatPct(p.correction_data.optimal_gain)}</span>
+                                    : <span style={{ color: 'var(--color-muted)' }}>-</span>}
+                                </div>
+                              </div>
+                              {sl_sims && (
+                                <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
+                                  {Object.entries(sl_sims).sort((a,b) => parseFloat(a[0]) - parseFloat(b[0])).map(([sl, sim]) => {
+                                    const isOpt = parseFloat(sl) === p.correction_data?.optimal_sl
+                                    return (
+                                      <span key={sl} style={{ 
+                                        padding: '2px 5px', borderRadius: 3, fontSize: '0.5625rem',
+                                        background: isOpt ? 'rgba(245,158,11,0.2)' : sim.stopped ? 'rgba(239,68,68,0.1)' : 'rgba(34,197,94,0.1)',
+                                        border: `1px solid ${isOpt ? '#f59e0b' : sim.stopped ? '#ef444433' : '#22c55e33'}`,
+                                        color: sim.stopped && !isOpt ? '#ef4444' : 'var(--color-text)'
+                                      }}>
+                                        SL {sl}%: {sim.stopped ? <span style={{ color: '#ef4444' }}>gestoppt</span> : <span style={{ color: '#22c55e' }}>+{sim.max_gain}%</span>}
+                                      </span>
+                                    )
+                                  })}
+                                </div>
+                              )}
+                              {p.traded && <div style={{ marginTop: 4, color: '#f59e0b', fontSize: '0.5625rem' }}>💰 Gehandelt</div>}
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    )
+                  })}
                 </tbody>
               </table>
         )}
