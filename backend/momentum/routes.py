@@ -282,10 +282,12 @@ async def execute_trade(prediction_id: int, req: TradeRequest, current_user: dic
             symbol=symbol,
             side='SELL',
             quantity=rounded_qty,
-            price=tp_price,
-            stopPrice=sl_price,
-            stopLimitPrice=sl_limit,
-            stopLimitTimeInForce='GTC'
+            aboveType='LIMIT_MAKER',
+            abovePrice=tp_price,
+            belowType='STOP_LOSS_LIMIT',
+            belowPrice=sl_limit,
+            belowStopPrice=sl_price,
+            belowTimeInForce='GTC'
         )
         oco_order_id = str(oco.get('orderListId', ''))
     except Exception as e:
