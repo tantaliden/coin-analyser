@@ -44,27 +44,24 @@ async def get_wallet_balance(current_user: dict = Depends(get_current_user)):
         return {"error": "Kein gültiger API Key konfiguriert"}
     try:
         account = client.get_account()
-        usdt_balance, usdc_balance, usdc_free, positions_value = 0.0, 0.0, 0.0, 0.0
+        usdc_balance, usdc_free, positions_value = 0.0, 0.0, 0.0
         for asset in account.get('balances', []):
             total = float(asset['free']) + float(asset['locked'])
             if total > 0:
-                if asset['asset'] == 'USDT':
-                    usdt_balance = total
-                elif asset['asset'] == 'USDC':
+                if asset['asset'] == 'USDC':
                     usdc_balance = total
                     usdc_free = float(asset['free'])
                 else:
                     try:
-                        ticker = client.get_symbol_ticker(symbol=f"{asset['asset']}USDT")
+                        ticker = client.get_symbol_ticker(symbol=f"{asset['asset']}USDC")
                         positions_value += total * float(ticker['price'])
                     except:
                         pass
         return {
-            "usdt_balance": round(usdt_balance, 2),
             "usdc_balance": round(usdc_balance, 2),
             "usdc_free": round(usdc_free, 2),
             "positions_value": round(positions_value, 2),
-            "total_portfolio": round(usdt_balance + usdc_balance + positions_value, 2)
+            "total_portfolio": round(usdc_balance + positions_value, 2)
         }
     except BinanceAPIException as e:
         return {"error": f"Binance API Fehler: {e.message}"}
@@ -86,8 +83,8 @@ async def get_wallet_positions(current_user: dict = Depends(get_current_user)):
             free = float(asset['free'])
             locked = float(asset['locked'])
             total = free + locked
-            if total > 0 and asset['asset'] not in ['USDT', 'USDC']:
-                symbol = f"{asset['asset']}USDT"
+            if total > 0 and asset['asset'] not in ['USDC']:
+                symbol = f"{asset['asset']}USDC"
                 try:
                     ticker = client.get_symbol_ticker(symbol=symbol)
                     current_price = float(ticker['price'])

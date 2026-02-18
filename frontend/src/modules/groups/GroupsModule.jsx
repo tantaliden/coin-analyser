@@ -196,7 +196,7 @@ export default function GroupsModule() {
               {groupCoins.length === 0 && <span className="text-gray-500">Keine Coins</span>}
               {groupCoins.map(s => (
                 <span key={s} className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-gray-700 rounded font-mono">
-                  {s.replace('USDT','')}
+                  {s.replace('USDC','')}
                   <button onClick={() => removeCoin(s)} className="hover:text-red-400"><X size={8} /></button>
                 </span>
               ))}
@@ -252,7 +252,7 @@ export default function GroupsModule() {
                             <button onClick={() => addCoin(c.symbol)}
                               className="p-0.5 bg-blue-600 hover:bg-blue-500 rounded"><Plus size={10} /></button>
                           </td>
-                          <td className="px-2 py-0.5 font-mono font-medium">{c.symbol.replace('USDT','')}</td>
+                          <td className="px-2 py-0.5 font-mono font-medium">{c.symbol.replace('USDC','')}</td>
                           <td className="px-2 py-0.5 text-gray-300">{c.name || '-'}</td>
                           <td className="px-2 py-0.5">
                             {c.network ? (

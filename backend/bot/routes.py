@@ -45,7 +45,7 @@ async def update_bot_config(request: BotConfigUpdate, current_user: dict = Depen
         updates.append("is_active = %s"); values.append(request.is_active)
     if request.amount_per_trade is not None:
         if request.amount_per_trade < 10:
-            return {"error": "Mindestbetrag 10 USDT"}
+            return {"error": "Mindestbetrag 10 USDC"}
         updates.append("amount_per_trade = %s"); values.append(request.amount_per_trade)
     if request.max_trades_enabled is not None:
         updates.append("max_trades_enabled = %s"); values.append(request.max_trades_enabled)

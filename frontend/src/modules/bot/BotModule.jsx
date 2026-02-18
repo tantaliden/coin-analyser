@@ -80,7 +80,7 @@ export default function BotModule() {
         {/* Config */}
         <div className="grid grid-cols-2 gap-3 text-xs">
           <div>
-            <label className="text-gray-400">Betrag pro Trade (USDT)</label>
+            <label className="text-gray-400">Betrag pro Trade (USDC)</label>
             <input type="number" value={config?.amount_per_trade || 50} min="10" step="10"
               onChange={e => updateConfig({ amount_per_trade: parseFloat(e.target.value) })}
               className="input w-full text-sm py-1.5 mt-1" />
@@ -89,7 +89,7 @@ export default function BotModule() {
             <div className="text-gray-400 mb-1">Heute</div>
             <div className="text-sm">{config?.today_trades || 0} Trades</div>
             <div className={`text-sm font-mono ${(config?.today_profit_loss || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              {(config?.today_profit_loss || 0) >= 0 ? '+' : ''}{(config?.today_profit_loss || 0).toFixed(2)} USDT
+              {(config?.today_profit_loss || 0) >= 0 ? '+' : ''}{(config?.today_profit_loss || 0).toFixed(2)} USDC
             </div>
           </div>
         </div>

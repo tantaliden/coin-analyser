@@ -227,7 +227,7 @@ async def execute_trade(prediction_id: int, req: TradeRequest, current_user: dic
     min_notional = float(coin['min_notional'])
 
     if amount_usdt < min_notional:
-        raise HTTPException(400, f"Amount {amount_usdt} USDT unter min_notional {min_notional} für {symbol}")
+        raise HTTPException(400, f"Amount {amount_usdt} USDC unter min_notional {min_notional} für {symbol}")
 
     # Binance Client
     client = get_user_binance_client(user_id)
@@ -253,7 +253,7 @@ async def execute_trade(prediction_id: int, req: TradeRequest, current_user: dic
         raise HTTPException(500, "Buy Order hat keine Menge gefüllt")
 
     # === SCHRITT 2: Free Balance prüfen (nach Fee-Abzug) ===
-    base_asset = symbol.replace('USDT', '')
+    base_asset = symbol.replace('USDC', '')
     try:
         balance = client.get_asset_balance(asset=base_asset)
         free_qty = float(balance.get('free', 0)) if balance else 0

@@ -210,7 +210,7 @@ export default function MomentumModule() {
       case 'direction': return p.direction === 'long'
         ? <TrendingUp size={13} style={{ color: '#22c55e' }} />
         : <TrendingDown size={13} style={{ color: '#ef4444' }} />
-      case 'symbol': return <span style={{ fontWeight: 600 }}>{p.symbol.replace('USDT', '')}</span>
+      case 'symbol': return <span style={{ fontWeight: 600 }}>{p.symbol.replace('USDC', '')}</span>
       case 'entry_price': return <span style={{ color: 'var(--color-muted)' }}>{formatPrice(p.entry_price)}</span>
       case 'current_price': return <span style={{ fontWeight: 500 }}>{formatPrice(p.current_price)}</span>
       case 'current_pct': {
@@ -450,7 +450,7 @@ export default function MomentumModule() {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
               <span style={{ fontWeight: 700, fontSize: '0.875rem' }}>
                 <Rocket size={14} style={{ marginRight: 6, color: '#3b82f6' }} />
-                Trade: {tradeDialog.symbol.replace('USDT', '')}
+                Trade: {tradeDialog.symbol.replace('USDC', '')}
               </span>
               <button onClick={() => !tradeLoading && setTradeDialog(null)} style={{ background: 'none', border: 'none', cursor: 'pointer' }}><X size={16} /></button>
             </div>
@@ -460,7 +460,7 @@ export default function MomentumModule() {
                 <div style={{ color: '#22c55e', fontWeight: 700, marginBottom: 8 }}>Trade ausgeführt!</div>
                 <div style={{ fontSize: '0.75rem', display: 'flex', flexDirection: 'column', gap: 3 }}>
                   <div>Gekauft: <b>{tradeResult.data.sell_qty}</b> @ <b>{tradeResult.data.buy_price}</b></div>
-                  <div>Amount: <b>{tradeResult.data.amount_usdt} USDT</b></div>
+                  <div>Amount: <b>{tradeResult.data.amount_usdt} USDC</b></div>
                   <div style={{ color: '#22c55e' }}>TP: {tradeResult.data.tp_price} ({tradeResult.data.tp_pct}%)</div>
                   <div style={{ color: '#ef4444' }}>SL: {tradeResult.data.sl_price} ({tradeResult.data.sl_pct}%)</div>
                 </div>

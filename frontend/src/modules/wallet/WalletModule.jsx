@@ -106,13 +106,13 @@ export default function WalletModule() {
       {/* Balance Bar */}
       {balance && (
         <div className="flex items-center gap-3 px-2 py-1.5 border-b border-zinc-700/50 bg-zinc-800/30 flex-shrink-0">
-          <div><span className="text-zinc-500">USDT</span> <span className="font-mono">${fp(balance.usdt_balance)}</span></div>
+          <div><span className="text-zinc-500">USDC</span> <span className="font-mono">${fp(balance.usdt_balance)}</span></div>
           {balance.usdc_balance > 0 && (
             <div className="flex items-center gap-1">
               <span className="text-zinc-500">USDC</span>
               <span className="font-mono text-blue-300">${fp(balance.usdc_balance)}</span>
               <button onClick={() => { setConvertDialog(true); setConvertAmount(''); setConvertResult(null) }}
-                className="ml-0.5 p-0.5 rounded hover:bg-zinc-600 text-blue-400" title="USDC → USDT konvertieren">
+                className="ml-0.5 p-0.5 rounded hover:bg-zinc-600 text-blue-400" title="USDC → USDC konvertieren">
                 <ArrowRightLeft className="w-3 h-3" />
               </button>
             </div>
@@ -165,7 +165,7 @@ export default function WalletModule() {
                 return (
                   <tr key={i} className="border-t border-zinc-800 hover:bg-zinc-800/50">
                     <td className="px-2 py-1 font-mono font-medium">
-                      {pos.symbol.replace('USDT','')}
+                      {pos.symbol.replace('USDC','')}
                       {pos.is_bot_trade && <Bot className="w-3 h-3 text-blue-400 inline ml-1" />}
                       {hasOrder && <Tag className="w-3 h-3 text-yellow-400 inline ml-1" />}
                     </td>
@@ -221,7 +221,7 @@ export default function WalletModule() {
                 const diff = cur && o.price ? ((o.price - cur) / cur * 100) : null
                 return (
                   <tr key={i} className="border-t border-zinc-800 hover:bg-zinc-800/50">
-                    <td className="px-2 py-1 font-mono font-medium">{o.symbol.replace('USDT','')}</td>
+                    <td className="px-2 py-1 font-mono font-medium">{o.symbol.replace('USDC','')}</td>
                     <td className={`px-2 py-1 ${o.side === 'BUY' ? 'text-green-400' : 'text-red-400'}`}>{o.side}</td>
                     <td className="px-2 py-1 text-right font-mono">${fp(o.price, 4)}</td>
                     <td className="px-2 py-1 text-right font-mono">{cur ? `$${fp(cur, 4)}` : '-'}</td>
@@ -273,7 +273,7 @@ export default function WalletModule() {
               ) : history.map((t, i) => (
                 <tr key={i} className="border-t border-zinc-800 hover:bg-zinc-800/50">
                   <td className="px-2 py-1 font-mono font-medium">
-                    {t.symbol?.replace('USDT','')} {t.is_bot_trade && <Bot className="w-3 h-3 text-blue-400 inline ml-1" />}
+                    {t.symbol?.replace('USDC','')} {t.is_bot_trade && <Bot className="w-3 h-3 text-blue-400 inline ml-1" />}
                   </td>
                   <td className={`px-2 py-1 ${t.side === 'buy' ? 'text-green-400' : 'text-red-400'}`}>{t.side?.toUpperCase()}</td>
                   <td className="px-2 py-1 text-right font-mono">${fp(t.price, 4)}</td>
@@ -292,14 +292,14 @@ export default function WalletModule() {
         <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center" onClick={e => { if (e.target === e.currentTarget && !convertLoading) setConvertDialog(false) }}>
           <div className="bg-zinc-800 border border-zinc-700 rounded-lg p-4 w-72">
             <div className="flex justify-between items-center mb-3">
-              <span className="font-semibold text-sm flex items-center gap-1.5"><ArrowRightLeft className="w-4 h-4 text-blue-400" /> USDC → USDT</span>
+              <span className="font-semibold text-sm flex items-center gap-1.5"><ArrowRightLeft className="w-4 h-4 text-blue-400" /> USDC → USDC</span>
               <button onClick={() => !convertLoading && setConvertDialog(false)}><X className="w-4 h-4 text-zinc-400" /></button>
             </div>
 
             {convertResult?.status === 'success' ? (
               <div className="p-3 bg-green-900/30 border border-green-700/40 rounded">
                 <div className="text-green-400 font-semibold mb-1">Konvertiert!</div>
-                <div className="text-xs text-zinc-300">{convertResult.usdc_sold} USDC → {convertResult.usdt_received} USDT</div>
+                <div className="text-xs text-zinc-300">{convertResult.usdc_sold} USDC → {convertResult.usdt_received} USDC</div>
                 <button onClick={() => setConvertDialog(false)} className="mt-3 w-full py-1 bg-zinc-700 hover:bg-zinc-600 rounded text-xs">Schließen</button>
               </div>
             ) : (
