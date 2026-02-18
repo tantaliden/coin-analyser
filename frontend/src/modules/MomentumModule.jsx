@@ -49,6 +49,7 @@ export default function MomentumModule() {
   const [tradeResult, setTradeResult] = useState(null)
   const [statsDirection, setStatsDirection] = useState('')
   const [expandedId, setExpandedId] = useState(null)
+  const [statsDrill, setStatsDrill] = useState(null) // z.B. {period:'24h',dir:'long',type:'tp'}
 
   const loadConfig = useCallback(async () => {
     try {
@@ -480,39 +481,110 @@ export default function MomentumModule() {
               </table>
         )}
 
-        {tab === 'stats' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: 4 }}>
-            {['24h', '7d', '30d', 'all'].map(period => {
-              const st = stats[getStatsKey(period)]
-              const stL = stats[`long_${period}`]
-              const stS = stats[`short_${period}`]
-              if (!st) return <div key={period} style={{ color: 'var(--color-muted)', fontSize: '0.6875rem' }}>{period}: Keine Daten</div>
-              const Row = ({data, label, color, icon}) => {
-                if (!data || !data.total_predictions) return null
-                const rPct = data.avg_result_pct || 0
+        {tab === 'stats' && (() => {
+          // Filter predictions fuer drill-down
+          const drillPreds = statsDrill ? predictions.filter(p => {
+            if (statsDrill.dir && p.direction !== statsDrill.dir) return false
+            const now = new Date()
+            if (statsDrill.period === '24h' && (now - new Date(p.detected_at)) > 86400000) return false
+            if (statsDrill.period === '7d' && (now - new Date(p.detected_at)) > 7*86400000) return false
+            if (statsDrill.period === '30d' && (now - new Date(p.detected_at)) > 30*86400000) return false
+            if (statsDrill.type === 'tp') return p.status === 'hit_tp'
+            if (statsDrill.type === 'sl') return p.status === 'hit_sl'
+            if (statsDrill.type === 'all') return ['hit_tp','hit_sl','expired','invalidated'].includes(p.status)
+            return true
+          }) : []
+
+          const Clk = ({children, drill, style: st2}) => (
+            <span onClick={(e) => { e.stopPropagation(); setStatsDrill(prev => prev && prev.dir === drill.dir && prev.period === drill.period && prev.type === drill.type ? null : drill) }}
+              style={{ cursor: 'pointer', textDecoration: 'underline', textDecorationStyle: 'dotted', textUnderlineOffset: 2, ...st2 }}>
+              {children}
+            </span>
+          )
+
+          const Row = ({data, label, color, icon, dir, period}) => {
+            if (!data || !data.total_predictions) return null
+            const rPct = data.avg_result_pct || 0
+            const miss = data.total_predictions - (data.correct_predictions || 0)
+            return (
+              <div style={{ display: 'grid', gridTemplateColumns: '48px 1fr 1fr 1fr 1fr', gap: 4, alignItems: 'center', padding: '3px 0', fontSize: '0.625rem' }}>
+                <Clk drill={{period, dir, type:'all'}} style={{ fontWeight: 600, color }}>{icon} {label}</Clk>
+                <span><Clk drill={{period, dir, type:'all'}} style={{}}>{data.total_predictions}</Clk> <span style={s.label}>pred</span></span>
+                <span>
+                  <Clk drill={{period, dir, type:'tp'}} style={{ color: '#22c55e', fontWeight: 600 }}>{data.correct_predictions || 0}</Clk>
+                  <span style={s.label}> TP </span>
+                  <Clk drill={{period, dir, type:'sl'}} style={{ color: '#ef4444', fontWeight: 600 }}>{miss}</Clk>
+                  <span style={s.label}> SL</span>
+                </span>
+                <span style={{ color: rPct >= 0 ? '#22c55e' : '#ef4444' }}>{formatPct(rPct)} <span style={s.label}>avg</span></span>
+                <span><span style={{ color: '#22c55e' }}>{formatPct(data.best_result_pct)}</span> / <span style={{ color: '#ef4444' }}>{formatPct(data.worst_result_pct)}</span></span>
+              </div>
+            )
+          }
+
+          const isDrillFor = (period, dir) => statsDrill && statsDrill.period === period && (!dir || statsDrill.dir === dir)
+
+          return (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: 4 }}>
+              {['24h', '7d', '30d', 'all'].map(period => {
+                const st = stats[getStatsKey(period)]
+                const stL = stats[`long_${period}`]
+                const stS = stats[`short_${period}`]
+                if (!st) return <div key={period} style={{ color: 'var(--color-muted)', fontSize: '0.6875rem' }}>{period}: Keine Daten</div>
                 return (
-                  <div style={{ display: 'grid', gridTemplateColumns: '52px 1fr 1fr 1fr 1fr', gap: 4, alignItems: 'center', padding: '3px 0', fontSize: '0.625rem' }}>
-                    <span style={{ fontWeight: 600, color }}>{icon} {label}</span>
-                    <span>{data.total_predictions} <span style={s.label}>pred</span></span>
-                    <span style={{ color: '#22c55e', fontWeight: 600 }}>{data.hit_rate_pct}% <span style={s.label}>hit</span></span>
-                    <span style={{ color: rPct >= 0 ? '#22c55e' : '#ef4444' }}>{formatPct(rPct)} <span style={s.label}>avg</span></span>
-                    <span><span style={{ color: '#22c55e' }}>{formatPct(data.best_result_pct)}</span> / <span style={{ color: '#ef4444' }}>{formatPct(data.worst_result_pct)}</span></span>
+                  <div key={period} style={{ padding: '6px 8px', background: 'var(--color-bg)', borderRadius: 6, border: '1px solid var(--color-border)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                      <span style={{ fontWeight: 700, fontSize: '0.75rem' }}>{period === 'all' ? 'Gesamt' : period}</span>
+                      <span style={{ fontSize: '0.5625rem', color: 'var(--color-muted)' }}>{st.total_predictions} Pred | <span style={{ color: '#22c55e' }}>{st.hit_rate_pct}%</span> | Ø {formatPct(st.avg_result_pct)}</span>
+                    </div>
+                    <Row data={stL} label="Long" color="#22c55e" icon="▲" dir="long" period={period} />
+                    <Row data={stS} label="Short" color="#ef4444" icon="▼" dir="short" period={period} />
+                    {isDrillFor(period) && drillPreds.length > 0 && (
+                      <div style={{ marginTop: 4, borderTop: '1px solid var(--color-border)', paddingTop: 4 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+                          <span style={{ fontSize: '0.5625rem', fontWeight: 600 }}>
+                            {statsDrill.dir === 'long' ? '▲' : '▼'} {statsDrill.type === 'tp' ? 'Treffer' : statsDrill.type === 'sl' ? 'Verfehlt' : 'Alle'} ({drillPreds.length})
+                          </span>
+                          <span onClick={() => setStatsDrill(null)} style={{ cursor: 'pointer', fontSize: '0.5625rem', color: 'var(--color-muted)' }}>✕</span>
+                        </div>
+                        {drillPreds.sort((a,b) => new Date(b.detected_at) - new Date(a.detected_at)).map(p => {
+                          const sl_sims = p.correction_data?.sl_simulations
+                          return (
+                            <div key={p.prediction_id} style={{ padding: '4px 6px', marginBottom: 3, background: 'var(--color-surface)', borderRadius: 4, border: '1px solid var(--color-border)', fontSize: '0.5625rem' }}>
+                              <div style={{ display: 'grid', gridTemplateColumns: '70px 1fr 1fr 1fr 1fr', gap: 4, alignItems: 'center' }}>
+                                <span style={{ fontWeight: 700 }}>{p.symbol.replace('USDC','')}{p.traded ? ' 💰' : ''}</span>
+                                <span>
+                                  <span style={s.label}>Result </span>
+                                  <span style={{ color: (p.actual_result_pct||0) >= 0 ? '#22c55e' : '#ef4444', fontWeight: 600 }}>{formatPct(p.actual_result_pct)}</span>
+                                </span>
+                                <span>
+                                  <span style={s.label}>Peak </span>
+                                  <span style={{ color: '#3b82f6', fontWeight: 600 }}>{formatPct(p.max_favorable_pct || p.peak_pct)}</span>
+                                </span>
+                                <span>
+                                  <span style={s.label}>DD </span>
+                                  <span style={{ color: '#ef4444' }}>{formatPct(p.max_adverse_pct || p.trough_pct)}</span>
+                                </span>
+                                <span>
+                                  {p.correction_data?.optimal_sl
+                                    ? <><span style={s.label}>Opt </span><span style={{ color: '#f59e0b' }}>SL {p.correction_data.optimal_sl}%→{formatPct(p.correction_data.optimal_gain)}</span></>
+                                    : <span style={{ color: 'var(--color-muted)' }}>-</span>}
+                                </span>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                    {isDrillFor(period) && drillPreds.length === 0 && (
+                      <div style={{ marginTop: 4, fontSize: '0.5625rem', color: 'var(--color-muted)' }}>Keine Predictions für diesen Filter</div>
+                    )}
                   </div>
                 )
-              }
-              return (
-                <div key={period} style={{ padding: '6px 8px', background: 'var(--color-bg)', borderRadius: 6, border: '1px solid var(--color-border)' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
-                    <span style={{ fontWeight: 700, fontSize: '0.75rem' }}>{period === 'all' ? 'Gesamt' : period}</span>
-                    <span style={{ fontSize: '0.5625rem', color: 'var(--color-muted)' }}>{st.total_predictions} Pred | <span style={{ color: '#22c55e' }}>{st.hit_rate_pct}%</span> | Ø {formatPct(st.avg_result_pct)}</span>
-                  </div>
-                  <Row data={stL} label="Long" color="#22c55e" icon="▲" />
-                  <Row data={stS} label="Short" color="#ef4444" icon="▼" />
-                </div>
-              )
-            })}
-          </div>
-        )}
+              })}
+            </div>
+          )
+        })()}
       </div>
 
       {/* Trade Dialog */}
