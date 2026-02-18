@@ -20,7 +20,8 @@ const COLUMNS = [
   { key: 'take_profit_pct', label: 'TP%',     width: 44,  align: 'right' },
   { key: 'stop_loss_pct',   label: 'SL%',     width: 44,  align: 'right' },
   { key: 'confidence',      label: 'Conf',    width: 38,  align: 'right' },
-  { key: 'detected_at',     label: 'Erkannt', width: 82,  align: 'right' },
+  { key: 'max_favorable',   label: 'Max',     width: 48,  align: 'right' },
+  { key: 'detected_at',     label: 'Erkannt', width: 72,  align: 'right' },
   { key: 'actions',         label: '',        width: 48,  align: 'center', sortable: false },
 ]
 
@@ -222,6 +223,11 @@ export default function MomentumModule() {
       case 'take_profit_pct': return <span style={{ color: '#22c55e' }}>{Number(p.take_profit_pct).toFixed(1)}</span>
       case 'stop_loss_pct': return <span style={{ color: '#ef4444' }}>{Number(p.stop_loss_pct).toFixed(1)}</span>
       case 'confidence': return <span>{p.confidence}</span>
+      case 'max_favorable': {
+        const mf = p.max_favorable_pct || p.peak_pct
+        if (!mf || p.status === 'active') return <span style={{ color: 'var(--color-muted)' }}>-</span>
+        return <span style={{ color: '#3b82f6', fontWeight: 500 }}>{Number(mf).toFixed(1)}%</span>
+      }
       case 'detected_at': return <span style={{ color: 'var(--color-muted)', fontSize: '0.5625rem' }}>{formatTime(p.detected_at)}</span>
       case 'actions': return p.status === 'active' ? (
         <span style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
@@ -423,18 +429,39 @@ export default function MomentumModule() {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: 4 }}>
             {['24h', '7d', '30d', 'all'].map(period => {
               const st = stats[getStatsKey(period)]
+              const stL = stats[statsDirection ? getStatsKey(period) : `long_${period}`]
+              const stS = stats[statsDirection ? getStatsKey(period) : `short_${period}`]
               if (!st) return <div key={period} style={{ color: 'var(--color-muted)' }}>{period}: Keine Daten</div>
+              const StatBlock = ({data, label, color}) => !data ? null : (
+                <div style={{ flex: 1, padding: 6, background: 'var(--color-surface)', borderRadius: 4, border: `1px solid ${color}22` }}>
+                  <div style={{ fontWeight: 600, fontSize: '0.625rem', color, marginBottom: 3 }}>{label}</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, fontSize: '0.625rem' }}>
+                    <div><span style={s.label}>Total</span> <span style={s.value}>{data.total_predictions}</span></div>
+                    <div><span style={s.label}>Hit</span> <span style={{ ...s.value, color: '#22c55e' }}>{data.hit_rate_pct}%</span></div>
+                    <div><span style={s.label}>Ø</span> <span style={{ ...s.value, color: (data.avg_result_pct||0) >= 0 ? '#22c55e' : '#ef4444' }}>{formatPct(data.avg_result_pct)}</span></div>
+                    <div><span style={s.label}>Best</span> <span style={{ ...s.value, color: '#22c55e' }}>{formatPct(data.best_result_pct)}</span></div>
+                  </div>
+                </div>
+              )
               return (
                 <div key={period} style={{ padding: 8, background: 'var(--color-bg)', borderRadius: 6, border: '1px solid var(--color-border)' }}>
-                  <div style={{ fontWeight: 600, marginBottom: 4 }}>{period}{statsDirection ? ` (${statsDirection})` : ''}</div>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 4 }}>
-                    <div><span style={s.label}>Total</span><br/><span style={s.value}>{st.total_predictions}</span></div>
-                    <div><span style={s.label}>Treffer</span><br/><span style={{ ...s.value, color: '#22c55e' }}>{st.correct_predictions} ({st.hit_rate_pct}%)</span></div>
-                    <div><span style={s.label}>Falsch</span><br/><span style={{ ...s.value, color: '#ef4444' }}>{st.incorrect_predictions}</span></div>
-                    <div><span style={s.label}>Ø Result</span><br/><span style={s.value}>{formatPct(st.avg_result_pct)}</span></div>
-                    <div><span style={s.label}>Best</span><br/><span style={{ ...s.value, color: '#22c55e' }}>{formatPct(st.best_result_pct)}</span></div>
-                    <div><span style={s.label}>Worst</span><br/><span style={{ ...s.value, color: '#ef4444' }}>{formatPct(st.worst_result_pct)}</span></div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <span style={{ fontWeight: 600 }}>{period}</span>
+                    <span style={{ fontSize: '0.625rem' }}>{st.total_predictions} Pred | <span style={{ color: '#22c55e' }}>{st.hit_rate_pct}%</span> | Ø {formatPct(st.avg_result_pct)}</span>
                   </div>
+                  {!statsDirection && (
+                    <div style={{ display: 'flex', gap: 4 }}>
+                      <StatBlock data={stL} label="LONG" color="#22c55e" />
+                      <StatBlock data={stS} label="SHORT" color="#ef4444" />
+                    </div>
+                  )}
+                  {statsDirection && (
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 4 }}>
+                      <div><span style={s.label}>Treffer</span><br/><span style={{ ...s.value, color: '#22c55e' }}>{st.correct_predictions} ({st.hit_rate_pct}%)</span></div>
+                      <div><span style={s.label}>Ø Result</span><br/><span style={s.value}>{formatPct(st.avg_result_pct)}</span></div>
+                      <div><span style={s.label}>Best/Worst</span><br/><span style={{ ...s.value, color: '#22c55e' }}>{formatPct(st.best_result_pct)}</span> / <span style={{ color: '#ef4444' }}>{formatPct(st.worst_result_pct)}</span></div>
+                    </div>
+                  )}
                 </div>
               )
             })}
