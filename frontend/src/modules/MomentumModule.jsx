@@ -226,7 +226,18 @@ export default function MomentumModule() {
       case 'max_favorable': {
         const mf = p.max_favorable_pct || p.peak_pct
         if (!mf || p.status === 'active') return <span style={{ color: 'var(--color-muted)' }}>-</span>
-        return <span style={{ color: '#3b82f6', fontWeight: 500 }}>{Number(mf).toFixed(1)}%</span>
+        const dd = p.max_adverse_pct
+        const sl = p.correction_data?.optimal_sl
+        const slGain = p.correction_data?.optimal_gain
+        const tip = [
+          `Peak: ${Number(mf).toFixed(1)}%`,
+          dd ? `Drawdown: ${Number(dd).toFixed(1)}%` : null,
+          sl ? `Optimal: SL ${sl}% → ${slGain}%` : null
+        ].filter(Boolean).join('\n')
+        return <span title={tip} style={{ cursor: 'help', fontWeight: 500 }}>
+          <span style={{ color: '#3b82f6' }}>{Number(mf).toFixed(1)}%</span>
+          {dd ? <span style={{ color: '#ef4444', fontSize: '0.5rem', marginLeft: 2 }}>{Number(dd).toFixed(0)}</span> : null}
+        </span>
       }
       case 'detected_at': return <span style={{ color: 'var(--color-muted)', fontSize: '0.5625rem' }}>{formatTime(p.detected_at)}</span>
       case 'actions': return p.status === 'active' ? (
