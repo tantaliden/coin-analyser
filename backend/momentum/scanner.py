@@ -128,7 +128,7 @@ def calc_atr(highs, lows, closes, period=14):
     return np.mean(trs[-period:])
 
 
-def analyze_symbol(candles_1h, candles_4h, candles_1d, current_price):
+def analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, btc_context=None):
     """
     Analysiert ein Symbol auf Long/Short Momentum.
     Returns: dict mit signal oder None
@@ -260,6 +260,28 @@ def analyze_symbol(candles_1h, candles_4h, candles_1d, current_price):
         else:
             short_score += 10
             signals.append({'name': 'Price < EMA50', 'type': 'short', 'weight': 10})
+
+    # === BTC MARKTKONTEXT - Score-Modifikator ===
+    if btc_context:
+        btc_trend = btc_context['btc_trend']  # -1 bis +1
+
+        if btc_trend > 0.6:       # stark bullisch
+            short_score -= 20
+            long_score  += 5
+            signals.append({'name': f'BTC bullish ({btc_context["btc_pct_1h"]:+.1f}% 1h) → short -20', 'type': 'btc_context', 'weight': -20})
+        elif btc_trend > 0.25:    # leicht bullisch
+            short_score -= 10
+            signals.append({'name': f'BTC bullish ({btc_context["btc_pct_1h"]:+.1f}% 1h) → short -10', 'type': 'btc_context', 'weight': -10})
+        elif btc_trend < -0.6:    # stark bärisch
+            long_score  -= 20
+            short_score += 5
+            signals.append({'name': f'BTC bearish ({btc_context["btc_pct_1h"]:+.1f}% 1h) → long -20', 'type': 'btc_context', 'weight': -20})
+        elif btc_trend < -0.25:   # leicht bärisch
+            long_score  -= 10
+            signals.append({'name': f'BTC bearish ({btc_context["btc_pct_1h"]:+.1f}% 1h) → long -10', 'type': 'btc_context', 'weight': -10})
+
+        short_score = max(short_score, 0)
+        long_score  = max(long_score, 0)
 
     # === ENTSCHEIDUNG ===
     max_score = max(long_score, short_score)
@@ -1128,6 +1150,42 @@ def get_symbols_for_config(config):
     return []
 
 
+
+def get_btc_context(ccur):
+    """Holt BTC Marktkontext für Score-Modifikator. Einmal pro Loop-Durchgang."""
+    try:
+        ccur.execute("""
+            SELECT close FROM klines
+            WHERE symbol='BTCUSDC' AND interval='1m'
+            ORDER BY open_time DESC LIMIT 241
+        """)
+        rows = ccur.fetchall()
+        if not rows or len(rows) < 60:
+            return None
+
+        closes = [r['close'] for r in reversed(rows)]
+        now  = closes[-1]
+        h1   = closes[-60]  if len(closes) >= 60  else closes[0]
+        h4   = closes[-240] if len(closes) >= 240 else closes[0]
+
+        pct_1h = (now - h1) / h1 * 100 if h1 > 0 else 0.0
+        pct_4h = (now - h4) / h4 * 100 if h4 > 0 else 0.0
+
+        # Gewichtet: 1h = 60%, 4h = 40%. Normalisiert auf -1..+1 (±3% Sättigung)
+        norm_1h   = max(-1.0, min(1.0, pct_1h / 3.0))
+        norm_4h   = max(-1.0, min(1.0, pct_4h / 3.0))
+        btc_trend = round(norm_1h * 0.6 + norm_4h * 0.4, 3)
+
+        return {
+            'btc_pct_1h': round(pct_1h, 2),
+            'btc_pct_4h': round(pct_4h, 2),
+            'btc_trend':  btc_trend,
+        }
+    except Exception as e:
+        logger.warning(f"[BTC_CTX] Fehler: {e}")
+        return None
+
+
 def scan_symbols(config, symbols):
     """Scannt eine Liste von Symbolen und erstellt Predictions"""
     user_id = config['user_id']
@@ -1173,6 +1231,13 @@ def scan_symbols(config, symbols):
         """, (user_id,))
         cooldown_symbols = {r['symbol'] for r in acur.fetchall()}
         active_symbols = active_symbols | cooldown_symbols
+
+        # BTC Marktkontext einmal pro Loop holen
+        btc_context = get_btc_context(ccur)
+        if btc_context:
+            logger.info(f"[BTC_CTX] BTC 1h={btc_context['btc_pct_1h']:+.2f}% 4h={btc_context['btc_pct_4h']:+.2f}% trend={btc_context['btc_trend']:+.3f}")
+        else:
+            logger.warning("[BTC_CTX] Kein BTC Kontext verfügbar, kein Score-Modifier")
 
         for symbol in symbols:
             if not running:
@@ -1221,7 +1286,7 @@ def scan_symbols(config, symbols):
                     continue
 
                 # Analyse (liefert Signal + expected_move, OHNE TP/SL)
-                signal = analyze_symbol(candles_1h, candles_4h, candles_1d, current_price)
+                signal = analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, btc_context=btc_context)
 
                 if signal and signal['confidence'] >= dir_config[signal['direction']]['min_conf']:
                     # Filter: erwartete Bewegung muss min_target_pct überschreiten
