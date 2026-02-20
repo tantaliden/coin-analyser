@@ -128,7 +128,7 @@ def calc_atr(highs, lows, closes, period=14):
     return np.mean(trs[-period:])
 
 
-def analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, btc_context=None):
+def analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, market_context=None):
     """
     Analysiert ein Symbol auf Long/Short Momentum.
     Returns: dict mit signal oder None
@@ -261,27 +261,35 @@ def analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, btc_contex
             short_score += 10
             signals.append({'name': 'Price < EMA50', 'type': 'short', 'weight': 10})
 
-    # === BTC MARKTKONTEXT - Score-Modifikator ===
-    if btc_context:
-        btc_trend = btc_context['btc_trend']  # -1 bis +1
+    # === MARKTKONTEXT - Score-Modifikator (nur Shorts, Long-Datenbasis zu dünn) ===
+    if market_context:
+        trend     = market_context['market_trend']  # -1..+1
+        avg_4h    = market_context['avg_4h']
+        breadth_4h = market_context['breadth_4h']
 
-        if btc_trend > 0.6:       # stark bullisch
-            short_score -= 20
-            long_score  += 5
-            signals.append({'name': f'BTC bullish ({btc_context["btc_pct_1h"]:+.1f}% 1h) → short -20', 'type': 'btc_context', 'weight': -20})
-        elif btc_trend > 0.25:    # leicht bullisch
-            short_score -= 10
-            signals.append({'name': f'BTC bullish ({btc_context["btc_pct_1h"]:+.1f}% 1h) → short -10', 'type': 'btc_context', 'weight': -10})
-        elif btc_trend < -0.6:    # stark bärisch
-            long_score  -= 20
-            short_score += 5
-            signals.append({'name': f'BTC bearish ({btc_context["btc_pct_1h"]:+.1f}% 1h) → long -20', 'type': 'btc_context', 'weight': -20})
-        elif btc_trend < -0.25:   # leicht bärisch
-            long_score  -= 10
-            signals.append({'name': f'BTC bearish ({btc_context["btc_pct_1h"]:+.1f}% 1h) → long -10', 'type': 'btc_context', 'weight': -10})
+        # Absoluter Block: Move bereits gelaufen → kein Short mehr sinnvoll
+        if avg_4h < -1.5 and breadth_4h < 0.25:
+            short_score = 0
+            signals.append({
+                'name': f'Market oversold (avg4h={avg_4h:+.1f}% breadth={breadth_4h:.2f}) → short blocked',
+                'type': 'market_context', 'weight': -99
+            })
+        else:
+            # Gradueller Strafscore: Markt zu bullish für Shorts
+            if trend > 0.6:
+                short_score -= 20
+                signals.append({
+                    'name': f'Market bullish (trend={trend:+.2f}) → short -20',
+                    'type': 'market_context', 'weight': -20
+                })
+            elif trend > 0.25:
+                short_score -= 10
+                signals.append({
+                    'name': f'Market bullish (trend={trend:+.2f}) → short -10',
+                    'type': 'market_context', 'weight': -10
+                })
 
         short_score = max(short_score, 0)
-        long_score  = max(long_score, 0)
 
     # === ENTSCHEIDUNG ===
     max_score = max(long_score, short_score)
@@ -1151,38 +1159,52 @@ def get_symbols_for_config(config):
 
 
 
-def get_btc_context(ccur):
-    """Holt BTC Marktkontext für Score-Modifikator. Einmal pro Loop-Durchgang."""
+def get_market_context(ccur):
+    """
+    Marktbreite über alle USDC-Symbole aus kline_metrics.
+    Einmal pro Loop-Durchgang — eine Query, kein externes API.
+    market_trend = avg_4h * 0.5 + (breadth_4h - 0.5) * 2 * 0.5  → -1..+1
+    """
     try:
         ccur.execute("""
-            SELECT close FROM klines
-            WHERE symbol='BTCUSDC' AND interval='1m'
-            ORDER BY open_time DESC LIMIT 241
+            SELECT
+                AVG(pct_240m)                                          AS avg_4h,
+                COUNT(*) FILTER (WHERE pct_240m > 0)::float / COUNT(*) AS breadth_4h,
+                AVG(pct_60m)                                           AS avg_1h,
+                COUNT(*) FILTER (WHERE pct_60m  > 0)::float / COUNT(*) AS breadth_1h
+            FROM kline_metrics
+            WHERE open_time = (
+                SELECT MAX(open_time) FROM kline_metrics
+                WHERE open_time <= date_trunc('hour', NOW())
+            )
+            AND pct_240m IS NOT NULL
         """)
-        rows = ccur.fetchall()
-        if not rows or len(rows) < 60:
+        row = ccur.fetchone()
+        if not row or row['avg_4h'] is None:
             return None
 
-        closes = [r['close'] for r in reversed(rows)]
-        now  = closes[-1]
-        h1   = closes[-60]  if len(closes) >= 60  else closes[0]
-        h4   = closes[-240] if len(closes) >= 240 else closes[0]
+        avg_4h     = float(row['avg_4h'])
+        breadth_4h = float(row['breadth_4h'])
+        avg_1h     = float(row['avg_1h'] or 0)
+        breadth_1h = float(row['breadth_1h'] or 0.5)
 
-        pct_1h = (now - h1) / h1 * 100 if h1 > 0 else 0.0
-        pct_4h = (now - h4) / h4 * 100 if h4 > 0 else 0.0
+        # Normalisieren: avg_4h Sättigung bei ±2%
+        norm_avg    = max(-1.0, min(1.0, avg_4h / 2.0))
+        # breadth zentriert um 0.5 (neutral=0), Sättigung bei ±0.5
+        norm_breadth = max(-1.0, min(1.0, (breadth_4h - 0.5) * 2.0))
 
-        # Gewichtet: 1h = 60%, 4h = 40%. Normalisiert auf -1..+1 (±3% Sättigung)
-        norm_1h   = max(-1.0, min(1.0, pct_1h / 3.0))
-        norm_4h   = max(-1.0, min(1.0, pct_4h / 3.0))
-        btc_trend = round(norm_1h * 0.6 + norm_4h * 0.4, 3)
+        # Gleichgewichtet 50/50
+        market_trend = round(norm_avg * 0.5 + norm_breadth * 0.5, 3)
 
         return {
-            'btc_pct_1h': round(pct_1h, 2),
-            'btc_pct_4h': round(pct_4h, 2),
-            'btc_trend':  btc_trend,
+            'avg_4h':       round(avg_4h, 3),
+            'breadth_4h':   round(breadth_4h, 3),
+            'avg_1h':       round(avg_1h, 3),
+            'breadth_1h':   round(breadth_1h, 3),
+            'market_trend': market_trend,
         }
     except Exception as e:
-        logger.warning(f"[BTC_CTX] Fehler: {e}")
+        logger.warning(f"[MKT_CTX] Fehler: {e}")
         return None
 
 
@@ -1232,12 +1254,12 @@ def scan_symbols(config, symbols):
         cooldown_symbols = {r['symbol'] for r in acur.fetchall()}
         active_symbols = active_symbols | cooldown_symbols
 
-        # BTC Marktkontext einmal pro Loop holen
-        btc_context = get_btc_context(ccur)
-        if btc_context:
-            logger.info(f"[BTC_CTX] BTC 1h={btc_context['btc_pct_1h']:+.2f}% 4h={btc_context['btc_pct_4h']:+.2f}% trend={btc_context['btc_trend']:+.3f}")
+        # Marktkontext einmal pro Loop holen (alle USDC-Symbole aus kline_metrics)
+        market_context = get_market_context(ccur)
+        if market_context:
+            logger.info(f"[MKT_CTX] avg_4h={market_context['avg_4h']:+.2f}% breadth_4h={market_context['breadth_4h']:.2f} trend={market_context['market_trend']:+.3f}")
         else:
-            logger.warning("[BTC_CTX] Kein BTC Kontext verfügbar, kein Score-Modifier")
+            logger.warning("[MKT_CTX] Kein Marktkontext verfügbar, kein Score-Modifier")
 
         for symbol in symbols:
             if not running:
@@ -1286,7 +1308,7 @@ def scan_symbols(config, symbols):
                     continue
 
                 # Analyse (liefert Signal + expected_move, OHNE TP/SL)
-                signal = analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, btc_context=btc_context)
+                signal = analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, market_context=market_context)
 
                 if signal and signal['confidence'] >= dir_config[signal['direction']]['min_conf']:
                     # Filter: erwartete Bewegung muss min_target_pct überschreiten
