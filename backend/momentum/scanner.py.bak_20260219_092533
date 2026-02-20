@@ -1,0 +1,1336 @@
+#!/usr/bin/env python3
+"""
+Momentum Scanner - Separates Autoscan-Modul
+Scannt Coins auf Long/Short Momentum, schreibt Predictions,
+überwacht aktive Predictions, führt Autokorrektur durch.
+
+Liest: coins DB (agg_1h, agg_4h, agg_1d)
+Schreibt: analyser_app DB (momentum_predictions, momentum_stats, momentum_corrections)
+"""
+
+import os
+import sys
+import time
+import json
+import signal
+import logging
+import traceback
+from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+
+import psycopg2
+from psycopg2.extras import RealDictCursor, Json
+import numpy as np
+
+# ============================================
+# LOGGING
+# ============================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('/opt/coin/logs/momentum_scanner.log')
+    ]
+)
+logger = logging.getLogger('momentum_scanner')
+
+# ============================================
+# CONFIG aus settings.json
+# ============================================
+from pathlib import Path
+ROOT_DIR = Path(__file__).resolve().parent.parent
+with open(ROOT_DIR / 'settings.json') as f:
+    SETTINGS = json.load(f)
+
+COINS_DB_CFG = SETTINGS['databases']['coins']
+APP_DB_CFG = SETTINGS['databases']['app']
+
+# ============================================
+# GLOBALS
+# ============================================
+running = True
+
+def signal_handler(signum, frame):
+    global running
+    logger.info(f"Signal {signum} received, shutting down...")
+    running = False
+
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+# ============================================
+# DB CONNECTIONS
+# ============================================
+@contextmanager
+def coins_db():
+    conn = psycopg2.connect(
+        host=COINS_DB_CFG['host'], port=COINS_DB_CFG['port'],
+        dbname=COINS_DB_CFG['name'], user=COINS_DB_CFG['user'],
+        password=COINS_DB_CFG['password'], cursor_factory=RealDictCursor
+    )
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+@contextmanager
+def app_db():
+    conn = psycopg2.connect(
+        host=APP_DB_CFG['host'], port=APP_DB_CFG['port'],
+        dbname=APP_DB_CFG['name'], user=APP_DB_CFG['user'],
+        password=APP_DB_CFG['password'], cursor_factory=RealDictCursor
+    )
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+# ============================================
+# SIGNAL DETECTION LOGIC
+# ============================================
+
+def calc_rsi(closes, period=14):
+    """RSI berechnen aus Close-Preisen"""
+    if len(closes) < period + 1:
+        return None
+    deltas = np.diff(closes)
+    gains = np.where(deltas > 0, deltas, 0)
+    losses = np.where(deltas < 0, -deltas, 0)
+    avg_gain = np.mean(gains[-period:])
+    avg_loss = np.mean(losses[-period:])
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def calc_ema(values, period):
+    """EMA berechnen"""
+    if len(values) < period:
+        return None
+    multiplier = 2 / (period + 1)
+    ema = values[0]
+    for v in values[1:]:
+        ema = (v - ema) * multiplier + ema
+    return ema
+
+
+def calc_atr(highs, lows, closes, period=14):
+    """Average True Range"""
+    if len(closes) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        trs.append(tr)
+    return np.mean(trs[-period:])
+
+
+def analyze_symbol(candles_1h, candles_4h, candles_1d, current_price):
+    """
+    Analysiert ein Symbol auf Long/Short Momentum.
+    Returns: dict mit signal oder None
+    """
+    if len(candles_1h) < 30 or len(candles_4h) < 15 or len(candles_1d) < 10:
+        return None
+
+    # Arrays extrahieren
+    closes_1h = [c['close'] for c in candles_1h]
+    highs_1h = [c['high'] for c in candles_1h]
+    lows_1h = [c['low'] for c in candles_1h]
+    volumes_1h = [c['volume'] for c in candles_1h]
+
+    closes_4h = [c['close'] for c in candles_4h]
+    closes_1d = [c['close'] for c in candles_1d]
+    volumes_1d = [c['volume'] for c in candles_1d]
+
+    # === INDIKATOREN BERECHNEN ===
+
+    # RSI (1h)
+    rsi_1h = calc_rsi(closes_1h, 14)
+    if rsi_1h is None:
+        return None
+
+    # EMAs (1h)
+    ema_9 = calc_ema(closes_1h, 9)
+    ema_21 = calc_ema(closes_1h, 21)
+    ema_50 = calc_ema(closes_1h[-50:], 50) if len(closes_1h) >= 50 else None
+
+    # ATR für SL-Berechnung
+    atr = calc_atr(highs_1h, lows_1h, closes_1h, 14)
+
+    # Volume: letzte 3 Candles vs. Durchschnitt
+    avg_vol = np.mean(volumes_1h[-20:]) if len(volumes_1h) >= 20 else np.mean(volumes_1h)
+    recent_vol = np.mean(volumes_1h[-3:])
+    vol_ratio = recent_vol / avg_vol if avg_vol > 0 else 1
+
+    # Trend 4h: steigende oder fallende Closes
+    trend_4h = 0
+    if len(closes_4h) >= 5:
+        recent_4h = closes_4h[-5:]
+        rising = sum(1 for i in range(1, len(recent_4h)) if recent_4h[i] > recent_4h[i-1])
+        trend_4h = (rising / (len(recent_4h) - 1)) * 2 - 1  # -1 bis +1
+
+    # Trend 1d
+    trend_1d = 0
+    if len(closes_1d) >= 5:
+        recent_1d = closes_1d[-5:]
+        rising = sum(1 for i in range(1, len(recent_1d)) if recent_1d[i] > recent_1d[i-1])
+        trend_1d = (rising / (len(recent_1d) - 1)) * 2 - 1
+
+    # Higher Highs / Higher Lows (1h, letzte 6 Candles)
+    hh_hl = 0
+    if len(highs_1h) >= 6 and len(lows_1h) >= 6:
+        recent_highs = highs_1h[-6:]
+        recent_lows = lows_1h[-6:]
+        higher_highs = sum(1 for i in range(1, 6) if recent_highs[i] > recent_highs[i-1])
+        higher_lows = sum(1 for i in range(1, 6) if recent_lows[i] > recent_lows[i-1])
+        hh_hl = (higher_highs + higher_lows) / 10  # 0 bis 1
+
+    # Momentum: % Change letzte 6h
+    pct_6h = ((closes_1h[-1] - closes_1h[-6]) / closes_1h[-6] * 100) if closes_1h[-6] > 0 else 0
+
+    # === SIGNAL SCORING ===
+    long_score = 0
+    short_score = 0
+    signals = []
+
+    # 1. EMA Crossover (9 > 21 = bullish)
+    if ema_9 and ema_21:
+        if ema_9 > ema_21:
+            long_score += 15
+            signals.append({'name': 'EMA9>EMA21', 'type': 'long', 'weight': 15})
+        else:
+            short_score += 15
+            signals.append({'name': 'EMA9<EMA21', 'type': 'short', 'weight': 15})
+
+    # 2. RSI
+    if rsi_1h < 30:
+        long_score += 20  # Oversold = Long opportunity
+        signals.append({'name': f'RSI oversold ({rsi_1h:.0f})', 'type': 'long', 'weight': 20})
+    elif rsi_1h < 45:
+        long_score += 10
+        signals.append({'name': f'RSI low ({rsi_1h:.0f})', 'type': 'long', 'weight': 10})
+    elif rsi_1h > 70:
+        short_score += 20
+        signals.append({'name': f'RSI overbought ({rsi_1h:.0f})', 'type': 'short', 'weight': 20})
+    elif rsi_1h > 55:
+        short_score += 10
+        signals.append({'name': f'RSI high ({rsi_1h:.0f})', 'type': 'short', 'weight': 10})
+
+    # 3. Volume Confirmation
+    if vol_ratio > 1.5:
+        if pct_6h > 0:
+            long_score += 15
+            signals.append({'name': f'Volume surge +buy ({vol_ratio:.1f}x)', 'type': 'long', 'weight': 15})
+        else:
+            short_score += 15
+            signals.append({'name': f'Volume surge +sell ({vol_ratio:.1f}x)', 'type': 'short', 'weight': 15})
+
+    # 4. Multi-Timeframe Trend Alignment
+    if trend_4h > 0.3:
+        long_score += 15
+        signals.append({'name': f'4h trend up ({trend_4h:.2f})', 'type': 'long', 'weight': 15})
+    elif trend_4h < -0.3:
+        short_score += 15
+        signals.append({'name': f'4h trend down ({trend_4h:.2f})', 'type': 'short', 'weight': 15})
+
+    if trend_1d > 0.3:
+        long_score += 10
+        signals.append({'name': f'1d trend up ({trend_1d:.2f})', 'type': 'long', 'weight': 10})
+    elif trend_1d < -0.3:
+        short_score += 10
+        signals.append({'name': f'1d trend down ({trend_1d:.2f})', 'type': 'short', 'weight': 10})
+
+    # 5. Higher Highs / Higher Lows Pattern
+    if hh_hl > 0.5:
+        long_score += 15
+        signals.append({'name': f'HH/HL pattern ({hh_hl:.2f})', 'type': 'long', 'weight': 15})
+    elif hh_hl < 0.2:
+        short_score += 15
+        signals.append({'name': f'LL/LH pattern ({hh_hl:.2f})', 'type': 'short', 'weight': 15})
+
+    # 6. Price above/below EMA50 (Trend)
+    if ema_50:
+        if current_price > ema_50:
+            long_score += 10
+            signals.append({'name': 'Price > EMA50', 'type': 'long', 'weight': 10})
+        else:
+            short_score += 10
+            signals.append({'name': 'Price < EMA50', 'type': 'short', 'weight': 10})
+
+    # === ENTSCHEIDUNG ===
+    max_score = max(long_score, short_score)
+    if max_score < 40:
+        return None  # Kein klares Signal
+
+    direction = 'long' if long_score > short_score else 'short'
+    confidence = min(max_score, 100)
+
+    # === EXPECTED MOVE (ATR-basiert, unabhängig von User TP/SL) ===
+    expected_move_pct = 0.0
+    if atr and atr > 0 and current_price > 0:
+        # ATR * 2.5 als erwartbare Bewegung
+        expected_move_pct = (atr * 2.5 / current_price) * 100
+    else:
+        # Fallback: 6h Momentum als Schätzung
+        expected_move_pct = abs(pct_6h) * 1.5 if pct_6h != 0 else 0
+
+    # Reason Text
+    top_signals = sorted([s for s in signals if s['type'] == direction], key=lambda x: -x['weight'])[:3]
+    reason = ', '.join(s['name'] for s in top_signals)
+
+    return {
+        'direction': direction,
+        'confidence': confidence,
+        'entry_price': current_price,
+        'expected_move_pct': round(expected_move_pct, 2),
+        'reason': reason,
+        'signals': signals,
+        'indicators': {
+            'rsi_1h': round(rsi_1h, 1),
+            'ema_9': round(ema_9, 8) if ema_9 else None,
+            'ema_21': round(ema_21, 8) if ema_21 else None,
+            'ema_50': round(ema_50, 8) if ema_50 else None,
+            'vol_ratio': round(vol_ratio, 2),
+            'trend_4h': round(trend_4h, 2),
+            'trend_1d': round(trend_1d, 2),
+            'atr': round(atr, 8) if atr else None,
+            'pct_6h': round(pct_6h, 2),
+            'hh_hl': round(hh_hl, 2),
+        }
+    }
+
+
+# ============================================
+# PREDICTION MONITORING
+# ============================================
+
+def check_active_predictions():
+    """Prüft alle aktiven Predictions gegen aktuelle Preise"""
+    with app_db() as aconn, coins_db() as cconn:
+        acur = aconn.cursor()
+        ccur = cconn.cursor()
+
+        acur.execute("SELECT * FROM momentum_predictions WHERE status = 'active'")
+        active = acur.fetchall()
+
+        if not active:
+            return 0
+
+        resolved_count = 0
+        for pred in active:
+            symbol = pred['symbol']
+            
+            # Aktuellen Preis holen (letzter 1m Kurs + 1h High/Low für Peak/Trough)
+            ccur.execute("""
+                SELECT close FROM klines
+                WHERE symbol = %s AND interval = '1m'
+                ORDER BY open_time DESC LIMIT 1
+            """, (symbol,))
+            row_1m = ccur.fetchone()
+            if not row_1m:
+                continue
+
+            # High/Low seit Detection für Peak/Trough
+            ccur.execute("""
+                SELECT MAX(high) as high, MIN(low) as low FROM klines
+                WHERE symbol = %s AND interval = '1m' AND open_time >= %s
+            """, (symbol, pred['detected_at']))
+            row_hl = ccur.fetchone()
+
+            current = row_1m['close']
+            entry = pred['entry_price']
+            row = {'close': current, 'high': row_hl['high'] or current, 'low': row_hl['low'] or current}
+            
+            # Peak/Trough tracken
+            if pred['direction'] == 'long':
+                pct_change = ((current - entry) / entry) * 100
+                peak = max(pred['peak_pct'] or 0, ((row['high'] - entry) / entry) * 100)
+                trough = min(pred['trough_pct'] or 0, ((row['low'] - entry) / entry) * 100)
+            else:
+                pct_change = ((entry - current) / entry) * 100
+                peak = max(pred['peak_pct'] or 0, ((entry - row['low']) / entry) * 100)
+                trough = min(pred['trough_pct'] or 0, ((entry - row['high']) / entry) * 100)
+
+            # Status prüfen
+            new_status = None
+            duration = int((datetime.now(timezone.utc) - pred['detected_at']).total_seconds() / 60)
+
+            if pred['direction'] == 'long':
+                if current >= pred['take_profit_price']:
+                    new_status = 'hit_tp'
+                elif current <= pred['stop_loss_price']:
+                    new_status = 'hit_sl'
+            else:
+                if current <= pred['take_profit_price']:
+                    new_status = 'hit_tp'
+                elif current >= pred['stop_loss_price']:
+                    new_status = 'hit_sl'
+
+            # Expiry: max 72h
+            if not new_status and pred['expires_at'] and datetime.now(timezone.utc) >= pred['expires_at']:
+                new_status = 'expired'
+
+            # Invalidierung: Trend komplett gedreht (Confidence < 20 bei Neuberechnung)
+            if not new_status:
+                # Einfacher Check: wenn pct_change < -3% bei Long oder > +3% bei Short → invalidieren
+                if (pred['direction'] == 'long' and pct_change < -3) or \
+                   (pred['direction'] == 'short' and pct_change < -3):
+                    new_status = 'invalidated'
+
+            if new_status:
+                was_correct = new_status == 'hit_tp'
+                acur.execute("""
+                    UPDATE momentum_predictions
+                    SET status = %s, resolved_at = NOW(), actual_result_pct = %s,
+                        peak_pct = %s, trough_pct = %s, duration_minutes = %s,
+                        was_correct = %s, max_favorable_pct = %s
+                    WHERE prediction_id = %s
+                """, (new_status, round(pct_change, 4), round(peak, 4), round(trough, 4),
+                      duration, was_correct, round(peak, 4), pred['prediction_id']))
+                
+                resolved_count += 1
+                logger.info(f"[RESOLVE] {symbol} {pred['direction']} → {new_status} ({pct_change:+.2f}%)")
+
+                # Autokorrektur starten
+                if not was_correct:
+                    run_autocorrection(aconn, cconn, pred, pct_change)
+            else:
+                # Peak/Trough updaten
+                acur.execute("""
+                    UPDATE momentum_predictions SET peak_pct = %s, trough_pct = %s
+                    WHERE prediction_id = %s
+                """, (round(peak, 4), round(trough, 4), pred['prediction_id']))
+
+        aconn.commit()
+        return resolved_count
+
+
+# ============================================
+# AUTOKORREKTUR
+# ============================================
+
+
+
+def track_resolved_predictions():
+    """Post-Resolve Tracking: Candle-by-Candle Analyse seit Entry.
+    Berechnet realistisches max_favorable (mit Drawdown-Beruecksichtigung)
+    und optimales SL fuer maximalen Gewinn."""
+    REVERSAL_THRESHOLD = 1.5  # 1.5% Ruecklauf vom Peak = Trendwende
+    MAX_TRACK_HOURS = 48
+    
+    with app_db() as aconn, coins_db() as cconn:
+        acur = aconn.cursor()
+        ccur = cconn.cursor()
+
+        acur.execute("""
+            SELECT prediction_id, symbol, direction, entry_price, 
+                   take_profit_pct, stop_loss_pct, detected_at,
+                   peak_pct, trough_pct, resolved_at, max_favorable_pct
+            FROM momentum_predictions
+            WHERE status IN ('hit_tp', 'hit_sl')
+              AND trend_reversal_at IS NULL
+              AND resolved_at >= NOW() - INTERVAL '%s hours'
+        """ % MAX_TRACK_HOURS)
+        preds = acur.fetchall()
+
+        if not preds:
+            return 0
+
+        tracked = 0
+        for pred in preds:
+            symbol = pred['symbol']
+            entry = pred['entry_price']
+            direction = pred['direction']
+            
+            # Alle 1m Candles seit Entry holen
+            ccur.execute("""
+                SELECT open_time, high, low, close FROM klines
+                WHERE symbol = %s AND interval = '1m' AND open_time >= %s
+                ORDER BY open_time ASC
+            """, (symbol, pred['detected_at']))
+            candles = ccur.fetchall()
+            
+            if len(candles) < 5:
+                continue
+
+            # Candle-by-Candle: Peak und Trough berechnen
+            running_peak = 0.0  # Bester Punkt in richtige Richtung
+            running_adverse = 0.0  # Schlechtester Punkt (Drawdown)
+            peak_before_reversal = 0.0
+            reversal_pct = None
+            
+            # Fuer jedes SL-Level simulieren: was waere der max Gewinn?
+            sl_simulations = {}  # sl_pct -> max_gain_before_stopped
+            for sl_test in [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.0, 10.0]:
+                sl_simulations[sl_test] = {'stopped': False, 'max_gain': 0.0}
+            
+            for candle in candles:
+                if direction == 'long':
+                    high_pct = ((candle['high'] - entry) / entry) * 100
+                    low_pct = ((candle['low'] - entry) / entry) * 100
+                    close_pct = ((candle['close'] - entry) / entry) * 100
+                    favorable = high_pct
+                    adverse = low_pct
+                else:
+                    high_pct = ((entry - candle['low']) / entry) * 100  # guenstig bei short
+                    low_pct = ((entry - candle['high']) / entry) * 100  # ungünstig bei short
+                    close_pct = ((entry - candle['close']) / entry) * 100
+                    favorable = high_pct
+                    adverse = low_pct
+                
+                running_peak = max(running_peak, favorable)
+                running_adverse = min(running_adverse, adverse)
+                
+                # SL Simulationen updaten
+                for sl_pct, sim in sl_simulations.items():
+                    if not sim['stopped']:
+                        if adverse <= -sl_pct:
+                            sim['stopped'] = True
+                        else:
+                            sim['max_gain'] = max(sim['max_gain'], favorable)
+                
+                # Trendwende erkennen: Peak erreicht und dann REVERSAL_THRESHOLD% zurueck
+                if running_peak > 0 and reversal_pct is None:
+                    if (running_peak - close_pct) >= REVERSAL_THRESHOLD:
+                        reversal_pct = close_pct
+                        peak_before_reversal = running_peak
+
+            # Bestes SL finden (das mit hoechstem max_gain das nicht gestoppt wurde, 
+            # oder falls gestoppt: hoechster Gain vor Stop)
+            best_sl = None
+            best_gain = 0.0
+            for sl_pct in sorted(sl_simulations.keys()):
+                sim = sl_simulations[sl_pct]
+                if sim['max_gain'] > best_gain:
+                    best_gain = sim['max_gain']
+                    best_sl = sl_pct
+
+            # Optimal SL als JSON in correction_data speichern
+            import json
+            sl_analysis = {
+                'sl_simulations': {str(k): {'max_gain': round(v['max_gain'], 2), 'stopped': v['stopped']} for k, v in sl_simulations.items()},
+                'optimal_sl': best_sl,
+                'optimal_gain': round(best_gain, 2),
+                'max_drawdown': round(running_adverse, 2)
+            }
+
+            if reversal_pct is not None:
+                # Trendwende erkannt
+                acur.execute("""
+                    UPDATE momentum_predictions 
+                    SET max_favorable_pct = %s, max_adverse_pct = %s,
+                        trend_reversal_at = NOW(), trend_reversal_pct = %s,
+                        correction_data = COALESCE(correction_data, '{}'::jsonb) || %s::jsonb
+                    WHERE prediction_id = %s
+                """, (round(running_peak, 4), round(running_adverse, 4),
+                      round(reversal_pct, 4), json.dumps(sl_analysis),
+                      pred['prediction_id']))
+                tracked += 1
+                opt_info = f"optimal SL={best_sl}% -> {best_gain:+.1f}%" if best_sl else ""
+                logger.info(f"[POST-TRACK] {symbol} {direction}: peak={running_peak:+.2f}% drawdown={running_adverse:+.2f}% reversal={reversal_pct:+.2f}% {opt_info}")
+            else:
+                # Noch keine Trendwende - nur updaten
+                acur.execute("""
+                    UPDATE momentum_predictions 
+                    SET max_favorable_pct = %s, max_adverse_pct = %s
+                    WHERE prediction_id = %s
+                """, (round(running_peak, 4), round(running_adverse, 4),
+                      pred['prediction_id']))
+
+        aconn.commit()
+        return tracked
+
+
+def run_autocorrection(aconn, cconn, pred, actual_pct):
+    """
+    Simuliert: was wäre gewesen mit leicht veränderten TP/SL?
+    Prüft Varianten und speichert die beste Alternative.
+    """
+    symbol = pred['symbol']
+    entry = pred['entry_price']
+    detected = pred['detected_at']
+    direction = pred['direction']
+
+    # Historische Preise seit Detection holen
+    ccur = cconn.cursor()
+    ccur.execute("""
+        SELECT bucket, high, low, close FROM agg_1h
+        WHERE symbol = %s AND bucket >= %s AND bucket <= %s
+        ORDER BY bucket
+    """, (symbol, detected, detected + timedelta(hours=72)))
+    candles = ccur.fetchall()
+
+    if len(candles) < 2:
+        return
+
+    # Varianten simulieren
+    tp_variants = [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0]
+    sl_variants = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
+    
+    best_improvement = None
+    acur = aconn.cursor()
+
+    for tp_pct in tp_variants:
+        for sl_pct in sl_variants:
+            if direction == 'long':
+                tp_price = entry * (1 + tp_pct / 100)
+                sl_price = entry * (1 - sl_pct / 100)
+            else:
+                tp_price = entry * (1 - tp_pct / 100)
+                sl_price = entry * (1 + sl_pct / 100)
+
+            sim_result = None
+            sim_pct = 0
+
+            for c in candles:
+                if direction == 'long':
+                    if c['high'] >= tp_price:
+                        sim_result = 'hit_tp'
+                        sim_pct = tp_pct
+                        break
+                    if c['low'] <= sl_price:
+                        sim_result = 'hit_sl'
+                        sim_pct = -sl_pct
+                        break
+                else:
+                    if c['low'] <= tp_price:
+                        sim_result = 'hit_tp'
+                        sim_pct = tp_pct
+                        break
+                    if c['high'] >= sl_price:
+                        sim_result = 'hit_sl'
+                        sim_pct = -sl_pct
+                        break
+
+            if sim_result is None:
+                sim_result = 'expired'
+                last_close = candles[-1]['close']
+                if direction == 'long':
+                    sim_pct = ((last_close - entry) / entry) * 100
+                else:
+                    sim_pct = ((entry - last_close) / entry) * 100
+
+            improvement = sim_pct - actual_pct
+
+            if best_improvement is None or improvement > best_improvement:
+                best_improvement = improvement
+                best_variant = {
+                    'tp_pct': tp_pct, 'sl_pct': sl_pct,
+                    'sim_result': sim_result, 'sim_pct': round(sim_pct, 4),
+                    'improvement': round(improvement, 4)
+                }
+
+    # Beste Variante speichern + globalen Impact prüfen
+    if best_variant and best_variant['improvement'] > 0:
+        new_tp = best_variant['tp_pct']
+        new_sl = best_variant['sl_pct']
+
+        # === GLOBALER IMPACT-TEST ===
+        # Alle bisherigen resolved predictions holen (gleicher User)
+        acur.execute("""
+            SELECT prediction_id, symbol, direction, entry_price, status,
+                   take_profit_pct, stop_loss_pct, detected_at, actual_result_pct
+            FROM momentum_predictions
+            WHERE user_id = %s AND status IN ('hit_tp', 'hit_sl', 'expired', 'invalidated')
+              AND prediction_id != %s
+        """, (pred['user_id'], pred['prediction_id']))
+        past_predictions = acur.fetchall()
+
+        tp_kept = 0
+        tp_lost = 0
+        total_tested = len(past_predictions)
+        ccur2 = cconn.cursor()
+
+        for pp in past_predictions:
+            if pp['status'] != 'hit_tp':
+                continue  # Nur prüfen ob TP-Treffer erhalten bleiben
+
+            # Historische Candles für diese Prediction holen
+            ccur2.execute("""
+                SELECT high, low, close FROM agg_1h
+                WHERE symbol = %s AND bucket >= %s AND bucket <= %s + INTERVAL '72 hours'
+                ORDER BY bucket
+            """, (pp['symbol'], pp['detected_at'], pp['detected_at']))
+            pp_candles = ccur2.fetchall()
+
+            if not pp_candles:
+                tp_kept += 1
+                continue
+
+            # Simulation mit neuen TP/SL Werten
+            pp_entry = pp['entry_price']
+            if pp['direction'] == 'long':
+                sim_tp_price = pp_entry * (1 + new_tp / 100)
+                sim_sl_price = pp_entry * (1 - new_sl / 100)
+            else:
+                sim_tp_price = pp_entry * (1 - new_tp / 100)
+                sim_sl_price = pp_entry * (1 + new_sl / 100)
+
+            sim_hit = None
+            for c in pp_candles:
+                if pp['direction'] == 'long':
+                    if c['high'] >= sim_tp_price:
+                        sim_hit = 'hit_tp'
+                        break
+                    if c['low'] <= sim_sl_price:
+                        sim_hit = 'hit_sl'
+                        break
+                else:
+                    if c['low'] <= sim_tp_price:
+                        sim_hit = 'hit_tp'
+                        break
+                    if c['high'] >= sim_sl_price:
+                        sim_hit = 'hit_sl'
+                        break
+
+            if sim_hit == 'hit_tp':
+                tp_kept += 1
+            else:
+                tp_lost += 1
+
+        # Empfehlung: apply nur wenn max 1 bisheriger TP verloren geht
+        recommendation = 'apply' if tp_lost <= 1 else 'reject'
+
+        acur.execute("""
+            INSERT INTO momentum_corrections 
+            (prediction_id, original_tp_pct, original_sl_pct,
+             simulated_tp_pct, simulated_sl_pct, simulated_result,
+             simulated_result_pct, improvement_pct,
+             global_tp_kept, global_tp_lost, global_total_tested, recommendation)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (pred['prediction_id'], pred['take_profit_pct'], pred['stop_loss_pct'],
+              new_tp, new_sl, best_variant['sim_result'], best_variant['sim_pct'],
+              best_variant['improvement'],
+              tp_kept, tp_lost, total_tested, recommendation))
+        
+        best_variant['global_tp_kept'] = tp_kept
+        best_variant['global_tp_lost'] = tp_lost
+        best_variant['recommendation'] = recommendation
+
+        acur.execute("""
+            UPDATE momentum_predictions SET correction_data = %s
+            WHERE prediction_id = %s
+        """, (Json(best_variant), pred['prediction_id']))
+        
+        logger.info(f"[CORRECTION] {symbol}: TP {pred['take_profit_pct']}->{new_tp}%, "
+                     f"SL {pred['stop_loss_pct']}->{new_sl}% -> {best_variant['sim_result']} "
+                     f"(+{best_variant['improvement']:.2f}%) | "
+                     f"Global: {tp_kept} kept, {tp_lost} lost -> {recommendation}")
+
+
+
+# ============================================
+# STATS UPDATE
+# ============================================
+
+def update_stats(user_id):
+    """Aktualisiert die Statistik-Tabelle für einen User (gesamt + long/short getrennt)"""
+    with app_db() as conn:
+        cur = conn.cursor()
+        
+        time_periods = {
+            '24h': "detected_at >= NOW() - INTERVAL '24 hours'",
+            '7d': "detected_at >= NOW() - INTERVAL '7 days'",
+            '30d': "detected_at >= NOW() - INTERVAL '30 days'",
+            'all': "TRUE"
+        }
+
+        # Alle Kombinationen: gesamt + long + short
+        combos = []
+        for tp, tw in time_periods.items():
+            combos.append((tp, tw, None))  # gesamt
+            combos.append((f'long_{tp}', tw, 'long'))
+            combos.append((f'short_{tp}', tw, 'short'))
+
+        for period_key, time_where, direction in combos:
+            dir_where = f" AND direction = '{direction}'" if direction else ""
+            cur.execute(f"""
+                SELECT 
+                    COUNT(*) as total,
+                    COUNT(*) FILTER (WHERE was_correct = true) as correct,
+                    COUNT(*) FILTER (WHERE was_correct = false) as incorrect,
+                    COUNT(*) FILTER (WHERE status = 'expired') as expired,
+                    AVG(confidence) as avg_conf,
+                    AVG(actual_result_pct) as avg_result,
+                    MAX(actual_result_pct) as best,
+                    MIN(actual_result_pct) as worst,
+                    AVG(duration_minutes) as avg_dur
+                FROM momentum_predictions
+                WHERE user_id = %s AND status != 'active' AND {time_where}{dir_where}
+            """, (user_id,))
+            
+            row = cur.fetchone()
+            total = row['total'] or 0
+            correct = row['correct'] or 0
+            hit_rate = (correct / total * 100) if total > 0 else 0
+
+            cur.execute("""
+                INSERT INTO momentum_stats (user_id, period, total_predictions, correct_predictions,
+                    incorrect_predictions, expired_predictions, avg_confidence, avg_result_pct,
+                    best_result_pct, worst_result_pct, hit_rate_pct, avg_duration_minutes, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (user_id, period) DO UPDATE SET
+                    total_predictions = EXCLUDED.total_predictions,
+                    correct_predictions = EXCLUDED.correct_predictions,
+                    incorrect_predictions = EXCLUDED.incorrect_predictions,
+                    expired_predictions = EXCLUDED.expired_predictions,
+                    avg_confidence = EXCLUDED.avg_confidence,
+                    avg_result_pct = EXCLUDED.avg_result_pct,
+                    best_result_pct = EXCLUDED.best_result_pct,
+                    worst_result_pct = EXCLUDED.worst_result_pct,
+                    hit_rate_pct = EXCLUDED.hit_rate_pct,
+                    avg_duration_minutes = EXCLUDED.avg_duration_minutes,
+                    updated_at = NOW()
+            """, (user_id, period_key, total, correct, row['incorrect'] or 0,
+                  row['expired'] or 0, row['avg_conf'], row['avg_result'],
+                  row['best'], row['worst'], round(hit_rate, 2),
+                  int(row['avg_dur']) if row['avg_dur'] else None))
+
+        conn.commit()
+
+
+
+
+# ============================================
+# DAILY OPTIMIZER - 2x täglich
+# ============================================
+
+_last_optimization_run = None
+
+def should_run_optimization():
+    """Prüft ob Optimierung laufen soll (08:00 und 20:00 Berlin)"""
+    global _last_optimization_run
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo('Europe/Berlin'))
+    run_hours = [8, 20]
+    
+    if now.hour in run_hours:
+        today_key = f"{now.date()}-{now.hour}"
+        if _last_optimization_run != today_key:
+            return today_key
+    return None
+
+
+def run_daily_optimization(user_id, config):
+    """
+    Tägliche Optimierung: Analysiert alle resolved Predictions der letzten 7 Tage.
+    Testet Parameter-Varianten und prüft ob Änderungen die Gesamtbilanz verbessern.
+    """
+    global _last_optimization_run
+    
+    logger.info(f"[OPTIMIZER] Starting daily optimization for user {user_id}...")
+    
+    with app_db() as aconn, coins_db() as cconn:
+        acur = aconn.cursor()
+        ccur = cconn.cursor()
+        
+        # Alle resolved Predictions der letzten 7 Tage
+        acur.execute("""
+            SELECT p.*, p.signals::text as signals_text
+            FROM momentum_predictions p
+            WHERE p.user_id = %s 
+              AND p.status IN ('hit_tp', 'hit_sl', 'expired', 'invalidated')
+              AND p.detected_at >= NOW() - INTERVAL '7 days'
+            ORDER BY p.detected_at
+        """, (user_id,))
+        resolved = acur.fetchall()
+        
+        if len(resolved) < 10:
+            logger.info(f"[OPTIMIZER] Nur {len(resolved)} resolved predictions, brauche min. 10. Skip.")
+            return
+        
+        total = len(resolved)
+        tp_hits = [p for p in resolved if p['status'] == 'hit_tp']
+        sl_hits = [p for p in resolved if p['status'] == 'hit_sl']
+        expired = [p for p in resolved if p['status'] in ('expired', 'invalidated')]
+        current_hit_rate = (len(tp_hits) / total * 100) if total > 0 else 0
+        
+        logger.info(f"[OPTIMIZER] {total} predictions: {len(tp_hits)} TP, {len(sl_hits)} SL, "
+                     f"{len(expired)} exp/inv = {current_hit_rate:.1f}% hit rate")
+        
+        # === VARIANTEN GENERIEREN ===
+        # Jede Variante ist ein Dict mit möglichen Config-Änderungen
+        variants = []
+        
+        current_mode = config.get('tp_sl_mode', 'dynamic')
+        current_conf = config.get('min_confidence', 60)
+        
+        # 1. Confidence-Varianten
+        for conf in [60, 65, 70, 75, 80, 85, 90]:
+            if conf != current_conf:
+                variants.append({'min_confidence': conf, 'label': f'conf={conf}'})
+        
+        # 2. TP/SL-Varianten (im fixed Modus)
+        for tp in [2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]:
+            for sl in [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]:
+                if sl < tp:
+                    variants.append({
+                        'fixed_tp_pct': tp, 'fixed_sl_pct': sl, 'tp_sl_mode': 'fixed',
+                        'label': f'fixed tp={tp} sl={sl}'
+                    })
+        
+        # 3. Confidence + TP/SL Kombis (Top-Varianten)
+        for conf in [65, 70, 75, 80]:
+            for tp in [3.0, 5.0, 7.0]:
+                for sl in [1.5, 2.0, 3.0]:
+                    if sl < tp:
+                        variants.append({
+                            'min_confidence': conf, 'fixed_tp_pct': tp, 'fixed_sl_pct': sl,
+                            'tp_sl_mode': 'fixed',
+                            'label': f'conf={conf} tp={tp} sl={sl}'
+                        })
+        
+        logger.info(f"[OPTIMIZER] Testing {len(variants)} variants...")
+        
+        # === SIMULATION ===
+        best_variant = None
+        best_score = current_hit_rate  # Muss besser sein als aktuell
+        best_details = None
+        
+        for variant in variants:
+            sim_tp = 0
+            sim_sl = 0
+            sim_eliminated = 0  # Wären gar nicht erstellt worden
+            sim_tp_lost = 0     # Treffer die verloren gehen
+            sim_total = 0
+            
+            v_conf = variant.get('min_confidence', current_conf)
+            v_tp_pct = variant.get('fixed_tp_pct', None)
+            v_sl_pct = variant.get('fixed_sl_pct', None)
+            
+            for pred in resolved:
+                # 1. Confidence-Filter: wäre diese Prediction erstellt worden?
+                if pred['confidence'] < v_conf:
+                    sim_eliminated += 1
+                    # War es ein Treffer? Dann ist das ein Verlust!
+                    if pred['status'] == 'hit_tp':
+                        sim_tp_lost += 1
+                    continue
+                
+                sim_total += 1
+                
+                # 2. TP/SL-Simulation: mit neuen Werten, hätte es geklappt?
+                if v_tp_pct and v_sl_pct:
+                    # Historische Candles holen
+                    ccur.execute("""
+                        SELECT high, low, close FROM klines
+                        WHERE symbol = %s AND interval = '1m'
+                          AND open_time >= %s AND open_time <= %s + INTERVAL '72 hours'
+                        ORDER BY open_time
+                    """, (pred['symbol'], pred['detected_at'], pred['detected_at']))
+                    candles = ccur.fetchall()
+                    
+                    if not candles:
+                        # Kann nicht simulieren, zähle original
+                        if pred['status'] == 'hit_tp':
+                            sim_tp += 1
+                        else:
+                            sim_sl += 1
+                        continue
+                    
+                    entry = pred['entry_price']
+                    if pred['direction'] == 'long':
+                        sim_tp_price = entry * (1 + v_tp_pct / 100)
+                        sim_sl_price = entry * (1 - v_sl_pct / 100)
+                    else:
+                        sim_tp_price = entry * (1 - v_tp_pct / 100)
+                        sim_sl_price = entry * (1 + v_sl_pct / 100)
+                    
+                    hit = None
+                    for c in candles:
+                        if pred['direction'] == 'long':
+                            if c['high'] >= sim_tp_price:
+                                hit = 'tp'
+                                break
+                            if c['low'] <= sim_sl_price:
+                                hit = 'sl'
+                                break
+                        else:
+                            if c['low'] <= sim_tp_price:
+                                hit = 'tp'
+                                break
+                            if c['high'] >= sim_sl_price:
+                                hit = 'sl'
+                                break
+                    
+                    if hit == 'tp':
+                        sim_tp += 1
+                    else:
+                        sim_sl += 1
+                else:
+                    # Kein TP/SL Override → Original-Ergebnis
+                    if pred['status'] == 'hit_tp':
+                        sim_tp += 1
+                    else:
+                        sim_sl += 1
+            
+            if sim_total == 0:
+                continue
+            
+            sim_hit_rate = (sim_tp / sim_total * 100)
+            
+            # Score: Hit-Rate gewichtet + Bonus für weniger Verluste, Malus für verlorene Treffer
+            score = sim_hit_rate - (sim_tp_lost * 5)  # 5% Strafe pro verlorenen Treffer
+            
+            if score > best_score and sim_tp_lost <= 1:
+                best_score = score
+                best_variant = variant
+                best_details = {
+                    'sim_total': sim_total,
+                    'sim_tp': sim_tp,
+                    'sim_sl': sim_sl,
+                    'sim_eliminated': sim_eliminated,
+                    'sim_tp_lost': sim_tp_lost,
+                    'sim_hit_rate': round(sim_hit_rate, 2),
+                }
+        
+        # === ENTSCHEIDUNG ===
+        if best_variant and best_details:
+            improvement = best_details['sim_hit_rate'] - current_hit_rate
+            
+            # Nur anwenden wenn: Verbesserung > 5%, max 1 Treffer verloren
+            if improvement >= 5.0 and best_details['sim_tp_lost'] <= 1:
+                recommendation = 'apply'
+                reason = (f"Hit rate {current_hit_rate:.1f}% -> {best_details['sim_hit_rate']:.1f}% "
+                          f"(+{improvement:.1f}%), {best_details['sim_eliminated']} eliminated, "
+                          f"{best_details['sim_tp_lost']} TP lost")
+                
+                logger.info(f"[OPTIMIZER] APPLY: {best_variant['label']} -> {reason}")
+                
+                # Config anwenden
+                changes = {}
+                if 'min_confidence' in best_variant:
+                    old_val = config.get('min_confidence', 60)
+                    new_val = best_variant['min_confidence']
+                    if old_val != new_val:
+                        changes['min_confidence'] = {'old': old_val, 'new': new_val}
+                
+                if 'tp_sl_mode' in best_variant:
+                    old_val = config.get('tp_sl_mode', 'dynamic')
+                    new_val = best_variant['tp_sl_mode']
+                    if old_val != new_val:
+                        changes['tp_sl_mode'] = {'old': old_val, 'new': new_val}
+                
+                if 'fixed_tp_pct' in best_variant:
+                    old_val = float(config.get('fixed_tp_pct', 5.0))
+                    new_val = best_variant['fixed_tp_pct']
+                    if old_val != new_val:
+                        changes['fixed_tp_pct'] = {'old': old_val, 'new': new_val}
+                
+                if 'fixed_sl_pct' in best_variant:
+                    old_val = float(config.get('fixed_sl_pct', 2.0))
+                    new_val = best_variant['fixed_sl_pct']
+                    if old_val != new_val:
+                        changes['fixed_sl_pct'] = {'old': old_val, 'new': new_val}
+                
+                # DB-Update
+                if changes:
+                    set_parts = []
+                    set_vals = []
+                    for field, vals in changes.items():
+                        set_parts.append(f"{field} = %s")
+                        set_vals.append(vals['new'])
+                    set_vals.append(user_id)
+                    
+                    acur.execute(
+                        f"UPDATE momentum_scan_config SET {', '.join(set_parts)}, updated_at = NOW() "
+                        f"WHERE user_id = %s",
+                        set_vals
+                    )
+                    logger.info(f"[OPTIMIZER] Config updated: {changes}")
+                
+                applied = True
+            else:
+                recommendation = 'no_change'
+                reason = (f"Improvement {improvement:.1f}% too small (need >=5%) or "
+                          f"too many TP lost ({best_details['sim_tp_lost']})")
+                applied = False
+                changes = {}
+                logger.info(f"[OPTIMIZER] NO CHANGE: {reason}")
+        else:
+            recommendation = 'no_change'
+            reason = "No variant improves current performance"
+            applied = False
+            changes = {}
+            best_details = {'sim_total': 0, 'sim_tp': 0, 'sim_sl': 0, 
+                           'sim_eliminated': 0, 'sim_tp_lost': 0, 'sim_hit_rate': 0}
+            logger.info(f"[OPTIMIZER] NO CHANGE: {reason}")
+        
+        # Log speichern
+        acur.execute("""
+            INSERT INTO momentum_optimization_log 
+            (user_id, period_start, period_end, total_predictions, total_tp, total_sl,
+             total_expired, current_hit_rate, simulations_run, best_variant,
+             best_sim_hit_rate, best_sim_tp, best_sim_sl, best_sim_eliminated,
+             best_sim_tp_lost, recommendation, applied, reason, changes_applied)
+            VALUES (%s, NOW() - INTERVAL '7 days', NOW(), %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (user_id, total, len(tp_hits), len(sl_hits), len(expired),
+              round(current_hit_rate, 2), len(variants),
+              Json(best_variant) if best_variant else None,
+              best_details['sim_hit_rate'], best_details['sim_tp'],
+              best_details['sim_sl'], best_details['sim_eliminated'],
+              best_details['sim_tp_lost'], recommendation, applied, reason,
+              Json(changes) if changes else None))
+        
+        aconn.commit()
+        logger.info(f"[OPTIMIZER] Done. Recommendation: {recommendation}")
+
+
+# ============================================
+# MAIN SCAN LOOP
+# ============================================
+
+def get_symbols_for_config(config):
+    """Holt Symbole basierend auf Scan-Config (Coingruppe oder alle)"""
+    if config['scan_all_symbols']:
+        with coins_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT symbol FROM agg_1h ORDER BY symbol")
+            return [r['symbol'] for r in cur.fetchall()]
+    elif config['coin_group_id']:
+        with app_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT symbol FROM coin_group_members WHERE group_id = %s", 
+                       (config['coin_group_id'],))
+            return [r['symbol'] for r in cur.fetchall()]
+    return []
+
+
+def scan_symbols(config, symbols):
+    """Scannt eine Liste von Symbolen und erstellt Predictions"""
+    user_id = config['user_id']
+    min_conf = config['min_confidence'] or 60
+    new_predictions = 0
+
+    # TP/SL Config für Trade-Execution (getrennt von Signal-Filter)
+    tp_sl_mode = config.get('tp_sl_mode', 'dynamic')
+    cfg_tp_pct = float(config.get('fixed_tp_pct', 5.0))
+    cfg_sl_pct = float(config.get('fixed_sl_pct', 2.0))
+    cfg_range_tp_min = float(config.get('range_tp_min', 5.0))
+    cfg_range_tp_max = float(config.get('range_tp_max', 15.0))
+    cfg_range_sl_min = float(config.get('range_sl_min', 2.0))
+    cfg_range_sl_max = float(config.get('range_sl_max', 6.0))
+
+    with coins_db() as cconn, app_db() as aconn:
+        ccur = cconn.cursor()
+        acur = aconn.cursor()
+
+        # Aktive Predictions holen (kein Doppel-Signal pro Symbol)
+        acur.execute("""
+            SELECT symbol FROM momentum_predictions 
+            WHERE user_id = %s AND status = 'active'
+        """, (user_id,))
+        active_symbols = {r['symbol'] for r in acur.fetchall()}
+
+        # Cooldown: Symbole die in den letzten 60 Min resolved wurden nicht nochmal scannen
+        acur.execute("""
+            SELECT DISTINCT symbol FROM momentum_predictions
+            WHERE user_id = %s AND status != 'active'
+              AND resolved_at >= NOW() - INTERVAL '60 minutes'
+        """, (user_id,))
+        cooldown_symbols = {r['symbol'] for r in acur.fetchall()}
+        active_symbols = active_symbols | cooldown_symbols
+
+        for symbol in symbols:
+            if not running:
+                break
+                
+            if symbol in active_symbols:
+                continue  # Schon aktive Prediction
+
+            try:
+                # 1h Candles (letzte 50)
+                ccur.execute("""
+                    SELECT bucket, open, high, low, close, volume 
+                    FROM agg_1h WHERE symbol = %s 
+                    ORDER BY bucket DESC LIMIT 50
+                """, (symbol,))
+                candles_1h = list(reversed(ccur.fetchall()))
+
+                # 4h Candles (letzte 20)
+                ccur.execute("""
+                    SELECT bucket, open, high, low, close, volume 
+                    FROM agg_4h WHERE symbol = %s 
+                    ORDER BY bucket DESC LIMIT 20
+                """, (symbol,))
+                candles_4h = list(reversed(ccur.fetchall()))
+
+                # 1d Candles (letzte 14)
+                ccur.execute("""
+                    SELECT bucket, open, high, low, close, volume 
+                    FROM agg_1d WHERE symbol = %s 
+                    ORDER BY bucket DESC LIMIT 14
+                """, (symbol,))
+                candles_1d = list(reversed(ccur.fetchall()))
+
+                if not candles_1h:
+                    continue
+
+                # Aktuellen Preis aus 1m-Klines holen (nicht agg_1h!)
+                ccur.execute("""
+                    SELECT close FROM klines
+                    WHERE symbol = %s AND interval = '1m'
+                    ORDER BY open_time DESC LIMIT 1
+                """, (symbol,))
+                row_1m = ccur.fetchone()
+                current_price = row_1m['close'] if row_1m else candles_1h[-1]['close']
+                if not current_price or current_price == 0:
+                    continue
+
+                # Analyse (liefert Signal + expected_move, OHNE TP/SL)
+                signal = analyze_symbol(candles_1h, candles_4h, candles_1d, current_price)
+
+                if signal and signal['confidence'] >= min_conf:
+                    # Filter: erwartete Bewegung muss min_target_pct überschreiten
+                    if signal['expected_move_pct'] < (config['min_target_pct'] or 5.0):
+                        continue
+
+                    # TP/SL aus User-Config berechnen (Trade-Execution, unabhängig vom Signal-Filter)
+                    entry = signal['entry_price']
+                    if tp_sl_mode == 'fixed':
+                        tp_pct = cfg_tp_pct
+                        sl_pct = cfg_sl_pct
+                    elif tp_sl_mode == 'range':
+                        atr_val = signal['indicators'].get('atr')
+                        if atr_val and atr_val > 0 and entry > 0:
+                            atr_pct = (atr_val / entry) * 100
+                            ratio = min(max((atr_pct - 0.5) / 4.5, 0), 1)
+                            tp_pct = cfg_range_tp_min + ratio * (cfg_range_tp_max - cfg_range_tp_min)
+                            sl_pct = cfg_range_sl_min + ratio * (cfg_range_sl_max - cfg_range_sl_min)
+                        else:
+                            tp_pct = cfg_range_tp_min
+                            sl_pct = cfg_range_sl_min
+                    else:  # dynamic
+                        atr_val = signal['indicators'].get('atr')
+                        if atr_val and atr_val > 0:
+                            sl_dist = max(atr_val * 1.5, entry * 0.02)
+                            tp_dist = sl_dist * 2.5
+                            tp_pct = (tp_dist / entry) * 100
+                            sl_pct = (sl_dist / entry) * 100
+                            tp_pct = max(2.0, min(tp_pct, 25.0))
+                            sl_pct = max(1.0, min(sl_pct, 10.0))
+                        else:
+                            tp_pct = 5.0
+                            sl_pct = 2.0
+
+                    # TP/SL Preise
+                    if signal['direction'] == 'long':
+                        tp_price = entry * (1 + tp_pct / 100)
+                        sl_price = entry * (1 - sl_pct / 100)
+                    else:
+                        tp_price = entry * (1 - tp_pct / 100)
+                        sl_price = entry * (1 + sl_pct / 100)
+
+                    acur.execute("""
+                        INSERT INTO momentum_predictions 
+                        (user_id, symbol, direction, entry_price, take_profit_price,
+                         stop_loss_price, take_profit_pct, stop_loss_pct,
+                         confidence, reason, signals, expires_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW() + INTERVAL '72 hours')
+                        RETURNING prediction_id
+                    """, (user_id, symbol, signal['direction'], entry,
+                          float(tp_price), float(sl_price),
+                          float(tp_pct), float(sl_pct),
+                          int(signal["confidence"]), signal["reason"],
+                          Json(signal['signals'])))
+                    
+                    pred_id = acur.fetchone()['prediction_id']
+                    new_predictions += 1
+                    logger.info(f"[NEW] #{pred_id} {symbol} {signal['direction'].upper()} "
+                               f"@ {current_price:.4f} (expect {signal['expected_move_pct']:.1f}%) "
+                               f"→ TP {tp_pct:.1f}% SL {sl_pct:.1f}% (conf: {signal['confidence']})")
+
+            except Exception as e:
+                logger.error(f"[SCAN] {symbol} error: {e}")
+                continue
+
+        aconn.commit()
+    return new_predictions
+
+
+def main():
+    """Main Loop"""
+    logger.info("=" * 60)
+    logger.info("Momentum Scanner starting...")
+    logger.info(f"PID: {os.getpid()}")
+    logger.info("=" * 60)
+
+    while running:
+        try:
+            # Aktive Configs laden
+            with app_db() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM momentum_scan_config WHERE is_active = true")
+                configs = cur.fetchall()
+
+            if not configs:
+                time.sleep(10)
+                continue
+
+            for config in configs:
+                if not running:
+                    break
+
+                user_id = config['user_id']
+                idle = config['idle_seconds'] or 60
+
+                # 0. Daily Optimizer (08:00 + 20:00 Berlin)
+                opt_key = should_run_optimization()
+                if opt_key:
+                    try:
+                        global _last_optimization_run
+                        run_daily_optimization(user_id, config)
+                        _last_optimization_run = opt_key
+                    except Exception as oe:
+                        logger.error(f"[OPTIMIZER] Error: {oe}")
+                        logger.error(traceback.format_exc())
+
+                # 1. Aktive Predictions prüfen
+                logger.info(f"[LOOP] Checking active predictions...")
+                resolved = check_active_predictions()
+                logger.info(f"[LOOP] Resolved: {resolved}")
+                if resolved > 0:
+                    update_stats(user_id)
+                    logger.info(f"[MONITOR] Resolved {resolved} predictions for user {user_id}")
+
+                # 1b. Post-Resolve Tracking (max favorable + Trendwende)
+                try:
+                    tracked = track_resolved_predictions()
+                    if tracked > 0:
+                        logger.info(f"[POST-TRACK] {tracked} predictions trend reversal detected")
+                except Exception as te:
+                    logger.error(f"[POST-TRACK] Error: {te}")
+
+                # 2. Neue Symbole scannen
+                symbols = get_symbols_for_config(config)
+                logger.info(f"[LOOP] Scanning {len(symbols) if symbols else 0} symbols...")
+                if symbols:
+                    new = scan_symbols(config, symbols)
+                    if new > 0:
+                        logger.info(f"[SCAN] Created {new} new predictions for user {user_id}")
+
+                # 3. Stats updaten
+                update_stats(user_id)
+
+                # Idle
+                logger.info(f"[LOOP] Cycle done, sleeping {idle}s...")
+                for _ in range(idle):
+                    if not running:
+                        break
+                    time.sleep(1)
+
+        except Exception as e:
+            logger.error(f"[MAIN] Error: {e}")
+            logger.error(traceback.format_exc())
+            time.sleep(30)
+
+    logger.info("Momentum Scanner stopped.")
+
+
+if __name__ == '__main__':
+    main()

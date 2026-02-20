@@ -64,16 +64,8 @@ def check_open_trades():
             WHERE t.side = 'buy'
               AND NOT EXISTS (
                   SELECT 1 FROM trade_history t2
-                  WHERE t2.side = 'sell'
-                    AND t2.symbol = t.symbol
-                    AND t2.user_id = t.user_id
-                    AND (
-                      (t.prediction_id IS NOT NULL AND t2.prediction_id = t.prediction_id)
-                      OR
-                      (t.prediction_id IS NULL AND t2.prediction_id IS NULL
-                       AND t2.executed_at >= t.executed_at
-                       AND t2.executed_at <= t.executed_at + INTERVAL '24 hours')
-                    )
+                  WHERE t2.prediction_id = t.prediction_id
+                    AND t2.side = 'sell'
               )
               AND t.executed_at >= NOW() - INTERVAL '7 days'
             ORDER BY t.executed_at ASC

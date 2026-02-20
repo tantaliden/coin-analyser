@@ -1,0 +1,162 @@
+================================================================================
+EVENT FINDER REPORT
+Generated: 2026-02-19 08:47:52 (Europe/Berlin)
+Period: 2025-11-21 to 2026-02-18
+Threshold: ≥5.0% move in 60-240 min
+================================================================================
+
+SUMMARY
+----------------------------------------
+Total events found: 53091
+  LONG:  24752
+  SHORT: 28339
+Events analyzed (with profiles): 53091
+Baseline samples: 500
+Unique coins: 277
+
+SIGNAL RANKING (Z-Score: how different from normal)
+------------------------------------------------------------
+Metric                       Z-Score    Event Avg   Baseline Avg
+------------------------------------------------------------
+trades_trend                    0.57        1.849          1.250
+vol_trend                       0.38        2.013          1.406
+vol_last30_ratio                0.22        1.728          1.342
+avg_taker_ratio                 0.08       49.467         48.789
+taker_shift                    -0.03        0.071          0.535
+
+*** = strong signal (|z| > 2), ** = moderate (|z| > 1)
+
+TOP COINS BY EVENT COUNT
+------------------------------------------------------------
+Symbol            Events    Avg %   LONG  SHORT Name
+------------------------------------------------------------
+GUNUSDC              489     7.6%    271    218 Gunz
+RESOLVUSDC           478     7.4%    238    240 Resolv
+ENSOUSDC             472     8.2%    231    241 Enso
+GPSUSDC              471     7.6%    257    214 GoPlus Security
+ACTUSDC              454     6.6%    235    219 Act I The AI Prophecy
+AXSUSDC              432     7.2%    204    228 Axie Infinity
+SOMIUSDC             428     7.1%    189    239 Somnia
+ALLOUSDC             426     7.0%    219    207 Allora
+币安人生USDC             415     7.5%    209    206 币安人生 (BinanceLife)
+TNSRUSDC             394     9.4%    177    217 Tensor
+ZECUSDC              394     6.4%    201    193 Zcash
+BERAUSDC             391     8.2%    183    208 Berachain
+KITEUSDC             384     6.1%    237    147 Kite
+LUNAUSDC             383     8.3%    167    216 Terra
+DASHUSDC             382     6.5%    189    193 Dash
+BROCCOLI714USDC      379    10.9%    168    211 
+HEMIUSDC             377     6.7%    178    199 Hemi
+ROSEUSDC             373     6.5%    187    186 Oasis
+PUMPUSDC             368     6.0%    198    170 Pump.fun
+0GUSDC               360     7.2%    175    185 0G
+NOMUSDC              360     7.8%    165    195 Nomina
+SAPIENUSDC           360     7.5%    175    185 Sapien
+XPLUSDC              355     6.1%    186    169 Plasma
+BANANAS31USDC        350     8.0%    194    156 Banana For Scale
+DOLOUSDC             350     7.2%    170    180 Dolomite
+BANKUSDC             345     6.3%    194    151 Lorenzo Protocol
+MMTUSDC              345     7.9%    162    183 Momentum
+PARTIUSDC            343     8.7%    170    173 Particle Network
+AVNTUSDC             342     6.5%    186    156 Avantis
+GIGGLEUSDC           340     6.5%    154    186 Giggle Fund
+
+TOP CATEGORIES BY EVENT COUNT
+------------------------------------------------------------
+
+  Ethereum Ecosystem: 26677 events across 141 coins
+    Vol trend: 2.07x | Trades trend: 1.88x | Taker shift: +0.0%
+
+  BNB Chain Ecosystem: 19756 events across 92 coins
+    Vol trend: 2.05x | Trades trend: 1.87x | Taker shift: +0.1%
+
+  Smart Contract Platform: 17266 events across 98 coins
+    Vol trend: 1.93x | Trades trend: 1.79x | Taker shift: -0.0%
+
+  Decentralized Finance (DeFi): 13443 events across 74 coins
+    Vol trend: 2.07x | Trades trend: 1.87x | Taker shift: -0.0%
+
+  Base Ecosystem: 11308 events across 55 coins
+    Vol trend: 2.06x | Trades trend: 1.88x | Taker shift: +0.1%
+
+  Binance HODLer Airdrops: 10092 events across 40 coins
+    Vol trend: 2.05x | Trades trend: 1.98x | Taker shift: +0.2%
+
+  Binance Alpha Spotlight: 9881 events across 39 coins
+    Vol trend: 1.82x | Trades trend: 1.67x | Taker shift: +0.1%
+
+  Layer 1 (L1): 9810 events across 56 coins
+    Vol trend: 1.80x | Trades trend: 1.72x | Taker shift: +0.1%
+
+  Made in USA: 9343 events across 60 coins
+    Vol trend: 1.85x | Trades trend: 1.72x | Taker shift: -0.2%
+
+  Solana Ecosystem: 8812 events across 42 coins
+    Vol trend: 1.80x | Trades trend: 1.66x | Taker shift: -0.0%
+
+  Base Native: 8597 events across 42 coins
+    Vol trend: 2.07x | Trades trend: 1.91x | Taker shift: +0.1%
+
+  Artificial Intelligence (AI): 7710 events across 35 coins
+    Vol trend: 2.01x | Trades trend: 2.00x | Taker shift: +0.3%
+
+  Infrastructure: 6704 events across 33 coins
+    Vol trend: 1.92x | Trades trend: 1.75x | Taker shift: +0.1%
+
+  Meme: 6664 events across 30 coins
+    Vol trend: 1.72x | Trades trend: 1.59x | Taker shift: +0.2%
+
+  Governance: 6211 events across 40 coins
+    Vol trend: 2.12x | Trades trend: 2.01x | Taker shift: -0.1%
+
+  Arbitrum Ecosystem: 5842 events across 37 coins
+    Vol trend: 2.19x | Trades trend: 2.03x | Taker shift: -0.1%
+
+  NFT: 5351 events across 28 coins
+    Vol trend: 2.00x | Trades trend: 1.87x | Taker shift: -0.0%
+
+  Binance Launchpool: 5217 events across 24 coins
+    Vol trend: 2.07x | Trades trend: 1.88x | Taker shift: +0.2%
+
+  Gaming (GameFi): 4283 events across 23 coins
+    Vol trend: 1.95x | Trades trend: 1.83x | Taker shift: +0.2%
+
+  Exchange-based Tokens: 4172 events across 25 coins
+    Vol trend: 1.98x | Trades trend: 1.79x | Taker shift: -0.1%
+
+HOURLY DISTRIBUTION (UTC)
+------------------------------------------------------------
+  00:00   1448  ██████████████
+  01:00   2373  ███████████████████████
+  02:00   2202  █████████████████████
+  03:00   2407  ███████████████████████
+  04:00   2592  █████████████████████████
+  05:00   2070  ████████████████████
+  06:00   1488  ██████████████
+  07:00   1333  █████████████
+  08:00   1649  ████████████████
+  09:00   1560  ███████████████
+  10:00   1550  ███████████████
+  11:00   1579  ███████████████
+  12:00   1442  ██████████████
+  13:00   1482  ██████████████
+  14:00   1601  ███████████████
+  15:00   1941  ███████████████████
+  16:00   3089  ██████████████████████████████
+  17:00   3640  ███████████████████████████████████
+  18:00   4040  ███████████████████████████████████████
+  19:00   4065  ████████████████████████████████████████
+  20:00   3104  ██████████████████████████████
+  21:00   2494  ████████████████████████
+  22:00   2043  ████████████████████
+  23:00   1899  ██████████████████
+
+FASTEST TIMEFRAME DISTRIBUTION
+----------------------------------------
+  pct_120m      10753 (20.3%)
+  pct_180m      14665 (27.6%)
+  pct_240m      21139 (39.8%)
+  pct_60m        6534 (12.3%)
+
+================================================================================
+END OF REPORT

@@ -1,0 +1,64 @@
+{
+  "databases": {
+    "coins": {
+      "type": "timescaledb",
+      "host": "localhost",
+      "port": 5432,
+      "name": "coins",
+      "user": "api_reader",
+      "password": "ApiReader2025!Secure",
+      "ssl": false,
+      "pool": {
+        "min": 2,
+        "max": 10
+      }
+    },
+    "app": {
+      "type": "postgres",
+      "host": "localhost",
+      "port": 5432,
+      "name": "analyser_app",
+      "user": "app_user",
+      "password": "AppUser2025!Secure",
+      "ssl": false,
+      "pool": {
+        "min": 2,
+        "max": 10
+      }
+    }
+  },
+
+  "ingestor": {
+    "database": {
+      "user": "ingestor",
+      "password": "tX9RX2XOV8aQg5F01FVDwQeVFvs7cLTyqN4wB7Avv8Q="
+    },
+    "httpTimeout": 30,
+    "httpRetries": 3,
+    "batchSize": 10000,
+    "startYear": 2022,
+    "quoteAsset": "USDC",
+    "liveOffsetMinutes": 2,
+    "liveLookbackHours": 24,
+    "liveIntervalSeconds": 5,
+    "symbolRefreshHours": 6,
+    "rateLimitSleep": 0.06
+  },
+
+  "binance": {
+    "readOnly": true,
+    "liveApiUrl": "https://api.binance.com",
+    "visionApi": "https://data.binance.vision/data/spot",
+    "apiKey": "7UrAjGlMsOlcRwbg9LGp0vRRJ8f5RUJl0xfBtmfVSDkA67jbXgzzSRxoM0kDnE8k",
+    "apiSecret": "OePih1wAHODqo3DZ1sJDIpWI39nDE9m5BjLED9xjs26uGBD8qhWbPw67tFPC8uuC"
+  },
+
+  "logging": {
+    "level": "info",
+    "backfillLog": "/opt/coin/database/logs/backfill.log",
+    "aggregateLog": "/opt/coin/database/logs/aggregate_backfill.log",
+    "liveLog": "/opt/coin/database/logs/live.log",
+    "metricsLog": "/opt/coin/database/logs/metrics.log",
+    "coingeckoLog": "/opt/coin/database/logs/coingecko.log"
+  }
+}

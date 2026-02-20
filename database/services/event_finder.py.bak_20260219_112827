@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+"""
+Event Finder - Retrospektive Pattern-Analyse
+
+Findet ≥5% Moves aus kline_metrics, analysiert Vorgeschichte aus klines,
+gruppiert nach coin_info Kategorien, bewertet Signalstärke.
+
+Phasen:
+  1. Events identifizieren (kline_metrics: pct_60m..pct_240m >= ±5%)
+  2. Vorgeschichte analysieren (klines: 120min vor Event)
+  3. Baseline erstellen (Nicht-Events als Vergleich)
+  4. Abweichungen berechnen (Signal vs Noise)
+  5. Gruppierung (per Coin, per Kategorie, global)
+  6. Report schreiben
+
+Läuft als:
+  --once           Einmaliger Scan
+  --loop           Dauerhafter Service (alle 6h)
+  --start DATE     Startdatum (default: 3 Monate zurück)
+  --end DATE       Enddatum (default: gestern)
+  --threshold N    Min-Prozent für Event (default: 5.0)
+"""
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from datetime import datetime, timedelta
+import json, sys, os, time, signal, random
+import pytz
+
+BERLIN_TZ = pytz.timezone('Europe/Berlin')
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+with open(os.path.join(SCRIPT_DIR, '..', 'settings.json')) as f:
+    SETTINGS = json.load(f)
+
+COINS_DB = {
+    'host': SETTINGS['databases']['coins']['host'],
+    'port': SETTINGS['databases']['coins']['port'],
+    'dbname': SETTINGS['databases']['coins']['name'],
+    'user': 'analyst',
+    'password': 'AnalystRead2026!'
+}
+
+APP_DB = {
+    'host': SETTINGS['databases']['app']['host'],
+    'port': SETTINGS['databases']['app']['port'],
+    'dbname': SETTINGS['databases']['app']['name'],
+    'user': 'analyst',
+    'password': 'AnalystRead2026!'
+}
+
+LOG_DIR = '/opt/coin/database/logs'
+LOG_FILE = os.path.join(LOG_DIR, 'event_finder.log')
+REPORT_DIR = '/opt/coin/database/data'
+
+# Zeitfenster in kline_metrics die wir scannen
+PCT_COLUMNS = ['pct_60m', 'pct_120m', 'pct_180m', 'pct_240m']
+# Vorgeschichte-Analyse: wie weit zurückschauen
+PRE_EVENT_MINUTES = 120
+# Block-Größe für Vorgeschichte-Analyse
+BLOCK_SIZE_MINUTES = 5
+
+running = True
+
+def handle_signal(sig, frame):
+    global running
+    running = False
+
+signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT, handle_signal)
+
+def log(msg):
+    ts = datetime.now(BERLIN_TZ).strftime('%Y-%m-%d %H:%M:%S')
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write(line + '\n')
+    except:
+        pass
+
+def coins_conn():
+    return psycopg2.connect(**COINS_DB)
+
+def app_conn():
+    return psycopg2.connect(**APP_DB)
+
+# ============================================================
+# PHASE 1: Events identifizieren
+# ============================================================
+
+def find_events(conn, start_date, end_date, threshold=5.0):
+    """
+    Findet alle Zeitpunkte wo mindestens ein pct_Xm >= threshold oder <= -threshold.
+    Gibt zurück: [{symbol, open_time, direction, max_pct, fastest_tf}, ...]
+    """
+    log(f"Phase 1: Finding ≥{threshold}% events from {start_date} to {end_date}")
+    
+    conditions = " OR ".join([f"ABS({col}) >= {threshold}" for col in PCT_COLUMNS])
+    
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT symbol, open_time,
+                   pct_60m, pct_120m, pct_180m, pct_240m
+            FROM kline_metrics
+            WHERE open_time >= %s AND open_time < %s
+              AND ({conditions})
+            ORDER BY symbol, open_time
+        """, (start_date, end_date))
+        rows = cur.fetchall()
+    
+    log(f"  Raw rows with ≥{threshold}% move: {len(rows)}")
+    
+    # Deduplizieren: Events die nah beieinander liegen zusammenfassen
+    # Ein Event = erster Zeitpunkt eines Moves, danach 60min Cooldown
+    events = []
+    last_event = {}  # symbol -> last_event_time
+    
+    for row in rows:
+        sym = row['symbol']
+        ot = row['open_time']
+        
+        if sym in last_event and (ot - last_event[sym]).total_seconds() < 3600:
+            continue  # Cooldown: skip wenn <60min seit letztem Event
+        
+        # Bestimme Richtung und stärkstes Timeframe
+        best_pct = 0
+        best_tf = None
+        for col in PCT_COLUMNS:
+            val = row[col]
+            if val is not None and abs(val) > abs(best_pct):
+                best_pct = val
+                best_tf = col
+        
+        if best_tf is None:
+            continue
+        
+        direction = 'LONG' if best_pct > 0 else 'SHORT'
+        
+        # Schnellstes Timeframe das den Threshold überschreitet
+        fastest_tf = None
+        for col in PCT_COLUMNS:  # 60m zuerst = schnellster
+            val = row[col]
+            if val is not None and abs(val) >= threshold:
+                fastest_tf = col
+                break
+        
+        events.append({
+            'symbol': sym,
+            'open_time': ot,
+            'direction': direction,
+            'max_pct': round(best_pct, 2),
+            'best_tf': best_tf,
+            'fastest_tf': fastest_tf,
+            'pct_60m': round(row['pct_60m'] or 0, 2),
+            'pct_120m': round(row['pct_120m'] or 0, 2),
+            'pct_180m': round(row['pct_180m'] or 0, 2),
+            'pct_240m': round(row['pct_240m'] or 0, 2),
+        })
+        last_event[sym] = ot
+    
+    log(f"  Deduplicated events: {len(events)}")
+    long_count = sum(1 for e in events if e['direction'] == 'LONG')
+    short_count = len(events) - long_count
+    log(f"  LONG: {long_count}, SHORT: {short_count}")
+    
+    return events
+
+# ============================================================
+# PHASE 2: Vorgeschichte analysieren
+# ============================================================
+
+def analyze_pre_event(conn, symbol, event_time):
+    """
+    Analysiert die PRE_EVENT_MINUTES vor einem Event.
+    Gibt Feature-Dict zurück mit Volumen, Trades, Taker-Ratio etc.
+    """
+    pre_start = event_time - timedelta(minutes=PRE_EVENT_MINUTES)
+    
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT open_time, open, high, low, close, volume,
+                   trades, taker_buy_base, taker_buy_quote, quote_asset_volume
+            FROM klines
+            WHERE symbol = %s AND interval = '1m'
+              AND open_time >= %s AND open_time < %s
+            ORDER BY open_time
+        """, (symbol, pre_start, event_time))
+        candles = cur.fetchall()
+    
+    if len(candles) < 60:  # mindestens 60 von 120 Minuten
+        return None
+    
+    # In 5-min Blöcke aufteilen
+    blocks = []
+    for i in range(0, PRE_EVENT_MINUTES, BLOCK_SIZE_MINUTES):
+        block_start = pre_start + timedelta(minutes=i)
+        block_end = block_start + timedelta(minutes=BLOCK_SIZE_MINUTES)
+        block_candles = [c for c in candles if block_start <= c['open_time'] < block_end]
+        
+        if not block_candles:
+            blocks.append(None)
+            continue
+        
+        vol = sum(float(c['volume'] or 0) for c in block_candles)
+        trades = sum(int(c['trades'] or 0) for c in block_candles)
+        taker_buy = sum(float(c['taker_buy_base'] or 0) for c in block_candles)
+        high = max(float(c['high'] or 0) for c in block_candles)
+        low = min(float(c['low'] or 0) for c in block_candles if c['low'])
+        open_p = float(block_candles[0]['open'] or 0)
+        close_p = float(block_candles[-1]['close'] or 0)
+        
+        taker_ratio = (taker_buy / vol * 100) if vol > 0 else 50.0
+        avg_trade_size = (vol / trades) if trades > 0 else 0
+        range_pct = ((high - low) / low * 100) if low > 0 else 0
+        pct_change = ((close_p - open_p) / open_p * 100) if open_p > 0 else 0
+        
+        blocks.append({
+            'minutes_before': PRE_EVENT_MINUTES - i,
+            'volume': vol,
+            'trades': trades,
+            'taker_ratio': round(taker_ratio, 2),
+            'avg_trade_size': avg_trade_size,
+            'range_pct': round(range_pct, 4),
+            'pct_change': round(pct_change, 4),
+        })
+    
+    valid_blocks = [b for b in blocks if b is not None]
+    if len(valid_blocks) < 12:  # Mindestens Hälfte
+        return None
+    
+    # Aggregierte Features
+    total_vol = sum(b['volume'] for b in valid_blocks)
+    total_trades = sum(b['trades'] for b in valid_blocks)
+    avg_taker_ratio = sum(b['taker_ratio'] for b in valid_blocks) / len(valid_blocks)
+    
+    # Trend-Features: erste vs letzte Hälfte
+    half = len(valid_blocks) // 2
+    first_half = valid_blocks[:half]
+    second_half = valid_blocks[half:]
+    
+    vol_first = sum(b['volume'] for b in first_half) if first_half else 1
+    vol_second = sum(b['volume'] for b in second_half) if second_half else 1
+    vol_trend = (vol_second / vol_first) if vol_first > 0 else 1.0
+    
+    trades_first = sum(b['trades'] for b in first_half) if first_half else 1
+    trades_second = sum(b['trades'] for b in second_half) if second_half else 1
+    trades_trend = (trades_second / trades_first) if trades_first > 0 else 1.0
+    
+    # Letzte 30 min vs Rest
+    last_6 = [b for b in valid_blocks if b['minutes_before'] <= 30]
+    rest = [b for b in valid_blocks if b['minutes_before'] > 30]
+    
+    vol_last30 = sum(b['volume'] for b in last_6) if last_6 else 0
+    vol_rest = sum(b['volume'] for b in rest) if rest else 1
+    vol_last30_ratio = (vol_last30 / vol_rest * (len(rest) / max(len(last_6), 1))) if vol_rest > 0 else 1.0
+    
+    taker_last30 = sum(b['taker_ratio'] for b in last_6) / len(last_6) if last_6 else 50
+    taker_rest = sum(b['taker_ratio'] for b in rest) / len(rest) if rest else 50
+    
+    return {
+        'blocks': blocks,
+        'total_volume': total_vol,
+        'total_trades': total_trades,
+        'avg_taker_ratio': round(avg_taker_ratio, 2),
+        'vol_trend': round(vol_trend, 3),           # >1 = steigend
+        'trades_trend': round(trades_trend, 3),
+        'vol_last30_ratio': round(vol_last30_ratio, 3),  # >1 = letzte 30min höher
+        'taker_last30': round(taker_last30, 2),
+        'taker_rest': round(taker_rest, 2),
+        'taker_shift': round(taker_last30 - taker_rest, 2),
+    }
+
+# ============================================================
+# PHASE 3: Baseline (Nicht-Events)
+# ============================================================
+
+def create_baseline(conn, symbols, start_date, end_date, event_times_by_symbol, samples_per_symbol=10):
+    """
+    Erstellt Baseline-Profile an zufälligen Zeitpunkten ohne Events.
+    """
+    log("Phase 3: Creating baseline profiles")
+    baselines = []
+    
+    total_days = (end_date - start_date).days
+    if total_days < 7:
+        log("  Not enough data for baseline")
+        return baselines
+    
+    for sym in symbols[:50]:  # Max 50 Symbole für Baseline
+        event_times = event_times_by_symbol.get(sym, set())
+        attempts = 0
+        found = 0
+        
+        while found < samples_per_symbol and attempts < samples_per_symbol * 5:
+            attempts += 1
+            # Zufälligen Zeitpunkt wählen
+            random_day = random.randint(0, total_days - 1)
+            random_hour = random.randint(0, 23)
+            random_min = random.randint(0, 59)
+            rand_time = start_date + timedelta(days=random_day, hours=random_hour, minutes=random_min)
+            
+            # Prüfe ob zu nah an einem Event (±120 min)
+            too_close = False
+            for et in event_times:
+                if abs((rand_time - et).total_seconds()) < 7200:  # 2h
+                    too_close = True
+                    break
+            
+            if too_close:
+                continue
+            
+            profile = analyze_pre_event(conn, sym, rand_time)
+            if profile:
+                baselines.append(profile)
+                found += 1
+    
+    log(f"  Baseline profiles: {len(baselines)}")
+    return baselines
+
+# ============================================================
+# PHASE 4: Abweichungen berechnen
+# ============================================================
+
+def compute_deviations(event_profiles, baseline_profiles):
+    """
+    Vergleicht Event-Profile mit Baseline und berechnet Abweichungen.
+    """
+    log("Phase 4: Computing deviations")
+    
+    if not baseline_profiles:
+        log("  No baseline profiles, skipping")
+        return {}
+    
+    # Baseline-Durchschnitte
+    metrics = ['vol_trend', 'trades_trend', 'vol_last30_ratio', 
+               'avg_taker_ratio', 'taker_shift']
+    
+    baseline_avgs = {}
+    baseline_stds = {}
+    
+    for m in metrics:
+        vals = [p[m] for p in baseline_profiles if m in p and p[m] is not None]
+        if vals:
+            avg = sum(vals) / len(vals)
+            std = (sum((v - avg) ** 2 for v in vals) / len(vals)) ** 0.5
+            baseline_avgs[m] = avg
+            baseline_stds[m] = max(std, 0.001)  # avoid div by 0
+    
+    # Event-Durchschnitte und Z-Scores
+    event_avgs = {}
+    event_zscores = {}
+    
+    for m in metrics:
+        vals = [p[m] for p in event_profiles if m in p and p[m] is not None]
+        if vals and m in baseline_avgs:
+            avg = sum(vals) / len(vals)
+            event_avgs[m] = avg
+            event_zscores[m] = round((avg - baseline_avgs[m]) / baseline_stds[m], 2)
+    
+    result = {
+        'baseline_avgs': {k: round(v, 3) for k, v in baseline_avgs.items()},
+        'event_avgs': {k: round(v, 3) for k, v in event_avgs.items()},
+        'z_scores': event_zscores,
+    }
+    
+    # Ranking nach Signal-Stärke
+    ranked = sorted(event_zscores.items(), key=lambda x: abs(x[1]), reverse=True)
+    result['signal_ranking'] = ranked
+    
+    for metric, zscore in ranked:
+        direction = "↑" if zscore > 0 else "↓"
+        log(f"  {metric}: z={zscore} {direction} (event={event_avgs.get(metric, '?')}, baseline={baseline_avgs.get(metric, '?')})")
+    
+    return result
+
+# ============================================================
+# PHASE 5: Kategorien-Gruppierung
+# ============================================================
+
+def load_categories():
+    """Lädt Coin-Kategorien aus analyser_app.coin_info"""
+    try:
+        conn = app_conn()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT symbol, name, categories, network FROM coin_info WHERE categories IS NOT NULL")
+            rows = cur.fetchall()
+        conn.close()
+        
+        cat_map = {}
+        for r in rows:
+            cat_map[r['symbol']] = {
+                'name': r['name'],
+                'categories': r['categories'] or [],
+                'network': r['network']
+            }
+        return cat_map
+    except Exception as e:
+        log(f"  Warning: Could not load categories: {e}")
+        return {}
+
+def group_events(events, event_profiles, cat_map):
+    """Gruppiert Events nach Coin und Kategorie"""
+    log("Phase 5: Grouping events")
+    
+    # Per Coin
+    by_coin = {}
+    for i, ev in enumerate(events):
+        sym = ev['symbol']
+        if sym not in by_coin:
+            by_coin[sym] = {'events': [], 'profiles': []}
+        by_coin[sym]['events'].append(ev)
+        if i < len(event_profiles) and event_profiles[i]:
+            by_coin[sym]['profiles'].append(event_profiles[i])
+    
+    # Per Kategorie
+    by_category = {}
+    for sym, data in by_coin.items():
+        cats = cat_map.get(sym, {}).get('categories', ['Unknown'])
+        if not cats:
+            cats = ['Unknown']
+        for cat in cats:
+            if cat not in by_category:
+                by_category[cat] = {'events': [], 'profiles': [], 'symbols': set()}
+            by_category[cat]['events'].extend(data['events'])
+            by_category[cat]['profiles'].extend(data['profiles'])
+            by_category[cat]['symbols'].add(sym)
+    
+    # Top Kategorien nach Event-Anzahl
+    top_cats = sorted(by_category.items(), key=lambda x: len(x[1]['events']), reverse=True)[:20]
+    
+    log(f"  {len(by_coin)} coins with events")
+    log(f"  {len(by_category)} categories")
+    for cat, data in top_cats[:10]:
+        log(f"    {cat}: {len(data['events'])} events, {len(data['symbols'])} coins")
+    
+    return by_coin, by_category
+
+# ============================================================
+# PHASE 6: Report schreiben
+# ============================================================
+
+def write_report(events, event_profiles, baseline_profiles, deviations,
+                 by_coin, by_category, cat_map, threshold, start_date, end_date):
+    """Schreibt strukturierten Report"""
+    
+    ts = datetime.now(BERLIN_TZ).strftime('%Y%m%d_%H%M%S')
+    report_file = os.path.join(REPORT_DIR, f'event_report_{ts}.txt')
+    
+    with open(report_file, 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write(f"EVENT FINDER REPORT\n")
+        f.write(f"Generated: {datetime.now(BERLIN_TZ):%Y-%m-%d %H:%M:%S} (Europe/Berlin)\n")
+        f.write(f"Period: {start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}\n")
+        f.write(f"Threshold: ≥{threshold}% move in 60-240 min\n")
+        f.write("=" * 80 + "\n\n")
+        
+        # Summary
+        f.write("SUMMARY\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"Total events found: {len(events)}\n")
+        long_events = [e for e in events if e['direction'] == 'LONG']
+        short_events = [e for e in events if e['direction'] == 'SHORT']
+        f.write(f"  LONG:  {len(long_events)}\n")
+        f.write(f"  SHORT: {len(short_events)}\n")
+        f.write(f"Events analyzed (with profiles): {len([p for p in event_profiles if p])}\n")
+        f.write(f"Baseline samples: {len(baseline_profiles)}\n")
+        f.write(f"Unique coins: {len(by_coin)}\n\n")
+        
+        # Signal Strength
+        if deviations and 'signal_ranking' in deviations:
+            f.write("SIGNAL RANKING (Z-Score: how different from normal)\n")
+            f.write("-" * 60 + "\n")
+            f.write(f"{'Metric':<25} {'Z-Score':>10} {'Event Avg':>12} {'Baseline Avg':>14}\n")
+            f.write("-" * 60 + "\n")
+            for metric, zscore in deviations['signal_ranking']:
+                e_avg = deviations['event_avgs'].get(metric, 0)
+                b_avg = deviations['baseline_avgs'].get(metric, 0)
+                star = " ***" if abs(zscore) > 2 else " **" if abs(zscore) > 1 else ""
+                f.write(f"{metric:<25} {zscore:>10.2f} {e_avg:>12.3f} {b_avg:>14.3f}{star}\n")
+            f.write("\n*** = strong signal (|z| > 2), ** = moderate (|z| > 1)\n\n")
+        
+        # Top Coins by Event Count
+        f.write("TOP COINS BY EVENT COUNT\n")
+        f.write("-" * 60 + "\n")
+        sorted_coins = sorted(by_coin.items(), key=lambda x: len(x[1]['events']), reverse=True)[:30]
+        f.write(f"{'Symbol':<15} {'Events':>8} {'Avg %':>8} {'LONG':>6} {'SHORT':>6} {'Name'}\n")
+        f.write("-" * 60 + "\n")
+        for sym, data in sorted_coins:
+            ev_list = data['events']
+            avg_pct = sum(abs(e['max_pct']) for e in ev_list) / len(ev_list)
+            longs = sum(1 for e in ev_list if e['direction'] == 'LONG')
+            shorts = len(ev_list) - longs
+            name = cat_map.get(sym, {}).get('name', '')
+            f.write(f"{sym:<15} {len(ev_list):>8} {avg_pct:>7.1f}% {longs:>6} {shorts:>6} {name}\n")
+        f.write("\n")
+        
+        # Top Categories
+        f.write("TOP CATEGORIES BY EVENT COUNT\n")
+        f.write("-" * 60 + "\n")
+        sorted_cats = sorted(by_category.items(), key=lambda x: len(x[1]['events']), reverse=True)[:20]
+        for cat, data in sorted_cats:
+            f.write(f"\n  {cat}: {len(data['events'])} events across {len(data['symbols'])} coins\n")
+            # Avg profile for category
+            profiles = data['profiles']
+            if profiles:
+                avg_vt = sum(p['vol_trend'] for p in profiles) / len(profiles)
+                avg_tt = sum(p['trades_trend'] for p in profiles) / len(profiles)
+                avg_ts = sum(p['taker_shift'] for p in profiles) / len(profiles)
+                f.write(f"    Vol trend: {avg_vt:.2f}x | Trades trend: {avg_tt:.2f}x | Taker shift: {avg_ts:+.1f}%\n")
+        f.write("\n")
+        
+        # Zeitliche Verteilung
+        f.write("HOURLY DISTRIBUTION (UTC)\n")
+        f.write("-" * 60 + "\n")
+        hours = [0] * 24
+        for e in events:
+            hours[e['open_time'].hour] += 1
+        max_h = max(hours) if hours else 1
+        for h in range(24):
+            bar = "█" * int(hours[h] / max_h * 40) if max_h > 0 else ""
+            f.write(f"  {h:02d}:00  {hours[h]:>5}  {bar}\n")
+        f.write("\n")
+        
+        # Timeframe Distribution
+        f.write("FASTEST TIMEFRAME DISTRIBUTION\n")
+        f.write("-" * 40 + "\n")
+        tf_counts = {}
+        for e in events:
+            tf = e['fastest_tf'] or 'unknown'
+            tf_counts[tf] = tf_counts.get(tf, 0) + 1
+        for tf, cnt in sorted(tf_counts.items()):
+            pct = cnt / len(events) * 100
+            f.write(f"  {tf:<12} {cnt:>6} ({pct:.1f}%)\n")
+        f.write("\n")
+        
+        f.write("=" * 80 + "\n")
+        f.write("END OF REPORT\n")
+    
+    log(f"Report written: {report_file}")
+    return report_file
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def run_scan(start_date=None, end_date=None, threshold=5.0):
+    log("=" * 60)
+    log("EVENT FINDER SCAN START")
+    log("=" * 60)
+    
+    now = datetime.now(BERLIN_TZ)
+    if start_date is None:
+        start_date = (now - timedelta(days=90)).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    if end_date is None:
+        end_date = (now - timedelta(days=1)).replace(hour=23, minute=59, second=0, microsecond=0, tzinfo=None)
+    
+    conn = coins_conn()
+    
+    # Check data availability
+    with conn.cursor() as cur:
+        cur.execute("SELECT MIN(open_time), MAX(open_time), COUNT(*) FROM kline_metrics WHERE open_time >= %s", (start_date,))
+        mn, mx, cnt = cur.fetchone()
+    
+    if cnt < 1000:
+        log(f"Not enough kline_metrics data: {cnt} rows (start={mn}, end={mx})")
+        log("Waiting for metrics backfill to complete...")
+        conn.close()
+        return None
+    
+    log(f"Data range: {mn} to {mx} ({cnt} rows)")
+    
+    # Phase 1
+    events = find_events(conn, start_date, end_date, threshold)
+    if not events:
+        log("No events found")
+        conn.close()
+        return None
+    
+    # Phase 2
+    log(f"Phase 2: Analyzing pre-event profiles ({len(events)} events)")
+    event_profiles = []
+    analyzed = 0
+    for i, ev in enumerate(events):
+        profile = analyze_pre_event(conn, ev['symbol'], ev['open_time'])
+        event_profiles.append(profile)
+        if profile:
+            analyzed += 1
+        if (i + 1) % 100 == 0:
+            log(f"  Analyzed {i+1}/{len(events)} ({analyzed} valid)")
+    log(f"  Total analyzed: {analyzed}/{len(events)}")
+    
+    # Phase 3
+    symbols = list(set(e['symbol'] for e in events))
+    event_times_by_symbol = {}
+    for ev in events:
+        s = ev['symbol']
+        if s not in event_times_by_symbol:
+            event_times_by_symbol[s] = set()
+        event_times_by_symbol[s].add(ev['open_time'])
+    
+    baseline_profiles = create_baseline(conn, symbols, start_date, end_date, event_times_by_symbol)
+    
+    # Phase 4
+    valid_event_profiles = [p for p in event_profiles if p]
+    deviations = compute_deviations(valid_event_profiles, baseline_profiles)
+    
+    # Phase 5
+    cat_map = load_categories()
+    by_coin, by_category = group_events(events, event_profiles, cat_map)
+    
+    # Phase 6
+    report_file = write_report(events, event_profiles, baseline_profiles, deviations,
+                                by_coin, by_category, cat_map, threshold, start_date, end_date)
+    
+    conn.close()
+    log("EVENT FINDER SCAN COMPLETE")
+    return report_file
+
+def run_loop():
+    log("Event Finder starting in loop mode (every 6h)")
+    while running:
+        try:
+            run_scan()
+        except Exception as e:
+            log(f"ERROR in scan: {e}")
+            import traceback
+            log(traceback.format_exc())
+        
+        # Sleep 6h in 30s chunks (for graceful shutdown)
+        for _ in range(720):
+            if not running:
+                break
+            time.sleep(30)
+    log("Event Finder stopped")
+
+if __name__ == '__main__':
+    args = sys.argv[1:]
+    
+    threshold = 5.0
+    start_date = None
+    end_date = None
+    
+    for i, arg in enumerate(args):
+        if arg == '--threshold' and i + 1 < len(args):
+            threshold = float(args[i + 1])
+        if arg == '--start' and i + 1 < len(args):
+            start_date = datetime.strptime(args[i + 1], '%Y-%m-%d')
+        if arg == '--end' and i + 1 < len(args):
+            end_date = datetime.strptime(args[i + 1], '%Y-%m-%d')
+    
+    if '--once' in args:
+        run_scan(start_date, end_date, threshold)
+    elif '--loop' in args:
+        run_loop()
+    else:
+        print("Usage:")
+        print("  python event_finder.py --once [--threshold 5.0] [--start 2025-11-01] [--end 2026-02-17]")
+        print("  python event_finder.py --loop")

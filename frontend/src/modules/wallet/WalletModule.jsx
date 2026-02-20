@@ -80,7 +80,7 @@ export default function WalletModule() {
     setConvertLoading(false)
   }
 
-  const fp = (v, d = 2) => v == null ? '-' : new Intl.NumberFormat('de-DE', { minimumFractionDigits: d, maximumFractionDigits: d }).format(v)
+  const fp = (v, d = 2) => { if (v == null) return '-'; let dec = d; if (d > 2 && Math.abs(v) > 0 && Math.abs(v) < 1) { const zeros = Math.max(0, Math.floor(-Math.log10(Math.abs(v)))); dec = Math.max(d, zeros + 3); } return new Intl.NumberFormat('de-DE', { minimumFractionDigits: dec, maximumFractionDigits: dec }).format(v) }
   const fPnl = (v) => v == null ? '-' : `${v >= 0 ? '+' : ''}$${fp(v)}`
   const fPct = (v) => v == null ? '-' : `${v >= 0 ? '+' : ''}${fp(v)}%`
   const fDate = (s) => s ? new Date(s).toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-'
