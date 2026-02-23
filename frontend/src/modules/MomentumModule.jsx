@@ -217,7 +217,8 @@ export default function MomentumModule() {
       case 'entry_price': return <span style={{ color: 'var(--color-muted)' }}>{formatPrice(p.entry_price)}</span>
       case 'current_price': return <span style={{ fontWeight: 500 }}>{formatPrice(p.current_price)}</span>
       case 'current_pct': {
-        const v = p.current_pct
+        const isResolved = p.status && p.status !== 'active'
+        const v = isResolved ? (p.actual_result_pct ?? p.current_pct) : p.current_pct
         if (v == null) return '-'
         const color = v > 0 ? '#22c55e' : v < 0 ? '#ef4444' : 'var(--color-muted)'
         return <span style={{ color, fontWeight: 600 }}>{formatPct(v)}</span>
