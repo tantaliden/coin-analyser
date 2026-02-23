@@ -1416,19 +1416,26 @@ def scan_symbols(config, symbols):
 
                     # Momentum-Check: pct_30m muss in Signal-Richtung laufen
                     ccur.execute("""
-                        SELECT pct_30m FROM kline_metrics
+                        SELECT pct_30m, pct_60m FROM kline_metrics
                         WHERE symbol = %s
                         ORDER BY open_time DESC LIMIT 1
                     """, (symbol,))
                     metrics_row = ccur.fetchone()
                     if metrics_row and metrics_row['pct_30m'] is not None:
                         pct_30m = float(metrics_row['pct_30m'])
-                        long_pct_min = float(config.get('long_pct_30m_min') or 2.0)
-                        short_pct_min = float(config.get('short_pct_30m_min') or 1.5)
+                        long_pct_min = float(config.get('long_pct_30m_min') or 2.5)
+                        short_pct_min = float(config.get('short_pct_30m_min') or 1.0)
                         if signal['direction'] == 'long' and pct_30m < long_pct_min:
                             continue  # Kein Long ohne ausreichend Momentum
                         if signal['direction'] == 'short' and pct_30m > -short_pct_min:
                             continue  # Kein Short ohne ausreichend Momentum
+
+                        # Short-Blocker: Move schon zu weit gelaufen → Bounce wahrscheinlich
+                        if signal['direction'] == 'short':
+                            pct_60m = float(metrics_row.get('pct_60m') or 0) if metrics_row.get('pct_60m') is not None else 0
+                            if pct_60m < -3.0:
+                                logger.debug(f"[LATE_SHORT] {symbol} skipped — pct_60m={pct_60m:.2f}% (move already ran)")
+                                continue
 
                     # Batch-Limit: Nicht mehr als 15 Shorts pro Scan-Zyklus
                     if signal['direction'] == 'short' and cycle_short_count >= 15:
