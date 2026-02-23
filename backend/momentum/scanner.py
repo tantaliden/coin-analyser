@@ -938,6 +938,34 @@ def _optimize_direction(user_id, direction, resolved, config, acur, ccur):
                         'label': f'conf={conf} tp={tp} sl={sl}'
                     })
     
+    # pct_30m zum Zeitpunkt jeder Prediction einmalig laden
+    for pred in preds:
+        ccur.execute("""
+            SELECT pct_30m FROM kline_metrics
+            WHERE symbol = %s AND open_time <= %s
+            ORDER BY open_time DESC LIMIT 1
+        """, (pred['symbol'], pred['detected_at']))
+        row = ccur.fetchone()
+        pred['_pct_30m'] = float(row['pct_30m']) if row and row['pct_30m'] is not None else None
+
+    # pct_30m Varianten hinzufügen (richtungsabhängig)
+    for pct_thresh in [1.0, 1.5, 2.0, 2.5, 3.0]:
+        variants.append({
+            'pct_30m_min': pct_thresh,
+            'label': f'pct_30m>={pct_thresh}%'
+        })
+        # Kombis mit TP/SL
+        for tp in [2.0, 3.0, 5.0]:
+            for sl in [1.5, 2.0, 3.0]:
+                if sl < tp:
+                    variants.append({
+                        'pct_30m_min': pct_thresh,
+                        'fixed_tp_pct': tp, 'fixed_sl_pct': sl, 'tp_sl_mode': 'fixed',
+                        'label': f'pct_30m>={pct_thresh} tp={tp} sl={sl}'
+                    })
+
+    logger.info(f"[OPTIMIZER] {direction.upper()}: Testing {len(variants)} variants")
+
     best_variant = None
     best_score = current_hit_rate
     best_details = None
@@ -953,12 +981,28 @@ def _optimize_direction(user_id, direction, resolved, config, acur, ccur):
         v_tp_pct = variant.get('fixed_tp_pct', None)
         v_sl_pct = variant.get('fixed_sl_pct', None)
         
+        v_pct_30m_min = variant.get('pct_30m_min', None)
+
         for pred in preds:
             if pred['confidence'] < v_conf:
                 sim_eliminated += 1
                 if pred['status'] == 'hit_tp':
                     sim_tp_lost += 1
                 continue
+
+            # pct_30m Filter: Prediction hätte nicht ausgelöst werden dürfen
+            if v_pct_30m_min is not None and pred.get('_pct_30m') is not None:
+                pct_val = pred['_pct_30m']
+                if direction == 'long' and pct_val < v_pct_30m_min:
+                    sim_eliminated += 1
+                    if pred['status'] == 'hit_tp':
+                        sim_tp_lost += 1
+                    continue
+                if direction == 'short' and pct_val > -v_pct_30m_min:
+                    sim_eliminated += 1
+                    if pred['status'] == 'hit_tp':
+                        sim_tp_lost += 1
+                    continue
             
             sim_total += 1
             
@@ -1094,7 +1138,7 @@ def run_daily_optimization(user_id, config):
             if best_variant and best_details:
                 improvement = best_details['sim_hit_rate'] - result['current_hit_rate']
                 
-                if improvement >= 5.0 and best_details['sim_tp_lost'] <= 1:
+                if improvement >= 3.0 and best_details['sim_tp_lost'] <= 2:
                     recommendation = 'apply'
                     reason = (f"{direction.upper()} hit rate {result['current_hit_rate']:.1f}% -> "
                               f"{best_details['sim_hit_rate']:.1f}% (+{improvement:.1f}%), "
@@ -1133,6 +1177,13 @@ def run_daily_optimization(user_id, config):
                         if old_val != new_val:
                             changes[field] = {'old': old_val, 'new': new_val}
                     
+                    if 'pct_30m_min' in best_variant:
+                        field = f'{prefix}pct_30m_min'
+                        old_val = float(config.get(field) or 1.5)
+                        new_val = best_variant['pct_30m_min']
+                        if old_val != new_val:
+                            changes[field] = {'old': old_val, 'new': new_val}
+                    
                     if changes:
                         set_parts = []
                         set_vals = []
@@ -1151,7 +1202,7 @@ def run_daily_optimization(user_id, config):
                     applied = True
                 else:
                     recommendation = 'no_change'
-                    reason = (f"{direction.upper()} improvement {improvement:.1f}% too small (need >=5%) or "
+                    reason = (f"{direction.upper()} improvement {improvement:.1f}% too small (need >=3%) or "
                               f"too many TP lost ({best_details['sim_tp_lost']})")
                     applied = False
                     changes = {}
@@ -1307,6 +1358,8 @@ def scan_symbols(config, symbols):
         else:
             logger.warning("[MKT_CTX] Kein Marktkontext verfügbar, kein Score-Modifier")
 
+        cycle_short_count = 0  # Batch-Limit: max Shorts pro Scan-Zyklus
+
         for symbol in symbols:
             if not running:
                 break
@@ -1370,10 +1423,17 @@ def scan_symbols(config, symbols):
                     metrics_row = ccur.fetchone()
                     if metrics_row and metrics_row['pct_30m'] is not None:
                         pct_30m = float(metrics_row['pct_30m'])
-                        if signal['direction'] == 'long' and pct_30m < 1.5:
-                            continue  # Kein Long ohne ≥+1% Momentum in 30min
-                        if signal['direction'] == 'short' and pct_30m > -1.5:
-                            continue  # Kein Short ohne ≤-1% Momentum in 30min
+                        long_pct_min = float(config.get('long_pct_30m_min') or 2.0)
+                        short_pct_min = float(config.get('short_pct_30m_min') or 1.5)
+                        if signal['direction'] == 'long' and pct_30m < long_pct_min:
+                            continue  # Kein Long ohne ausreichend Momentum
+                        if signal['direction'] == 'short' and pct_30m > -short_pct_min:
+                            continue  # Kein Short ohne ausreichend Momentum
+
+                    # Batch-Limit: Nicht mehr als 15 Shorts pro Scan-Zyklus
+                    if signal['direction'] == 'short' and cycle_short_count >= 15:
+                        logger.info(f"[BATCH_LIMIT] {symbol} short skipped — already {cycle_short_count} shorts this cycle")
+                        continue
 
                     # TP/SL aus User-Config berechnen (direction-spezifisch)
                     entry = signal['entry_price']
@@ -1428,6 +1488,8 @@ def scan_symbols(config, symbols):
                     
                     pred_id = acur.fetchone()['prediction_id']
                     new_predictions += 1
+                    if signal['direction'] == 'short':
+                        cycle_short_count += 1
                     logger.info(f"[NEW] #{pred_id} {symbol} {signal['direction'].upper()} "
                                f"@ {current_price:.4f} (expect {signal['expected_move_pct']:.1f}%) "
                                f"→ TP {tp_pct:.1f}% SL {sl_pct:.1f}% (conf: {signal['confidence']})")
