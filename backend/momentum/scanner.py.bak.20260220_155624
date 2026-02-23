@@ -263,23 +263,15 @@ def analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, market_con
 
     # === MARKTKONTEXT - Score-Modifikator (nur Shorts, Long-Datenbasis zu dünn) ===
     if market_context:
-        trend      = market_context['market_trend']  # -1..+1
-        avg_4h     = market_context['avg_4h']
+        trend     = market_context['market_trend']  # -1..+1
+        avg_4h    = market_context['avg_4h']
         breadth_4h = market_context['breadth_4h']
-        breadth_1h = market_context.get('breadth_1h', 0.5)
 
-        # Block 1: Move bereits gelaufen → kein Short mehr sinnvoll
+        # Absoluter Block: Move bereits gelaufen → kein Short mehr sinnvoll
         if avg_4h < -1.5 and breadth_4h < 0.25:
             short_score = 0
             signals.append({
-                'name': f'Market oversold (avg4h={avg_4h:+.1f}% breadth4h={breadth_4h:.2f}) → short blocked',
-                'type': 'market_context', 'weight': -99
-            })
-        # Block 2: Bounce-Erkennung → 1h-Breadth hoch = Markt dreht kurzfristig
-        elif breadth_1h > 0.75:
-            short_score = 0
-            signals.append({
-                'name': f'Market bouncing (breadth1h={breadth_1h:.2f}) → short blocked',
+                'name': f'Market oversold (avg4h={avg_4h:+.1f}% breadth={breadth_4h:.2f}) → short blocked',
                 'type': 'market_context', 'weight': -99
             })
         else:
@@ -296,46 +288,8 @@ def analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, market_con
                     'name': f'Market bullish (trend={trend:+.2f}) → short -10',
                     'type': 'market_context', 'weight': -10
                 })
-            # Milde Bremse bei breadth_1h > 60% (Bounce beginnt)
-            if breadth_1h > 0.60:
-                short_score -= 15
-                signals.append({
-                    'name': f'Market recovering (breadth1h={breadth_1h:.2f}) → short -15',
-                    'type': 'market_context', 'weight': -15
-                })
 
         short_score = max(short_score, 0)
-
-        # === LONG-Schutz (spiegelverkehrt) ===
-        # Block: Markt crasht → 1h-Breadth niedrig = fast alle Coins fallen
-        if breadth_1h < 0.25:
-            long_score = 0
-            signals.append({
-                'name': f'Market dumping (breadth1h={breadth_1h:.2f}) → long blocked',
-                'type': 'market_context', 'weight': -99
-            })
-        elif breadth_1h < 0.40:
-            long_score -= 15
-            signals.append({
-                'name': f'Market weakening (breadth1h={breadth_1h:.2f}) → long -15',
-                'type': 'market_context', 'weight': -15
-            })
-
-        # Graduell: Markt stark bärisch
-        if trend < -0.6:
-            long_score -= 20
-            signals.append({
-                'name': f'Market bearish (trend={trend:+.2f}) → long -20',
-                'type': 'market_context', 'weight': -20
-            })
-        elif trend < -0.25:
-            long_score -= 10
-            signals.append({
-                'name': f'Market bearish (trend={trend:+.2f}) → long -10',
-                'type': 'market_context', 'weight': -10
-            })
-
-        long_score = max(long_score, 0)
 
     # === ENTSCHEIDUNG ===
     max_score = max(long_score, short_score)
