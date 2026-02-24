@@ -316,8 +316,12 @@ export default function MomentumModule() {
               </div>
             </div>
             {editConfig.tp_sl_mode === 'fixed' && <>
-              <div><div style={s.label}>TP %</div><input type="number" step="0.5" value={editConfig.fixed_tp_pct || 5} onChange={e => setEditConfig({...editConfig, fixed_tp_pct: parseFloat(e.target.value)})} style={s.input} /></div>
-              <div><div style={s.label}>SL %</div><input type="number" step="0.5" value={editConfig.fixed_sl_pct || 2} onChange={e => setEditConfig({...editConfig, fixed_sl_pct: parseFloat(e.target.value)})} style={s.input} /></div>
+              <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:'4px'}}>
+                <div><div style={s.label}>Long TP %</div><input type="number" step="0.5" value={editConfig.long_fixed_tp_pct || editConfig.fixed_tp_pct || 2} onChange={e => setEditConfig({...editConfig, long_fixed_tp_pct: parseFloat(e.target.value)})} style={s.input} /></div>
+                <div><div style={s.label}>Long SL %</div><input type="number" step="0.5" value={editConfig.long_fixed_sl_pct || editConfig.fixed_sl_pct || 2} onChange={e => setEditConfig({...editConfig, long_fixed_sl_pct: parseFloat(e.target.value)})} style={s.input} /></div>
+                <div><div style={s.label}>Short TP %</div><input type="number" step="0.5" value={editConfig.short_fixed_tp_pct || editConfig.fixed_tp_pct || 2} onChange={e => setEditConfig({...editConfig, short_fixed_tp_pct: parseFloat(e.target.value)})} style={s.input} /></div>
+                <div><div style={s.label}>Short SL %</div><input type="number" step="0.5" value={editConfig.short_fixed_sl_pct || editConfig.fixed_sl_pct || 2} onChange={e => setEditConfig({...editConfig, short_fixed_sl_pct: parseFloat(e.target.value)})} style={s.input} /></div>
+              </div>
             </>}
             {editConfig.tp_sl_mode === 'range' && <>
               <div><div style={s.label}>TP Min %</div><input type="number" step="0.5" value={editConfig.range_tp_min || 5} onChange={e => setEditConfig({...editConfig, range_tp_min: parseFloat(e.target.value)})} style={s.input} /></div>
