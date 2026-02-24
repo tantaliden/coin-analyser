@@ -388,6 +388,32 @@ def check_active_predictions():
         short_tp = float(scan_cfg.get('short_fixed_tp_pct') or 2.0)
         short_sl = float(scan_cfg.get('short_fixed_sl_pct') or 2.0)
 
+        # Aktive Predictions updaten wenn Config-TP/SL abweicht
+        for pred in active:
+            entry = pred['entry_price']
+            if pred['direction'] == 'long':
+                new_tp_price = entry * (1 + long_tp / 100)
+                new_sl_price = entry * (1 - long_sl / 100)
+                new_tp_pct, new_sl_pct = long_tp, long_sl
+            else:
+                new_tp_price = entry * (1 - short_tp / 100)
+                new_sl_price = entry * (1 + short_sl / 100)
+                new_tp_pct, new_sl_pct = short_tp, short_sl
+
+            if (abs(float(pred['take_profit_pct']) - new_tp_pct) > 0.01 or
+                abs(float(pred['stop_loss_pct']) - new_sl_pct) > 0.01):
+                acur.execute("""
+                    UPDATE momentum_predictions
+                    SET take_profit_price = %s, stop_loss_price = %s,
+                        take_profit_pct = %s, stop_loss_pct = %s
+                    WHERE prediction_id = %s
+                """, (new_tp_price, new_sl_price, new_tp_pct, new_sl_pct, pred['prediction_id']))
+                pred['take_profit_price'] = new_tp_price
+                pred['stop_loss_price'] = new_sl_price
+                pred['take_profit_pct'] = new_tp_pct
+                pred['stop_loss_pct'] = new_sl_pct
+                logger.info(f"[TP/SL] #{pred['prediction_id']} {pred['symbol']} updated → TP {new_tp_pct}% SL {new_sl_pct}%")
+        aconn.commit()
 
         resolved_count = 0
         for pred in active:
