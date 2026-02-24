@@ -380,6 +380,15 @@ def check_active_predictions():
         if not active:
             return 0
 
+        # Config laden für live TP/SL
+        acur.execute("SELECT * FROM momentum_scan_config WHERE user_id = 1")
+        scan_cfg = acur.fetchone() or {}
+        long_tp = float(scan_cfg.get('long_fixed_tp_pct') or 2.0)
+        long_sl = float(scan_cfg.get('long_fixed_sl_pct') or 2.0)
+        short_tp = float(scan_cfg.get('short_fixed_tp_pct') or 2.0)
+        short_sl = float(scan_cfg.get('short_fixed_sl_pct') or 2.0)
+
+
         resolved_count = 0
         for pred in active:
             symbol = pred['symbol']
@@ -415,19 +424,27 @@ def check_active_predictions():
                 peak = max(pred['peak_pct'] or 0, ((entry - row['low']) / entry) * 100)
                 trough = min(pred['trough_pct'] or 0, ((entry - row['high']) / entry) * 100)
 
+            # Live TP/SL aus Config (änderbar, gilt sofort für alle offenen Positionen)
+            if pred['direction'] == 'long':
+                live_tp = entry * (1 + long_tp / 100)
+                live_sl = entry * (1 - long_sl / 100)
+            else:
+                live_tp = entry * (1 - short_tp / 100)
+                live_sl = entry * (1 + short_sl / 100)
+
             # Status prüfen
             new_status = None
             duration = int((datetime.now(timezone.utc) - pred['detected_at']).total_seconds() / 60)
 
             if pred['direction'] == 'long':
-                if current >= pred['take_profit_price']:
+                if current >= live_tp:
                     new_status = 'hit_tp'
-                elif current <= pred['stop_loss_price']:
+                elif current <= live_sl:
                     new_status = 'hit_sl'
             else:
-                if current <= pred['take_profit_price']:
+                if current <= live_tp:
                     new_status = 'hit_tp'
-                elif current >= pred['stop_loss_price']:
+                elif current >= live_sl:
                     new_status = 'hit_sl'
 
             # Expiry: max 72h
@@ -1222,7 +1239,6 @@ def run_daily_optimization(user_id, config):
         logger.info(f"[OPTIMIZER] Done. Long and Short optimized separately.")
 
 # ============================================
-
 def get_symbols_for_config(config):
     """Holt Symbole basierend auf Scan-Config (Coingruppe oder alle)"""
     if config['scan_all_symbols']:
