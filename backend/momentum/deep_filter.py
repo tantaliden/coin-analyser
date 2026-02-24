@@ -400,7 +400,7 @@ def greedy_filter_search(events, direction, max_filters=7):
     
     for rule in all_rules:
         result = evaluate_ruleset(events, [rule], direction)
-        if result and result['precision'] > best_single_prec and result['n_total'] >= 20:
+        if result and result['precision'] > best_single_prec and result['n_total'] >= max(100, len(events) * 0.05):
             best_single_prec = result['precision']
             best_single = rule
     
@@ -430,7 +430,7 @@ def greedy_filter_search(events, direction, max_filters=7):
             if result is None: continue
             
             # Muss besser sein UND genug Samples haben
-            min_n = max(15, len(events) * 0.005)  # Min 0.5% der Events
+            min_n = max(100, len(events) * 0.05)  # Min 0.5% der Events
             if result['precision'] > best_next_prec and result['n_total'] >= min_n:
                 best_next_prec = result['precision']
                 best_next = rule
