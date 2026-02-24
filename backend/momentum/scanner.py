@@ -15,6 +15,9 @@ import json
 import signal
 import logging
 import traceback
+# Threshold Optimizer (direkt importiert, gleiche Ebene)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from threshold_optimizer import run_optimization as run_threshold_optimization
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 
@@ -128,233 +131,192 @@ def calc_atr(highs, lows, closes, period=14):
     return np.mean(trs[-period:])
 
 
-def analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, market_context=None):
+def calc_body_ratio(opens, highs, lows, closes, n=6):
+    """Durchschnittliches Body/Wick Verhältnis der letzten n Candles"""
+    if len(opens) < n:
+        return None
+    ratios = []
+    for i in range(-n, 0):
+        full_range = highs[i] - lows[i]
+        if full_range <= 0:
+            continue
+        body = abs(closes[i] - opens[i])
+        ratios.append(body / full_range)
+    return float(np.mean(ratios)) if ratios else None
+
+
+def calc_consecutive(closes, n=10):
+    """Wie viele der letzten n Candles steigen vs fallen"""
+    if len(closes) < n + 1:
+        return 0, 0
+    ups = sum(1 for i in range(-n, 0) if closes[i] > closes[i-1])
+    return ups, n - ups
+
+
+def analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, market_context=None, scan_config=None):
     """
-    Analysiert ein Symbol auf Long/Short Momentum.
-    Returns: dict mit signal oder None
+    v2: Datengetriebene Gewichtung basierend auf Discovery Scanner.
+    Thresholds kommen aus scan_config (DB) und sind vom Optimizer anpassbar.
     """
     if len(candles_1h) < 30 or len(candles_4h) < 15 or len(candles_1d) < 10:
         return None
 
-    # Arrays extrahieren
-    closes_1h = [c['close'] for c in candles_1h]
-    highs_1h = [c['high'] for c in candles_1h]
-    lows_1h = [c['low'] for c in candles_1h]
+    closes_1h  = [c['close'] for c in candles_1h]
+    highs_1h   = [c['high'] for c in candles_1h]
+    lows_1h    = [c['low'] for c in candles_1h]
+    opens_1h   = [c['open'] for c in candles_1h]
     volumes_1h = [c['volume'] for c in candles_1h]
+    closes_4h  = [c['close'] for c in candles_4h]
+    closes_1d  = [c['close'] for c in candles_1d]
 
-    closes_4h = [c['close'] for c in candles_4h]
-    closes_1d = [c['close'] for c in candles_1d]
-    volumes_1d = [c['volume'] for c in candles_1d]
+    # === CONFIG THRESHOLDS (DB, Optimizer-anpassbar) ===
+    cfg = scan_config or {}
+    t4h_long_min   = float(cfg.get('scan_trend_4h_long_min') or -0.5)
+    t4h_short_max  = float(cfg.get('scan_trend_4h_short_max') or -0.5)
+    t1d_long_min   = float(cfg.get('scan_trend_1d_long_min') or -0.5)
+    t1d_short_max  = float(cfg.get('scan_trend_1d_short_max') or -0.5)
+    br_long_min    = float(cfg.get('scan_body_ratio_long_min') or 0.55)
+    br_short_max   = float(cfg.get('scan_body_ratio_short_max') or 0.55)
+    rsi_long_min   = float(cfg.get('scan_rsi_long_min') or 40.0)
+    rsi_short_max  = float(cfg.get('scan_rsi_short_max') or 40.0)
+    hhhl_long_min  = float(cfg.get('scan_hh_hl_long_min') or 0.4)
+    hhhl_short_max = float(cfg.get('scan_hh_hl_short_max') or 0.4)
+    cu_long_min    = int(cfg.get('scan_consec_ups_long_min') or 4)
+    cd_short_min   = int(cfg.get('scan_consec_downs_short_min') or 5)
+    min_score      = int(cfg.get('scan_min_score') or 40)
 
-    # === INDIKATOREN BERECHNEN ===
-
-    # RSI (1h)
+    # === INDIKATOREN ===
     rsi_1h = calc_rsi(closes_1h, 14)
     if rsi_1h is None:
         return None
 
-    # EMAs (1h)
-    ema_9 = calc_ema(closes_1h, 9)
-    ema_21 = calc_ema(closes_1h, 21)
-    ema_50 = calc_ema(closes_1h[-50:], 50) if len(closes_1h) >= 50 else None
-
-    # ATR für SL-Berechnung
-    atr = calc_atr(highs_1h, lows_1h, closes_1h, 14)
-
-    # Volume: letzte 3 Candles vs. Durchschnitt
-    avg_vol = np.mean(volumes_1h[-20:]) if len(volumes_1h) >= 20 else np.mean(volumes_1h)
-    recent_vol = np.mean(volumes_1h[-3:])
-    vol_ratio = recent_vol / avg_vol if avg_vol > 0 else 1
-
-    # Trend 4h: steigende oder fallende Closes
     trend_4h = 0
     if len(closes_4h) >= 5:
-        recent_4h = closes_4h[-5:]
-        rising = sum(1 for i in range(1, len(recent_4h)) if recent_4h[i] > recent_4h[i-1])
-        trend_4h = (rising / (len(recent_4h) - 1)) * 2 - 1  # -1 bis +1
+        r = closes_4h[-5:]
+        trend_4h = (sum(1 for i in range(1, len(r)) if r[i] > r[i-1]) / (len(r) - 1)) * 2 - 1
 
-    # Trend 1d
     trend_1d = 0
     if len(closes_1d) >= 5:
-        recent_1d = closes_1d[-5:]
-        rising = sum(1 for i in range(1, len(recent_1d)) if recent_1d[i] > recent_1d[i-1])
-        trend_1d = (rising / (len(recent_1d) - 1)) * 2 - 1
+        r = closes_1d[-5:]
+        trend_1d = (sum(1 for i in range(1, len(r)) if r[i] > r[i-1]) / (len(r) - 1)) * 2 - 1
 
-    # Higher Highs / Higher Lows (1h, letzte 6 Candles)
+    body_ratio = calc_body_ratio(opens_1h, highs_1h, lows_1h, closes_1h, 6) or 0.5
+
     hh_hl = 0
-    if len(highs_1h) >= 6 and len(lows_1h) >= 6:
-        recent_highs = highs_1h[-6:]
-        recent_lows = lows_1h[-6:]
-        higher_highs = sum(1 for i in range(1, 6) if recent_highs[i] > recent_highs[i-1])
-        higher_lows = sum(1 for i in range(1, 6) if recent_lows[i] > recent_lows[i-1])
-        hh_hl = (higher_highs + higher_lows) / 10  # 0 bis 1
+    if len(highs_1h) >= 6:
+        rh, rl = highs_1h[-6:], lows_1h[-6:]
+        hh_hl = (sum(1 for i in range(1, 6) if rh[i] > rh[i-1]) + sum(1 for i in range(1, 6) if rl[i] > rl[i-1])) / 10
 
-    # Momentum: % Change letzte 6h
-    pct_6h = ((closes_1h[-1] - closes_1h[-6]) / closes_1h[-6] * 100) if closes_1h[-6] > 0 else 0
+    consec_ups, consec_downs = calc_consecutive(closes_1h)
 
-    # === SIGNAL SCORING ===
+    avg_vol = np.mean(volumes_1h[-20:]) if len(volumes_1h) >= 20 else np.mean(volumes_1h)
+    vol_ratio = np.mean(volumes_1h[-3:]) / avg_vol if avg_vol > 0 else 1
+
+    atr = calc_atr(highs_1h, lows_1h, closes_1h, 14)
+    ema_9  = calc_ema(closes_1h, 9)
+    ema_21 = calc_ema(closes_1h, 21)
+
+    # === SCORING (Discovery-gewichtet) ===
     long_score = 0
     short_score = 0
     signals = []
 
-    # 1. EMA Crossover (9 > 21 = bullish)
-    if ema_9 and ema_21:
-        if ema_9 > ema_21:
-            long_score += 15
-            signals.append({'name': 'EMA9>EMA21', 'type': 'long', 'weight': 15})
-        else:
-            short_score += 15
-            signals.append({'name': 'EMA9<EMA21', 'type': 'short', 'weight': 15})
+    # TIER 1: trend_1d (Sep 0.475) → 25
+    if trend_1d >= t1d_long_min:
+        long_score += 25
+        signals.append({'name': f'1d trend bullish ({trend_1d:+.2f})', 'type': 'long', 'weight': 25})
+    if trend_1d <= t1d_short_max:
+        short_score += 25
+        signals.append({'name': f'1d trend bearish ({trend_1d:+.2f})', 'type': 'short', 'weight': 25})
 
-    # 2. RSI
-    if rsi_1h < 30:
-        long_score += 20  # Oversold = Long opportunity
-        signals.append({'name': f'RSI oversold ({rsi_1h:.0f})', 'type': 'long', 'weight': 20})
-    elif rsi_1h < 45:
-        long_score += 10
-        signals.append({'name': f'RSI low ({rsi_1h:.0f})', 'type': 'long', 'weight': 10})
-    elif rsi_1h > 70:
+    # TIER 1: trend_4h (Sep 0.471) → 25
+    if trend_4h >= t4h_long_min:
+        long_score += 25
+        signals.append({'name': f'4h trend bullish ({trend_4h:+.2f})', 'type': 'long', 'weight': 25})
+    if trend_4h <= t4h_short_max:
+        short_score += 25
+        signals.append({'name': f'4h trend bearish ({trend_4h:+.2f})', 'type': 'short', 'weight': 25})
+
+    # TIER 1: body_ratio (Sep 0.430) → 20
+    if body_ratio >= br_long_min:
+        long_score += 20
+        signals.append({'name': f'Strong bodies ({body_ratio:.2f})', 'type': 'long', 'weight': 20})
+    if body_ratio < br_short_max:
         short_score += 20
-        signals.append({'name': f'RSI overbought ({rsi_1h:.0f})', 'type': 'short', 'weight': 20})
-    elif rsi_1h > 55:
-        short_score += 10
-        signals.append({'name': f'RSI high ({rsi_1h:.0f})', 'type': 'short', 'weight': 10})
+        signals.append({'name': f'Weak bodies ({body_ratio:.2f})', 'type': 'short', 'weight': 20})
 
-    # 3. Volume Confirmation
-    if vol_ratio > 1.5:
-        if pct_6h > 0:
-            long_score += 15
-            signals.append({'name': f'Volume surge +buy ({vol_ratio:.1f}x)', 'type': 'long', 'weight': 15})
-        else:
-            short_score += 15
-            signals.append({'name': f'Volume surge +sell ({vol_ratio:.1f}x)', 'type': 'short', 'weight': 15})
-
-    # 4. Multi-Timeframe Trend Alignment
-    if trend_4h > 0.3:
+    # TIER 2: RSI (Sep 0.378) → 15
+    if rsi_1h >= rsi_long_min:
         long_score += 15
-        signals.append({'name': f'4h trend up ({trend_4h:.2f})', 'type': 'long', 'weight': 15})
-    elif trend_4h < -0.3:
+        signals.append({'name': f'RSI bullish ({rsi_1h:.0f})', 'type': 'long', 'weight': 15})
+    if rsi_1h < rsi_short_max:
         short_score += 15
-        signals.append({'name': f'4h trend down ({trend_4h:.2f})', 'type': 'short', 'weight': 15})
+        signals.append({'name': f'RSI bearish ({rsi_1h:.0f})', 'type': 'short', 'weight': 15})
 
-    if trend_1d > 0.3:
+    # TIER 2: consecutive (Sep 0.348) → 15
+    if consec_ups >= cu_long_min:
+        long_score += 15
+        signals.append({'name': f'Consec ups ({consec_ups}/10)', 'type': 'long', 'weight': 15})
+    if consec_downs >= cd_short_min:
+        short_score += 15
+        signals.append({'name': f'Consec downs ({consec_downs}/10)', 'type': 'short', 'weight': 15})
+
+    # TIER 2: hh_hl (Sep 0.314) → 10
+    if hh_hl >= hhhl_long_min:
         long_score += 10
-        signals.append({'name': f'1d trend up ({trend_1d:.2f})', 'type': 'long', 'weight': 10})
-    elif trend_1d < -0.3:
+        signals.append({'name': f'HH/HL ({hh_hl:.2f})', 'type': 'long', 'weight': 10})
+    if hh_hl < hhhl_short_max:
         short_score += 10
-        signals.append({'name': f'1d trend down ({trend_1d:.2f})', 'type': 'short', 'weight': 10})
+        signals.append({'name': f'LL/LH ({hh_hl:.2f})', 'type': 'short', 'weight': 10})
 
-    # 5. Higher Highs / Higher Lows Pattern
-    if hh_hl > 0.5:
-        long_score += 15
-        signals.append({'name': f'HH/HL pattern ({hh_hl:.2f})', 'type': 'long', 'weight': 15})
-    elif hh_hl < 0.2:
-        short_score += 15
-        signals.append({'name': f'LL/LH pattern ({hh_hl:.2f})', 'type': 'short', 'weight': 15})
-
-    # 6. Price above/below EMA50 (Trend)
-    if ema_50:
-        if current_price > ema_50:
-            long_score += 10
-            signals.append({'name': 'Price > EMA50', 'type': 'long', 'weight': 10})
+    # TIER 3: Volume (Sep 0.236) → 5
+    if vol_ratio > 1.5:
+        pct_6h = ((closes_1h[-1] - closes_1h[-6]) / closes_1h[-6] * 100) if closes_1h[-6] > 0 else 0
+        if pct_6h > 0:
+            long_score += 5
+            signals.append({'name': f'Vol +buy ({vol_ratio:.1f}x)', 'type': 'long', 'weight': 5})
         else:
-            short_score += 10
-            signals.append({'name': 'Price < EMA50', 'type': 'short', 'weight': 10})
+            short_score += 5
+            signals.append({'name': f'Vol +sell ({vol_ratio:.1f}x)', 'type': 'short', 'weight': 5})
 
-    # === MARKTKONTEXT - Score-Modifikator (nur Shorts, Long-Datenbasis zu dünn) ===
+    # === MARKTKONTEXT ===
     if market_context:
-        trend      = market_context['market_trend']  # -1..+1
+        trend      = market_context['market_trend']
         avg_4h     = market_context['avg_4h']
         breadth_4h = market_context['breadth_4h']
         breadth_1h = market_context.get('breadth_1h', 0.5)
 
-        # Block 1: Move bereits gelaufen → kein Short mehr sinnvoll
         if avg_4h < -1.5 and breadth_4h < 0.25:
             short_score = 0
-            signals.append({
-                'name': f'Market oversold (avg4h={avg_4h:+.1f}% breadth4h={breadth_4h:.2f}) → short blocked',
-                'type': 'market_context', 'weight': -99
-            })
-        # Block 2: Bounce-Erkennung → 1h-Breadth hoch = Markt dreht kurzfristig
+            signals.append({'name': 'Market oversold → short blocked', 'type': 'market_context', 'weight': -99})
         elif breadth_1h > 0.75:
             short_score = 0
-            signals.append({
-                'name': f'Market bouncing (breadth1h={breadth_1h:.2f}) → short blocked',
-                'type': 'market_context', 'weight': -99
-            })
+            signals.append({'name': f'Market bouncing (b1h={breadth_1h:.2f}) → short blocked', 'type': 'market_context', 'weight': -99})
         else:
-            # Gradueller Strafscore: Markt zu bullish für Shorts
-            if trend > 0.6:
-                short_score -= 20
-                signals.append({
-                    'name': f'Market bullish (trend={trend:+.2f}) → short -20',
-                    'type': 'market_context', 'weight': -20
-                })
-            elif trend > 0.25:
-                short_score -= 10
-                signals.append({
-                    'name': f'Market bullish (trend={trend:+.2f}) → short -10',
-                    'type': 'market_context', 'weight': -10
-                })
-            # Milde Bremse bei breadth_1h > 60% (Bounce beginnt)
-            if breadth_1h > 0.60:
-                short_score -= 15
-                signals.append({
-                    'name': f'Market recovering (breadth1h={breadth_1h:.2f}) → short -15',
-                    'type': 'market_context', 'weight': -15
-                })
-
+            if trend > 0.6: short_score -= 20; signals.append({'name': f'Mkt bull ({trend:+.2f}) → short -20', 'type': 'market_context', 'weight': -20})
+            elif trend > 0.25: short_score -= 10; signals.append({'name': f'Mkt bull ({trend:+.2f}) → short -10', 'type': 'market_context', 'weight': -10})
+            if breadth_1h > 0.60: short_score -= 15; signals.append({'name': f'Mkt recover (b1h={breadth_1h:.2f}) → short -15', 'type': 'market_context', 'weight': -15})
         short_score = max(short_score, 0)
 
-        # === LONG-Schutz (spiegelverkehrt) ===
-        # Block: Markt crasht → 1h-Breadth niedrig = fast alle Coins fallen
         if breadth_1h < 0.25:
             long_score = 0
-            signals.append({
-                'name': f'Market dumping (breadth1h={breadth_1h:.2f}) → long blocked',
-                'type': 'market_context', 'weight': -99
-            })
+            signals.append({'name': f'Market dump (b1h={breadth_1h:.2f}) → long blocked', 'type': 'market_context', 'weight': -99})
         elif breadth_1h < 0.40:
-            long_score -= 15
-            signals.append({
-                'name': f'Market weakening (breadth1h={breadth_1h:.2f}) → long -15',
-                'type': 'market_context', 'weight': -15
-            })
-
-        # Graduell: Markt stark bärisch
-        if trend < -0.6:
-            long_score -= 20
-            signals.append({
-                'name': f'Market bearish (trend={trend:+.2f}) → long -20',
-                'type': 'market_context', 'weight': -20
-            })
-        elif trend < -0.25:
-            long_score -= 10
-            signals.append({
-                'name': f'Market bearish (trend={trend:+.2f}) → long -10',
-                'type': 'market_context', 'weight': -10
-            })
-
+            long_score -= 15; signals.append({'name': f'Mkt weak (b1h={breadth_1h:.2f}) → long -15', 'type': 'market_context', 'weight': -15})
+        if trend < -0.6: long_score -= 20; signals.append({'name': f'Mkt bear ({trend:+.2f}) → long -20', 'type': 'market_context', 'weight': -20})
+        elif trend < -0.25: long_score -= 10; signals.append({'name': f'Mkt bear ({trend:+.2f}) → long -10', 'type': 'market_context', 'weight': -10})
         long_score = max(long_score, 0)
 
     # === ENTSCHEIDUNG ===
     max_score = max(long_score, short_score)
-    if max_score < 40:
-        return None  # Kein klares Signal
+    if max_score < min_score:
+        return None
 
     direction = 'long' if long_score > short_score else 'short'
     confidence = min(max_score, 100)
 
-    # === EXPECTED MOVE (ATR-basiert, unabhängig von User TP/SL) ===
-    expected_move_pct = 0.0
-    if atr and atr > 0 and current_price > 0:
-        # ATR * 2.5 als erwartbare Bewegung
-        expected_move_pct = (atr * 2.5 / current_price) * 100
-    else:
-        # Fallback: 6h Momentum als Schätzung
-        expected_move_pct = abs(pct_6h) * 1.5 if pct_6h != 0 else 0
+    expected_move_pct = (atr * 2.5 / current_price * 100) if atr and current_price > 0 else 0
 
-    # Reason Text
     top_signals = sorted([s for s in signals if s['type'] == direction], key=lambda x: -x['weight'])[:3]
     reason = ', '.join(s['name'] for s in top_signals)
 
@@ -369,16 +331,16 @@ def analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, market_con
             'rsi_1h': round(rsi_1h, 1),
             'ema_9': round(ema_9, 8) if ema_9 else None,
             'ema_21': round(ema_21, 8) if ema_21 else None,
-            'ema_50': round(ema_50, 8) if ema_50 else None,
             'vol_ratio': round(vol_ratio, 2),
             'trend_4h': round(trend_4h, 2),
             'trend_1d': round(trend_1d, 2),
             'atr': round(atr, 8) if atr else None,
-            'pct_6h': round(pct_6h, 2),
             'hh_hl': round(hh_hl, 2),
+            'body_ratio': round(body_ratio, 3),
+            'consec_ups': consec_ups,
+            'consec_downs': consec_downs,
         }
     }
-
 
 # ============================================
 # PREDICTION MONITORING
@@ -882,7 +844,7 @@ def should_run_optimization():
     global _last_optimization_run
     from zoneinfo import ZoneInfo
     now = datetime.now(ZoneInfo('Europe/Berlin'))
-    run_hours = [8, 20]
+    run_hours = [8]  # 1x täglich für Threshold Optimizer
     
     if now.hour in run_hours:
         today_key = f"{now.date()}-{now.hour}"
@@ -1407,7 +1369,7 @@ def scan_symbols(config, symbols):
                     continue
 
                 # Analyse (liefert Signal + expected_move, OHNE TP/SL)
-                signal = analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, market_context=market_context)
+                signal = analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, market_context=market_context, scan_config=config)
 
                 if signal and signal['confidence'] >= dir_config[signal['direction']]['min_conf']:
                     # Filter: erwartete Bewegung muss min_target_pct überschreiten
@@ -1540,6 +1502,13 @@ def main():
                 if opt_key:
                     try:
                         global _last_optimization_run
+                        # Threshold Optimizer: Discovery-basiert, passt Scanner-Thresholds an
+                        try:
+                            run_threshold_optimization(14, 4.0)
+                            logger.info("[OPTIMIZER] Threshold optimization complete")
+                        except Exception as te:
+                            logger.error(f"[OPTIMIZER] Threshold optimization failed: {te}")
+                        # Legacy TP/SL Optimizer danach
                         run_daily_optimization(user_id, config)
                         _last_optimization_run = opt_key
                     except Exception as oe:
