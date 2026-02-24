@@ -66,163 +66,17 @@ def calc_atr(highs, lows, closes, period=14):
         trs.append(tr)
     return np.mean(trs[-period:])
 
-def analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, market_context=None):
-    """Exakte Kopie der Scanner-Logik"""
-    if len(candles_1h) < 30 or len(candles_4h) < 15 or len(candles_1d) < 10:
-        return None
+# Import Scanner v2 analyze_symbol + Hilfsfunktionen
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from scanner import analyze_symbol, calc_body_ratio, calc_consecutive
 
-    closes_1h = [c['close'] for c in candles_1h]
-    highs_1h = [c['high'] for c in candles_1h]
-    lows_1h = [c['low'] for c in candles_1h]
-    volumes_1h = [c['volume'] for c in candles_1h]
-    closes_4h = [c['close'] for c in candles_4h]
-    closes_1d = [c['close'] for c in candles_1d]
 
-    rsi_1h = calc_rsi(closes_1h, 14)
-    if rsi_1h is None:
-        return None
-
-    ema_9 = calc_ema(closes_1h, 9)
-    ema_21 = calc_ema(closes_1h, 21)
-    ema_50 = calc_ema(closes_1h[-50:], 50) if len(closes_1h) >= 50 else None
-    atr = calc_atr(highs_1h, lows_1h, closes_1h, 14)
-
-    avg_vol = np.mean(volumes_1h[-20:]) if len(volumes_1h) >= 20 else np.mean(volumes_1h)
-    recent_vol = np.mean(volumes_1h[-3:])
-    vol_ratio = recent_vol / avg_vol if avg_vol > 0 else 1
-
-    trend_4h = 0
-    if len(closes_4h) >= 5:
-        recent_4h = closes_4h[-5:]
-        rising = sum(1 for i in range(1, len(recent_4h)) if recent_4h[i] > recent_4h[i-1])
-        trend_4h = (rising / (len(recent_4h) - 1)) * 2 - 1
-
-    trend_1d = 0
-    if len(closes_1d) >= 5:
-        recent_1d = closes_1d[-5:]
-        rising = sum(1 for i in range(1, len(recent_1d)) if recent_1d[i] > recent_1d[i-1])
-        trend_1d = (rising / (len(recent_1d) - 1)) * 2 - 1
-
-    hh_hl = 0
-    if len(highs_1h) >= 6 and len(lows_1h) >= 6:
-        recent_highs = highs_1h[-6:]
-        recent_lows = lows_1h[-6:]
-        higher_highs = sum(1 for i in range(1, 6) if recent_highs[i] > recent_highs[i-1])
-        higher_lows = sum(1 for i in range(1, 6) if recent_lows[i] > recent_lows[i-1])
-        hh_hl = (higher_highs + higher_lows) / 10
-
-    pct_6h = ((closes_1h[-1] - closes_1h[-6]) / closes_1h[-6] * 100) if closes_1h[-6] > 0 else 0
-
-    long_score = 0
-    short_score = 0
-    signals = []
-
-    if ema_9 and ema_21:
-        if ema_9 > ema_21:
-            long_score += 15
-            signals.append({'name': 'EMA9>EMA21', 'type': 'long', 'weight': 15})
-        else:
-            short_score += 15
-            signals.append({'name': 'EMA9<EMA21', 'type': 'short', 'weight': 15})
-
-    if rsi_1h < 30:
-        long_score += 20
-        signals.append({'name': f'RSI oversold ({rsi_1h:.0f})', 'type': 'long', 'weight': 20})
-    elif rsi_1h < 45:
-        long_score += 10
-        signals.append({'name': f'RSI low ({rsi_1h:.0f})', 'type': 'long', 'weight': 10})
-    elif rsi_1h > 70:
-        short_score += 20
-        signals.append({'name': f'RSI overbought ({rsi_1h:.0f})', 'type': 'short', 'weight': 20})
-    elif rsi_1h > 55:
-        short_score += 10
-        signals.append({'name': f'RSI high ({rsi_1h:.0f})', 'type': 'short', 'weight': 10})
-
-    if vol_ratio > 1.5:
-        if pct_6h > 0:
-            long_score += 15
-            signals.append({'name': f'Volume surge +buy ({vol_ratio:.1f}x)', 'type': 'long', 'weight': 15})
-        else:
-            short_score += 15
-            signals.append({'name': f'Volume surge +sell ({vol_ratio:.1f}x)', 'type': 'short', 'weight': 15})
-
-    if trend_4h > 0.3:
-        long_score += 15
-        signals.append({'name': f'4h trend up ({trend_4h:.2f})', 'type': 'long', 'weight': 15})
-    elif trend_4h < -0.3:
-        short_score += 15
-        signals.append({'name': f'4h trend down ({trend_4h:.2f})', 'type': 'short', 'weight': 15})
-
-    if trend_1d > 0.3:
-        long_score += 10
-        signals.append({'name': f'1d trend up ({trend_1d:.2f})', 'type': 'long', 'weight': 10})
-    elif trend_1d < -0.3:
-        short_score += 10
-        signals.append({'name': f'1d trend down ({trend_1d:.2f})', 'type': 'short', 'weight': 10})
-
-    if hh_hl > 0.5:
-        long_score += 15
-        signals.append({'name': f'HH/HL pattern ({hh_hl:.2f})', 'type': 'long', 'weight': 15})
-    elif hh_hl < 0.2:
-        short_score += 15
-        signals.append({'name': f'LL/LH pattern ({hh_hl:.2f})', 'type': 'short', 'weight': 15})
-
-    if ema_50:
-        if current_price > ema_50:
-            long_score += 10
-            signals.append({'name': 'Price > EMA50', 'type': 'long', 'weight': 10})
-        else:
-            short_score += 10
-            signals.append({'name': 'Price < EMA50', 'type': 'short', 'weight': 10})
-
-    # Market context (vereinfacht für Backtest - kein Live-Kontext)
-    if market_context:
-        trend = market_context.get('market_trend', 0)
-        breadth_1h = market_context.get('breadth_1h', 0.5)
-        avg_4h = market_context.get('avg_4h', 0)
-        breadth_4h = market_context.get('breadth_4h', 0.5)
-
-        if avg_4h < -1.5 and breadth_4h < 0.25:
-            short_score = 0
-        elif breadth_1h > 0.75:
-            short_score = 0
-        else:
-            if trend > 0.6: short_score -= 20
-            elif trend > 0.25: short_score -= 10
-            if breadth_1h > 0.60: short_score -= 15
-
-        short_score = max(short_score, 0)
-
-        if breadth_1h < 0.25:
-            long_score = 0
-        elif breadth_1h < 0.40:
-            long_score -= 15
-        if trend < -0.6: long_score -= 20
-        elif trend < -0.25: long_score -= 10
-
-        long_score = max(long_score, 0)
-
-    max_score = max(long_score, short_score)
-    if max_score < 40:
-        return None
-
-    direction = 'long' if long_score > short_score else 'short'
-    confidence = min(max_score, 100)
-
-    return {
-        'direction': direction,
-        'confidence': confidence,
-        'entry_price': current_price,
-        'signals': signals,
-        'indicators': {
-            'rsi_1h': round(rsi_1h, 1),
-            'vol_ratio': round(vol_ratio, 2),
-            'trend_4h': round(trend_4h, 2),
-            'trend_1d': round(trend_1d, 2),
-            'pct_6h': round(pct_6h, 2),
-            'hh_hl': round(hh_hl, 2),
-        }
-    }
+def load_scan_config():
+    """Lädt aktuelle Scanner-Config aus DB (gleiche Thresholds wie Live-Scanner)"""
+    with app_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM momentum_scan_config WHERE is_active = true LIMIT 1")
+        return cur.fetchone() or {}
 
 
 # === BACKTEST LOGIK ===
@@ -388,6 +242,9 @@ def run_backtest(start_date, end_date, tp_pct=2.0, sl_pct=2.0, min_confidence=65
     Hauptfunktion: Scanner über historische Daten laufen lassen.
     Scannt alle X Stunden, für jedes Symbol, prüft ob TP/SL erreicht wird.
     """
+    scan_config = load_scan_config()
+    logger.info(f"Loaded scan_config: {dict(scan_config)}")
+
     logger.info(f"{'='*60}")
     logger.info(f"BACKTEST START")
     logger.info(f"Period: {start_date} → {end_date}")
@@ -433,7 +290,7 @@ def run_backtest(start_date, end_date, tp_pct=2.0, sl_pct=2.0, min_confidence=65
                 continue
             
             # Scanner analysieren
-            signal = analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, mkt_ctx)
+            signal = analyze_symbol(candles_1h, candles_4h, candles_1d, current_price, market_context=mkt_ctx, scan_config=scan_config)
             
             if signal is None:
                 continue
