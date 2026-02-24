@@ -33,7 +33,7 @@ export default function MomentumModule() {
   const [stats, setStats] = useState({})
   const [activePredictions, setActivePredictions] = useState(0)
   const [loading, setLoading] = useState(false)
-  const [statusFilter, setStatusFilter] = useState('')
+  const [statusFilter, setStatusFilter] = useState('active')
   const [hideShort, setHideShort] = useState(false)
   const [hideTradedFilter, setHideTradedFilter] = useState(true)
   const [showSettings, setShowSettings] = useState(false)
