@@ -116,7 +116,7 @@ export default function MomentumModule() {
     setLoading(true)
     try {
       const updates = {}
-      for (const k of ['idle_seconds','min_target_pct','stop_loss_pct','min_confidence','scan_all_symbols','coin_group_id','tp_sl_mode','fixed_tp_pct','fixed_sl_pct','range_tp_min','range_tp_max','range_sl_min','range_sl_max']) {
+      for (const k of ['idle_seconds','min_target_pct','stop_loss_pct','min_confidence','scan_all_symbols','coin_group_id','tp_sl_mode','fixed_tp_pct','fixed_sl_pct','long_fixed_tp_pct','long_fixed_sl_pct','short_fixed_tp_pct','short_fixed_sl_pct','range_tp_min','range_tp_max','range_sl_min','range_sl_max']) {
         if (editConfig[k] !== config[k]) updates[k] = editConfig[k]
       }
       if (Object.keys(updates).length) {

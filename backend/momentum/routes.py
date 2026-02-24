@@ -30,6 +30,10 @@ class ConfigUpdate(BaseModel):
     range_tp_max: Optional[float] = None
     range_sl_min: Optional[float] = None
     range_sl_max: Optional[float] = None
+    long_fixed_tp_pct: Optional[float] = None
+    long_fixed_sl_pct: Optional[float] = None
+    short_fixed_tp_pct: Optional[float] = None
+    short_fixed_sl_pct: Optional[float] = None
 
 class TradeRequest(BaseModel):
     take_profit_pct: float
