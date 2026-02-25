@@ -547,7 +547,7 @@ export default function MomentumModule() {
             const bgColor = isTP ? 'rgba(34,197,94,0.05)' : 'rgba(239,68,68,0.05)'
             return (
               <div style={{ padding: '4px 6px', marginBottom: 3, background: bgColor, borderRadius: 4, border: `1px solid ${borderColor}`, fontSize: '0.5625rem' }}>
-                <div style={{ display: 'grid', gridTemplateColumns: '70px 1fr 1fr 1fr 1fr', gap: 4, alignItems: 'center' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '70px 1fr 1fr 1fr 1fr 52px', gap: 4, alignItems: 'center' }}>
                   <span style={{ fontWeight: 700 }}>
                     <span style={{ color: isTP ? '#22c55e' : '#ef4444', marginRight: 3 }}>{isTP ? 'TP' : 'SL'}</span>
                     {p.symbol.replace('USDC','')}{p.traded ? ' $' : ''}
@@ -569,6 +569,7 @@ export default function MomentumModule() {
                       ? <><span style={s.label}>Opt </span><span style={{ color: '#f59e0b' }}>SL {p.correction_data.optimal_sl}%→{formatPct(p.correction_data.optimal_gain)}</span></>
                       : <span style={{ color: 'var(--color-muted)' }}>-</span>}
                   </span>
+                  <span style={{ color: 'var(--color-muted)', textAlign: 'right' }}>{formatTime(p.resolved_at || p.detected_at)}</span>
                 </div>
               </div>
             )
