@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react'
-import { Play, Square, TrendingUp, TrendingDown, Settings, RefreshCw, Trash2, AlertCircle, CheckCircle, XCircle, Clock, Loader2, ArrowUp, ArrowDown, Rocket, X, EyeOff, Eye } from 'lucide-react'
+import { Play, Square, TrendingUp, TrendingDown, Settings, RefreshCw, Trash2, AlertCircle, CheckCircle, XCircle, Clock, Loader2, ArrowUp, ArrowDown, Rocket, X, EyeOff, Eye, BarChart2 } from 'lucide-react'
 import api from '../utils/api'
 import { useSearchStore } from '../stores/searchStore'
 
@@ -142,6 +142,21 @@ export default function MomentumModule() {
     setLoading(false)
   }
 
+  const showInChart = (p) => {
+    const detected = new Date(p.detected_at)
+    const resolved = p.resolved_at ? new Date(p.resolved_at) : new Date()
+    const durationMin = Math.max(Math.round((resolved - detected) / 60000), 10)
+    const eventStart = detected.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+    selectEvents([{
+      id: `pred_${p.prediction_id}`,
+      symbol: p.symbol,
+      event_start: eventStart,
+      duration_minutes: durationMin,
+      change_percent: p.actual_result_pct || p.current_pct || 0,
+    }])
+    setPrehistoryMinutes(Math.max(durationMin, 60))
+  }
+
   const cancelPrediction = async (id) => {
     try { await api.delete(`/api/v1/momentum/predictions/${id}`); loadPredictions(); loadStats() }
     catch (err) { console.error('Cancel failed:', err) }
@@ -257,20 +272,26 @@ export default function MomentumModule() {
         </span>
       }
       case 'detected_at': return <span style={{ color: 'var(--color-muted)', fontSize: '0.5625rem' }}>{formatTime(p.detected_at)}</span>
-      case 'actions': return p.status === 'active' ? (
+      case 'actions': return (
         <span style={{ display: 'flex', gap: 4, justifyContent: 'center' }}>
-          {p.direction === 'long' && !p.traded && (
+          <button onClick={(e) => { e.stopPropagation(); showInChart(p) }} title="Im Chart anzeigen"
+            style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
+            <BarChart2 size={11} style={{ color: '#8b5cf6' }} />
+          </button>
+          {p.status === 'active' && p.direction === 'long' && !p.traded && (
             <button onClick={() => openTradeDialog(p)} title="An Tradebot übergeben"
               style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
               <Rocket size={11} style={{ color: '#3b82f6' }} />
             </button>
           )}
-          <button onClick={() => cancelPrediction(p.prediction_id)} title="Löschen"
-            style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
-            <Trash2 size={11} style={{ color: '#ef4444' }} />
-          </button>
+          {p.status === 'active' && (
+            <button onClick={() => cancelPrediction(p.prediction_id)} title="Löschen"
+              style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
+              <Trash2 size={11} style={{ color: '#ef4444' }} />
+            </button>
+          )}
         </span>
-      ) : null
+      )
       default: return '-'
     }
   }
@@ -542,21 +563,6 @@ export default function MomentumModule() {
           }
 
           const isDrillFor = (period, dir) => statsDrill && statsDrill.period === period && (!dir || statsDrill.dir === dir)
-
-          const showInChart = (p) => {
-            const detected = new Date(p.detected_at)
-            const resolved = p.resolved_at ? new Date(p.resolved_at) : new Date(detected.getTime() + (p.duration_minutes || 60) * 60000)
-            const durationMin = Math.round((resolved - detected) / 60000)
-            const eventStart = detected.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
-            selectEvents([{
-              id: `pred_${p.prediction_id}`,
-              symbol: p.symbol,
-              event_start: eventStart,
-              duration_minutes: durationMin,
-              change_percent: p.actual_result_pct || 0,
-            }])
-            setPrehistoryMinutes(Math.max(durationMin, 60))
-          }
 
           const PredCard = ({p}) => {
             const isTP = p.status === 'hit_tp'

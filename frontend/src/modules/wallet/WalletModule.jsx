@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Wallet, RefreshCw, TrendingUp, TrendingDown, AlertCircle, X, Edit2, Trash2, Bot, DollarSign, Check, Tag, Filter, ArrowRightLeft, Loader2 } from 'lucide-react'
+import { Wallet, RefreshCw, TrendingUp, TrendingDown, AlertCircle, X, Edit2, Trash2, Bot, DollarSign, Check, Tag, Filter, ArrowRightLeft, Loader2, BarChart2 } from 'lucide-react'
 import api from '../../utils/api'
+import { useSearchStore } from '../../stores/searchStore'
 
 export default function WalletModule() {
+  const { selectEvents, setPrehistoryMinutes } = useSearchStore()
   const [status, setStatus] = useState({ configured: false })
   const [balance, setBalance] = useState(null)
   const [positions, setPositions] = useState([])
@@ -67,6 +69,21 @@ export default function WalletModule() {
   const getOrderForPosition = (posSymbol) => {
     const base = posSymbol.replace(/USD[TC]$/, '')
     return orders.find(o => o.symbol.replace(/USD[TC]$/, '') === base && o.side === 'SELL')
+  }
+
+  const showPositionChart = (pos) => {
+    const now = new Date()
+    const hoursBack = 24
+    const start = new Date(now.getTime() - hoursBack * 3600000)
+    const eventStart = start.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+    selectEvents([{
+      id: `wallet_${pos.symbol}`,
+      symbol: pos.symbol,
+      event_start: eventStart,
+      duration_minutes: hoursBack * 60,
+      change_percent: pos.pnl_percent || 0,
+    }])
+    setPrehistoryMinutes(60)
   }
 
   const doConvert = async (amount) => {
@@ -165,6 +182,9 @@ export default function WalletModule() {
                 return (
                   <tr key={i} className="border-t border-zinc-800 hover:bg-zinc-800/50">
                     <td className="px-2 py-1 font-mono font-medium">
+                      <button onClick={() => showPositionChart(pos)} className="text-purple-400 hover:text-purple-300 mr-1" title="Chart anzeigen">
+                        <BarChart2 className="w-3 h-3 inline" />
+                      </button>
                       {pos.symbol.replace('USDC','')}
                       {pos.is_bot_trade && <Bot className="w-3 h-3 text-blue-400 inline ml-1" />}
                       {hasOrder && <Tag className="w-3 h-3 text-yellow-400 inline ml-1" />}
