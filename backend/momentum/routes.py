@@ -337,13 +337,37 @@ async def execute_trade(prediction_id: int, req: TradeRequest, current_user: dic
 
 @router.get("/stats")
 async def get_stats(current_user: dict = Depends(get_current_user)):
+    user_id = current_user['user_id']
     with get_app_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM momentum_stats WHERE user_id = %s", (current_user['user_id'],))
+            cur.execute("SELECT * FROM momentum_stats WHERE user_id = %s", (user_id,))
             stats = {r['period']: dict(r) for r in cur.fetchall()}
-            cur.execute("SELECT COUNT(*) as c FROM momentum_predictions WHERE user_id = %s AND status = 'active'", (current_user['user_id'],))
+            cur.execute("SELECT COUNT(*) as c FROM momentum_predictions WHERE user_id = %s AND status = 'active'", (user_id,))
             active = cur.fetchone()['c']
-            return {"stats": stats, "active_predictions": active}
+
+            # Trade-Stats: echte Käufe/Verkäufe aus trade_history (Momentum-Trades)
+            trade_stats = {}
+            for period, tw in {'7d': "7 days", '30d': "30 days", 'all': None}.items():
+                time_filter = f"AND t.executed_at >= NOW() - INTERVAL '{tw}'" if tw else ""
+                cur.execute(f"""
+                    SELECT
+                        COUNT(DISTINCT t.prediction_id) FILTER (WHERE t.side = 'buy') as trades,
+                        COALESCE(SUM(t.quote_amount) FILTER (WHERE t.side = 'buy'), 0) as total_buy,
+                        COALESCE(SUM(t.quote_amount) FILTER (WHERE t.side = 'sell'), 0) as total_sell
+                    FROM trade_history t
+                    WHERE t.user_id = %s AND t.prediction_id IS NOT NULL {time_filter}
+                """, (user_id,))
+                row = cur.fetchone()
+                total_buy = float(row['total_buy'] or 0)
+                total_sell = float(row['total_sell'] or 0)
+                trade_stats[period] = {
+                    'trades': row['trades'] or 0,
+                    'total_buy': round(total_buy, 2),
+                    'total_sell': round(total_sell, 2),
+                    'realized_pnl': round(total_sell - total_buy, 2)
+                }
+
+            return {"stats": stats, "active_predictions": active, "trade_stats": trade_stats}
 
 # === CORRECTIONS & OPTIMIZATIONS ===
 

@@ -51,6 +51,7 @@ export default function MomentumModule() {
   const [expandedId, setExpandedId] = useState(null)
   const [statsDrill, setStatsDrill] = useState(null) // z.B. {period:'24h',dir:'long',type:'tp'}
   const [resolvedPreds, setResolvedPreds] = useState([])
+  const [tradeStats, setTradeStats] = useState({})
 
   const loadConfig = useCallback(async () => {
     try {
@@ -78,6 +79,7 @@ export default function MomentumModule() {
       const res = await api.get('/api/v1/momentum/stats')
       setStats(res.data.stats || {})
       setActivePredictions(res.data.active_predictions || 0)
+      setTradeStats(res.data.trade_stats || {})
     } catch (err) { console.error('Stats load failed:', err) }
   }, [])
 
@@ -574,6 +576,27 @@ export default function MomentumModule() {
 
           return (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: 4 }}>
+              {/* Trade P/L */}
+              {Object.keys(tradeStats).length > 0 && (
+                <div style={{ padding: '6px 8px', background: 'var(--color-bg)', borderRadius: 6, border: '1px solid var(--color-border)' }}>
+                  <div style={{ fontWeight: 700, fontSize: '0.75rem', marginBottom: 4 }}>Trades (echtes Geld)</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6, fontSize: '0.625rem' }}>
+                    {['7d', '30d', 'all'].map(p => {
+                      const ts = tradeStats[p]
+                      if (!ts || !ts.trades) return null
+                      const pnlColor = ts.realized_pnl >= 0 ? '#22c55e' : '#ef4444'
+                      return (
+                        <div key={p} style={{ textAlign: 'center' }}>
+                          <div style={{ fontWeight: 600, marginBottom: 2 }}>{p === 'all' ? 'Gesamt' : p}</div>
+                          <div><span style={s.label}>{ts.trades} Trades</span></div>
+                          <div style={{ color: pnlColor, fontWeight: 700, fontSize: '0.75rem' }}>{ts.realized_pnl >= 0 ? '+' : ''}{ts.realized_pnl.toFixed(2)} $</div>
+                          <div style={{ fontSize: '0.5625rem', color: 'var(--color-muted)' }}>Buy {ts.total_buy.toFixed(0)} / Sell {ts.total_sell.toFixed(0)}</div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
               {['24h', '7d', '30d', 'all'].map(period => {
                 const st = stats[getStatsKey(period)]
                 const stL = stats[`long_${period}`]
