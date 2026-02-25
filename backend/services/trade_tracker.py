@@ -51,6 +51,63 @@ def get_binance_client(user_row):
     api_secret = decrypt_value(user_row['binance_api_secret_encrypted'])
     return BinanceClient(api_key, api_secret)
 
+def resolve_stats(cur, user_id):
+    """Stats aktualisieren nach Prediction-Resolution"""
+    time_periods = {
+        '24h': "detected_at >= NOW() - INTERVAL '24 hours'",
+        '7d': "detected_at >= NOW() - INTERVAL '7 days'",
+        '30d': "detected_at >= NOW() - INTERVAL '30 days'",
+        'all': "TRUE"
+    }
+    combos = []
+    for tp, tw in time_periods.items():
+        combos.append((tp, tw, None))
+        combos.append((f'long_{tp}', tw, 'long'))
+        combos.append((f'short_{tp}', tw, 'short'))
+
+    for period_key, time_where, direction in combos:
+        dir_where = f" AND direction = '{direction}'" if direction else ""
+        cur.execute(f"""
+            SELECT
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE was_correct = true) as correct,
+                COUNT(*) FILTER (WHERE was_correct = false) as incorrect,
+                COUNT(*) FILTER (WHERE status = 'expired') as expired,
+                AVG(confidence) as avg_conf,
+                AVG(actual_result_pct) as avg_result,
+                MAX(actual_result_pct) as best,
+                MIN(actual_result_pct) as worst,
+                AVG(duration_minutes) as avg_dur
+            FROM momentum_predictions
+            WHERE user_id = %s AND status != 'active' AND {time_where}{dir_where}
+        """, (user_id,))
+        row = cur.fetchone()
+        total = row['total'] or 0
+        correct = row['correct'] or 0
+        hit_rate = (correct / total * 100) if total > 0 else 0
+        cur.execute("""
+            INSERT INTO momentum_stats (user_id, period, total_predictions, correct_predictions,
+                incorrect_predictions, expired_predictions, avg_confidence, avg_result_pct,
+                best_result_pct, worst_result_pct, hit_rate_pct, avg_duration_minutes, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (user_id, period) DO UPDATE SET
+                total_predictions = EXCLUDED.total_predictions,
+                correct_predictions = EXCLUDED.correct_predictions,
+                incorrect_predictions = EXCLUDED.incorrect_predictions,
+                expired_predictions = EXCLUDED.expired_predictions,
+                avg_confidence = EXCLUDED.avg_confidence,
+                avg_result_pct = EXCLUDED.avg_result_pct,
+                best_result_pct = EXCLUDED.best_result_pct,
+                worst_result_pct = EXCLUDED.worst_result_pct,
+                hit_rate_pct = EXCLUDED.hit_rate_pct,
+                avg_duration_minutes = EXCLUDED.avg_duration_minutes,
+                updated_at = NOW()
+        """, (user_id, period_key, total, correct, row['incorrect'] or 0,
+              row['expired'] or 0, row['avg_conf'], row['avg_result'],
+              row['best'], row['worst'], round(hit_rate, 2),
+              int(row['avg_dur']) if row['avg_dur'] else None))
+
+
 def check_open_trades():
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -137,6 +194,25 @@ def check_open_trades():
                     INSERT INTO trade_history (user_id, prediction_id, symbol, side, price, quantity, quote_amount, order_id, is_bot_trade, executed_at)
                     VALUES (%s, %s, %s, 'sell', %s, %s, %s, %s, TRUE, %s)
                 """, (user_id, buy['prediction_id'], symbol, avg_sell_price, total_sell_qty, total_sell_quote, sell_order_id, sell_time))
+
+                # Prediction resolven wenn vorhanden
+                if buy['prediction_id']:
+                    buy_price = float(buy['buy_price'])
+                    if buy_price > 0:
+                        result_pct = ((avg_sell_price - buy_price) / buy_price) * 100
+                    else:
+                        result_pct = 0
+                    new_status = 'hit_tp' if pnl >= 0 else 'hit_sl'
+                    duration = int((sell_time - buy_time).total_seconds() / 60)
+                    cur.execute("""
+                        UPDATE momentum_predictions
+                        SET status = %s, was_correct = %s, actual_result_pct = %s,
+                            duration_minutes = %s, resolved_at = %s
+                        WHERE prediction_id = %s AND status = 'active'
+                    """, (new_status, pnl >= 0, round(result_pct, 4), duration, sell_time, buy['prediction_id']))
+                    print(f"[TRACKER] Prediction #{buy['prediction_id']} → {new_status} ({result_pct:+.2f}%)")
+                    # Stats aktualisieren
+                    resolve_stats(cur, user_id)
 
                 conn.commit()
                 filled_count += 1

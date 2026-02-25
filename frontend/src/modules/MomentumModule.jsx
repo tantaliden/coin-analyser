@@ -50,6 +50,7 @@ export default function MomentumModule() {
   const [statsDirection, setStatsDirection] = useState('')
   const [expandedId, setExpandedId] = useState(null)
   const [statsDrill, setStatsDrill] = useState(null) // z.B. {period:'24h',dir:'long',type:'tp'}
+  const [resolvedPreds, setResolvedPreds] = useState([])
 
   const loadConfig = useCallback(async () => {
     try {
@@ -87,6 +88,13 @@ export default function MomentumModule() {
     } catch (err) { console.error('Groups load failed:', err) }
   }, [])
 
+  const loadResolvedPreds = useCallback(async () => {
+    try {
+      const res = await api.get('/api/v1/momentum/predictions', { params: { limit: 500 } })
+      setResolvedPreds((res.data.predictions || []).filter(p => p.status !== 'active'))
+    } catch (err) { console.error('Resolved load failed:', err) }
+  }, [])
+
   const loadOptLog = useCallback(async () => {
     try {
       const res = await api.get('/api/v1/momentum/optimizations')
@@ -101,6 +109,8 @@ export default function MomentumModule() {
   }, [loadConfig, loadPredictions, loadStats, loadGroups])
 
   useEffect(() => { loadPredictions() }, [statusFilter, hideShort, hideTradedFilter])
+
+  useEffect(() => { if (tab === 'stats') loadResolvedPreds() }, [tab, loadResolvedPreds])
 
   const toggleScanner = async () => {
     if (!config) return
@@ -487,8 +497,8 @@ export default function MomentumModule() {
         )}
 
         {tab === 'stats' && (() => {
-          // Filter predictions fuer drill-down
-          const drillPreds = statsDrill ? predictions.filter(p => {
+          // Filter resolved predictions fuer drill-down
+          const drillPreds = statsDrill ? resolvedPreds.filter(p => {
             if (statsDrill.dir && p.direction !== statsDrill.dir) return false
             const now = new Date()
             if (statsDrill.period === '24h' && (now - new Date(p.detected_at)) > 86400000) return false
@@ -529,6 +539,39 @@ export default function MomentumModule() {
 
           const isDrillFor = (period, dir) => statsDrill && statsDrill.period === period && (!dir || statsDrill.dir === dir)
 
+          const PredCard = ({p}) => {
+            const isTP = p.status === 'hit_tp'
+            const borderColor = isTP ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'
+            const bgColor = isTP ? 'rgba(34,197,94,0.05)' : 'rgba(239,68,68,0.05)'
+            return (
+              <div style={{ padding: '4px 6px', marginBottom: 3, background: bgColor, borderRadius: 4, border: `1px solid ${borderColor}`, fontSize: '0.5625rem' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '70px 1fr 1fr 1fr 1fr', gap: 4, alignItems: 'center' }}>
+                  <span style={{ fontWeight: 700 }}>
+                    <span style={{ color: isTP ? '#22c55e' : '#ef4444', marginRight: 3 }}>{isTP ? 'TP' : 'SL'}</span>
+                    {p.symbol.replace('USDC','')}{p.traded ? ' $' : ''}
+                  </span>
+                  <span>
+                    <span style={s.label}>Result </span>
+                    <span style={{ color: (p.actual_result_pct||0) >= 0 ? '#22c55e' : '#ef4444', fontWeight: 600 }}>{formatPct(p.actual_result_pct)}</span>
+                  </span>
+                  <span>
+                    <span style={s.label}>Peak </span>
+                    <span style={{ color: '#3b82f6', fontWeight: 600 }}>{formatPct(p.max_favorable_pct || p.peak_pct)}</span>
+                  </span>
+                  <span>
+                    <span style={s.label}>DD </span>
+                    <span style={{ color: '#ef4444' }}>{formatPct(p.max_adverse_pct || p.trough_pct)}</span>
+                  </span>
+                  <span>
+                    {p.correction_data?.optimal_sl
+                      ? <><span style={s.label}>Opt </span><span style={{ color: '#f59e0b' }}>SL {p.correction_data.optimal_sl}%→{formatPct(p.correction_data.optimal_gain)}</span></>
+                      : <span style={{ color: 'var(--color-muted)' }}>-</span>}
+                  </span>
+                </div>
+              </div>
+            )
+          }
+
           return (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: 4 }}>
               {['24h', '7d', '30d', 'all'].map(period => {
@@ -538,7 +581,8 @@ export default function MomentumModule() {
                 if (!st) return <div key={period} style={{ color: 'var(--color-muted)', fontSize: '0.6875rem' }}>{period}: Keine Daten</div>
                 return (
                   <div key={period} style={{ padding: '6px 8px', background: 'var(--color-bg)', borderRadius: 6, border: '1px solid var(--color-border)' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2, cursor: 'pointer' }}
+                      onClick={() => setStatsDrill(prev => prev && prev.period === period && !prev.dir ? null : {period, dir: null, type:'all'})}>
                       <span style={{ fontWeight: 700, fontSize: '0.75rem' }}>{period === 'all' ? 'Gesamt' : period}</span>
                       <span style={{ fontSize: '0.5625rem', color: 'var(--color-muted)' }}>{st.total_predictions} Pred | <span style={{ color: '#22c55e' }}>{st.hit_rate_pct}%</span> | Ø {formatPct(st.avg_result_pct)}</span>
                     </div>
@@ -548,37 +592,14 @@ export default function MomentumModule() {
                       <div style={{ marginTop: 4, borderTop: '1px solid var(--color-border)', paddingTop: 4 }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
                           <span style={{ fontSize: '0.5625rem', fontWeight: 600 }}>
-                            {statsDrill.dir === 'long' ? '▲' : '▼'} {statsDrill.type === 'tp' ? 'Treffer' : statsDrill.type === 'sl' ? 'Verfehlt' : 'Alle'} ({drillPreds.length})
+                            {statsDrill.dir ? (statsDrill.dir === 'long' ? '▲ Long' : '▼ Short') : 'Alle'}
+                            {statsDrill.type === 'tp' ? ' Treffer' : statsDrill.type === 'sl' ? ' Verfehlt' : ''} ({drillPreds.length})
                           </span>
                           <span onClick={() => setStatsDrill(null)} style={{ cursor: 'pointer', fontSize: '0.5625rem', color: 'var(--color-muted)' }}>✕</span>
                         </div>
-                        {drillPreds.sort((a,b) => new Date(b.detected_at) - new Date(a.detected_at)).map(p => {
-                          const sl_sims = p.correction_data?.sl_simulations
-                          return (
-                            <div key={p.prediction_id} style={{ padding: '4px 6px', marginBottom: 3, background: 'var(--color-surface)', borderRadius: 4, border: '1px solid var(--color-border)', fontSize: '0.5625rem' }}>
-                              <div style={{ display: 'grid', gridTemplateColumns: '70px 1fr 1fr 1fr 1fr', gap: 4, alignItems: 'center' }}>
-                                <span style={{ fontWeight: 700 }}>{p.symbol.replace('USDC','')}{p.traded ? ' 💰' : ''}</span>
-                                <span>
-                                  <span style={s.label}>Result </span>
-                                  <span style={{ color: (p.actual_result_pct||0) >= 0 ? '#22c55e' : '#ef4444', fontWeight: 600 }}>{formatPct(p.actual_result_pct)}</span>
-                                </span>
-                                <span>
-                                  <span style={s.label}>Peak </span>
-                                  <span style={{ color: '#3b82f6', fontWeight: 600 }}>{formatPct(p.max_favorable_pct || p.peak_pct)}</span>
-                                </span>
-                                <span>
-                                  <span style={s.label}>DD </span>
-                                  <span style={{ color: '#ef4444' }}>{formatPct(p.max_adverse_pct || p.trough_pct)}</span>
-                                </span>
-                                <span>
-                                  {p.correction_data?.optimal_sl
-                                    ? <><span style={s.label}>Opt </span><span style={{ color: '#f59e0b' }}>SL {p.correction_data.optimal_sl}%→{formatPct(p.correction_data.optimal_gain)}</span></>
-                                    : <span style={{ color: 'var(--color-muted)' }}>-</span>}
-                                </span>
-                              </div>
-                            </div>
-                          )
-                        })}
+                        {drillPreds.sort((a,b) => new Date(b.detected_at) - new Date(a.detected_at)).map(p => (
+                          <PredCard key={p.prediction_id} p={p} />
+                        ))}
                       </div>
                     )}
                     {isDrillFor(period) && drillPreds.length === 0 && (
