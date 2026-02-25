@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { Play, Square, TrendingUp, TrendingDown, Settings, RefreshCw, Trash2, AlertCircle, CheckCircle, XCircle, Clock, Loader2, ArrowUp, ArrowDown, Rocket, X, EyeOff, Eye } from 'lucide-react'
 import api from '../utils/api'
+import { useSearchStore } from '../stores/searchStore'
 
 const STATUS_ICONS = {
   active: <Clock size={13} style={{ color: '#3b82f6' }} />,
@@ -26,6 +27,7 @@ const COLUMNS = [
 ]
 
 export default function MomentumModule() {
+  const { selectEvents, setPrehistoryMinutes } = useSearchStore()
   const [tab, setTab] = useState('predictions')
   const [config, setConfig] = useState(null)
   const [predictions, setPredictions] = useState([])
@@ -541,12 +543,27 @@ export default function MomentumModule() {
 
           const isDrillFor = (period, dir) => statsDrill && statsDrill.period === period && (!dir || statsDrill.dir === dir)
 
+          const showInChart = (p) => {
+            const detected = new Date(p.detected_at)
+            const resolved = p.resolved_at ? new Date(p.resolved_at) : new Date(detected.getTime() + (p.duration_minutes || 60) * 60000)
+            const durationMin = Math.round((resolved - detected) / 60000)
+            const eventStart = detected.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+            selectEvents([{
+              id: `pred_${p.prediction_id}`,
+              symbol: p.symbol,
+              event_start: eventStart,
+              duration_minutes: durationMin,
+              change_percent: p.actual_result_pct || 0,
+            }])
+            setPrehistoryMinutes(Math.max(durationMin, 60))
+          }
+
           const PredCard = ({p}) => {
             const isTP = p.status === 'hit_tp'
             const borderColor = isTP ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'
             const bgColor = isTP ? 'rgba(34,197,94,0.05)' : 'rgba(239,68,68,0.05)'
             return (
-              <div style={{ padding: '4px 6px', marginBottom: 3, background: bgColor, borderRadius: 4, border: `1px solid ${borderColor}`, fontSize: '0.5625rem' }}>
+              <div onClick={() => showInChart(p)} style={{ padding: '4px 6px', marginBottom: 3, background: bgColor, borderRadius: 4, border: `1px solid ${borderColor}`, fontSize: '0.5625rem', cursor: 'pointer' }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '70px 1fr 1fr 1fr 1fr 52px', gap: 4, alignItems: 'center' }}>
                   <span style={{ fontWeight: 700 }}>
                     <span style={{ color: isTP ? '#22c55e' : '#ef4444', marginRight: 3 }}>{isTP ? 'TP' : 'SL'}</span>
