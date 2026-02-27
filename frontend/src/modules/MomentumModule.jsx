@@ -54,6 +54,15 @@ export default function MomentumModule() {
   const [statsDrill, setStatsDrill] = useState(null) // z.B. {period:'24h',dir:'long',type:'tp'}
   const [resolvedPreds, setResolvedPreds] = useState([])
   const [tradeStats, setTradeStats] = useState({})
+  // 2h Scanner State
+  const [config2h, setConfig2h] = useState(null)
+  const [editConfig2h, setEditConfig2h] = useState({})
+  const [predictions2h, setPredictions2h] = useState([])
+  const [totalPredictions2h, setTotalPredictions2h] = useState(0)
+  const [stats2h, setStats2h] = useState({})
+  const [activePredictions2h, setActivePredictions2h] = useState(0)
+  const [tradeStats2h, setTradeStats2h] = useState({})
+  const [showSettings2h, setShowSettings2h] = useState(false)
 
   const loadConfig = useCallback(async () => {
     try {
@@ -61,6 +70,14 @@ export default function MomentumModule() {
       setConfig(res.data)
       setEditConfig(res.data)
     } catch (err) { console.error('Config load failed:', err) }
+  }, [])
+
+  const loadConfig2h = useCallback(async () => {
+    try {
+      const res = await api.get('/api/v1/momentum/config/2h')
+      setConfig2h(res.data)
+      setEditConfig2h(res.data)
+    } catch (err) { console.error('Config 2h load failed:', err) }
   }, [])
 
   const loadPredictions = useCallback(async () => {
@@ -76,6 +93,18 @@ export default function MomentumModule() {
     } catch (err) { console.error('Predictions load failed:', err) }
   }, [statusFilter, hideShort, hideTradedFilter])
 
+  const loadPredictions2h = useCallback(async () => {
+    try {
+      const params = { limit: 200, scanner_type: 'cnn_2h' }
+      if (statusFilter) params.status = statusFilter
+      if (hideShort) params.direction = 'long'
+      if (hideTradedFilter) params.hide_traded = true
+      const res = await api.get('/api/v1/momentum/predictions', { params })
+      setPredictions2h(res.data.predictions || [])
+      setTotalPredictions2h(res.data.total || 0)
+    } catch (err) { console.error('Predictions 2h load failed:', err) }
+  }, [statusFilter, hideShort, hideTradedFilter])
+
   const loadStats = useCallback(async () => {
     try {
       const res = await api.get('/api/v1/momentum/stats')
@@ -83,6 +112,15 @@ export default function MomentumModule() {
       setActivePredictions(res.data.active_predictions || 0)
       setTradeStats(res.data.trade_stats || {})
     } catch (err) { console.error('Stats load failed:', err) }
+  }, [])
+
+  const loadStats2h = useCallback(async () => {
+    try {
+      const res = await api.get('/api/v1/momentum/stats', { params: { scanner_type: 'cnn_2h' } })
+      setStats2h(res.data.stats || {})
+      setActivePredictions2h(res.data.active_predictions || 0)
+      setTradeStats2h(res.data.trade_stats || {})
+    } catch (err) { console.error('Stats 2h load failed:', err) }
   }, [])
 
   const loadGroups = useCallback(async () => {
@@ -107,12 +145,12 @@ export default function MomentumModule() {
   }, [])
 
   useEffect(() => {
-    loadConfig(); loadPredictions(); loadStats(); loadGroups()
-    const interval = setInterval(() => { loadPredictions(); loadStats() }, 15000)
+    loadConfig(); loadConfig2h(); loadPredictions(); loadPredictions2h(); loadStats(); loadStats2h(); loadGroups()
+    const interval = setInterval(() => { loadPredictions(); loadPredictions2h(); loadStats(); loadStats2h() }, 15000)
     return () => clearInterval(interval)
-  }, [loadConfig, loadPredictions, loadStats, loadGroups])
+  }, [loadConfig, loadConfig2h, loadPredictions, loadPredictions2h, loadStats, loadStats2h, loadGroups])
 
-  useEffect(() => { loadPredictions() }, [statusFilter, hideShort, hideTradedFilter])
+  useEffect(() => { loadPredictions(); loadPredictions2h() }, [statusFilter, hideShort, hideTradedFilter])
 
   useEffect(() => { if (tab === 'stats') loadResolvedPreds() }, [tab, loadResolvedPreds])
 
@@ -123,6 +161,16 @@ export default function MomentumModule() {
       const res = await api.put('/api/v1/momentum/config', { is_active: !config.is_active })
       setConfig(res.data); setEditConfig(res.data)
     } catch (err) { console.error('Toggle failed:', err) }
+    setLoading(false)
+  }
+
+  const toggleScanner2h = async () => {
+    if (!config2h) return
+    setLoading(true)
+    try {
+      const res = await api.put('/api/v1/momentum/config/2h', { is_active: !config2h.is_active })
+      setConfig2h(res.data); setEditConfig2h(res.data)
+    } catch (err) { console.error('Toggle 2h failed:', err) }
     setLoading(false)
   }
 
@@ -139,6 +187,22 @@ export default function MomentumModule() {
       }
       setShowSettings(false)
     } catch (err) { console.error('Save failed:', err) }
+    setLoading(false)
+  }
+
+  const saveConfig2h = async () => {
+    setLoading(true)
+    try {
+      const updates = {}
+      for (const k of ['idle_seconds','min_confidence','scan_all_symbols','coin_group_id','tp_sl_mode','long_fixed_tp_pct','long_fixed_sl_pct','short_fixed_tp_pct','short_fixed_sl_pct']) {
+        if (editConfig2h[k] !== config2h[k]) updates[k] = editConfig2h[k]
+      }
+      if (Object.keys(updates).length) {
+        const res = await api.put('/api/v1/momentum/config/2h', updates)
+        setConfig2h(res.data); setEditConfig2h(res.data)
+      }
+      setShowSettings2h(false)
+    } catch (err) { console.error('Save 2h failed:', err) }
     setLoading(false)
   }
 
@@ -200,7 +264,8 @@ export default function MomentumModule() {
     else { setSortCol(key); setSortDir('asc') }
   }
 
-  const sortedPredictions = [...predictions].sort((a, b) => {
+  const currentPredictions = tab === 'predictions_2h' ? predictions2h : predictions
+  const sortedPredictions = [...currentPredictions].sort((a, b) => {
     let va = a[sortCol], vb = b[sortCol]
     if (sortCol === 'symbol') { va = va || ''; vb = vb || ''; return sortDir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va) }
     if (sortCol === 'detected_at') { va = new Date(va || 0).getTime(); vb = new Date(vb || 0).getTime() }
@@ -298,6 +363,10 @@ export default function MomentumModule() {
 
   // Stats nach direction filtern
   const getStatsKey = (period) => statsDirection ? `${statsDirection}_${period}` : period
+  const currentStats = tab === 'stats' ? stats : stats2h
+  const currentTradeStats = tab === 'stats' ? tradeStats : tradeStats2h
+  const currentActive = tab === 'predictions_2h' ? activePredictions2h : activePredictions
+  const currentConfig = tab === 'predictions_2h' ? config2h : config
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 5, fontSize: '0.75rem' }}>
@@ -305,13 +374,27 @@ export default function MomentumModule() {
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <button onClick={toggleScanner} disabled={loading}
-            style={{ ...s.btn, background: config?.is_active ? '#ef4444' : '#22c55e', color: '#fff' }}>
-            {loading ? <Loader2 size={14} className="spin" /> : config?.is_active ? <><Square size={14} /> Stop</> : <><Play size={14} /> Start</>}
-          </button>
-          <span style={{ fontSize: '0.625rem', color: config?.is_active ? '#22c55e' : 'var(--color-muted)' }}>
-            {config?.is_active ? `Scannt (${activePredictions} aktiv)` : 'Gestoppt'}
-          </span>
+          {tab !== 'predictions_2h' ? (
+            <>
+              <button onClick={toggleScanner} disabled={loading}
+                style={{ ...s.btn, background: config?.is_active ? '#ef4444' : '#22c55e', color: '#fff' }}>
+                {loading ? <Loader2 size={14} className="spin" /> : config?.is_active ? <><Square size={14} /> Stop</> : <><Play size={14} /> Start</>}
+              </button>
+              <span style={{ fontSize: '0.625rem', color: config?.is_active ? '#22c55e' : 'var(--color-muted)' }}>
+                {config?.is_active ? `Scannt (${activePredictions} aktiv)` : 'Gestoppt'}
+              </span>
+            </>
+          ) : (
+            <>
+              <button onClick={toggleScanner2h} disabled={loading}
+                style={{ ...s.btn, background: config2h?.is_active ? '#ef4444' : '#22c55e', color: '#fff' }}>
+                {loading ? <Loader2 size={14} className="spin" /> : config2h?.is_active ? <><Square size={14} /> Stop</> : <><Play size={14} /> Start</>}
+              </button>
+              <span style={{ fontSize: '0.625rem', color: config2h?.is_active ? '#22c55e' : 'var(--color-muted)' }}>
+                {config2h?.is_active ? `2h-Scan (${activePredictions2h} aktiv)` : '2h Gestoppt'}
+              </span>
+            </>
+          )}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
           {lastUpdate && <span style={{ fontSize: '0.5625rem', color: 'var(--color-muted)' }}>{lastUpdate.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>}
@@ -320,8 +403,11 @@ export default function MomentumModule() {
             {hideShort ? <Eye size={12} /> : <EyeOff size={12} />}
             <span style={{ fontSize: '0.5625rem' }}>S</span>
           </button>
-          <button onClick={() => { loadPredictions(); loadStats() }} style={{ ...s.btn, background: 'var(--color-bg)' }}><RefreshCw size={12} /></button>
-          <button onClick={() => setShowSettings(!showSettings)} style={{ ...s.btn, background: showSettings ? '#3b82f6' : 'var(--color-bg)', color: showSettings ? '#fff' : 'var(--color-text)' }}><Settings size={12} /></button>
+          <button onClick={() => { loadPredictions(); loadPredictions2h(); loadStats(); loadStats2h() }} style={{ ...s.btn, background: 'var(--color-bg)' }}><RefreshCw size={12} /></button>
+          {tab === 'predictions_2h'
+            ? <button onClick={() => setShowSettings2h(!showSettings2h)} style={{ ...s.btn, background: showSettings2h ? '#3b82f6' : 'var(--color-bg)', color: showSettings2h ? '#fff' : 'var(--color-text)' }}><Settings size={12} /></button>
+            : <button onClick={() => setShowSettings(!showSettings)} style={{ ...s.btn, background: showSettings ? '#3b82f6' : 'var(--color-bg)', color: showSettings ? '#fff' : 'var(--color-text)' }}><Settings size={12} /></button>
+          }
         </div>
       </div>
 
@@ -408,6 +494,22 @@ export default function MomentumModule() {
         </div>
       )}
 
+      {/* 2h Settings */}
+      {showSettings2h && tab === 'predictions_2h' && (
+        <div style={{ padding: 8, background: 'var(--color-bg)', borderRadius: 6, border: '1px solid var(--color-border)', display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ fontWeight: 600, fontSize: '0.6875rem', color: '#f59e0b' }}>2h-Scanner Einstellungen</div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+            <div><div style={s.label}>Min. Confidence</div><input type="number" value={editConfig2h.min_confidence || 60} onChange={e => setEditConfig2h({...editConfig2h, min_confidence: parseInt(e.target.value)})} style={s.input} /></div>
+            <div><div style={s.label}>Idle (Sek.)</div><input type="number" value={editConfig2h.idle_seconds || 60} onChange={e => setEditConfig2h({...editConfig2h, idle_seconds: parseInt(e.target.value)})} style={s.input} /></div>
+            <div><div style={s.label}>Long TP %</div><input type="number" step="0.5" value={editConfig2h.long_fixed_tp_pct || 2} onChange={e => setEditConfig2h({...editConfig2h, long_fixed_tp_pct: parseFloat(e.target.value)})} style={s.input} /></div>
+            <div><div style={s.label}>Long SL %</div><input type="number" step="0.5" value={editConfig2h.long_fixed_sl_pct || 2} onChange={e => setEditConfig2h({...editConfig2h, long_fixed_sl_pct: parseFloat(e.target.value)})} style={s.input} /></div>
+            <div><div style={s.label}>Short TP %</div><input type="number" step="0.5" value={editConfig2h.short_fixed_tp_pct || 2} onChange={e => setEditConfig2h({...editConfig2h, short_fixed_tp_pct: parseFloat(e.target.value)})} style={s.input} /></div>
+            <div><div style={s.label}>Short SL %</div><input type="number" step="0.5" value={editConfig2h.short_fixed_sl_pct || 2} onChange={e => setEditConfig2h({...editConfig2h, short_fixed_sl_pct: parseFloat(e.target.value)})} style={s.input} /></div>
+          </div>
+          <button onClick={saveConfig2h} disabled={loading} style={{ ...s.btn, background: '#3b82f6', color: '#fff', justifyContent: 'center' }}>Speichern</button>
+        </div>
+      )}
+
       {/* Stats Bar */}
       {stats[getStatsKey('all')] && (
         <div style={{ display: 'flex', gap: 8, padding: '3px 0', flexWrap: 'wrap', alignItems: 'center' }}>
@@ -420,12 +522,13 @@ export default function MomentumModule() {
 
       {/* Tabs */}
       <div style={{ display: 'flex', gap: 0, borderBottom: '1px solid var(--color-border)' }}>
-        <button onClick={() => setTab('predictions')} style={s.tab(tab === 'predictions')}>Predictions ({totalPredictions})</button>
+        <button onClick={() => setTab('predictions')} style={s.tab(tab === 'predictions')}>Scanner ({totalPredictions})</button>
+        <button onClick={() => setTab('predictions_2h')} style={s.tab(tab === 'predictions_2h')}>2h ({totalPredictions2h})</button>
         <button onClick={() => setTab('stats')} style={s.tab(tab === 'stats')}>Statistik</button>
       </div>
 
       {/* Filter */}
-      {tab === 'predictions' && (
+      {(tab === 'predictions' || tab === 'predictions_2h') && (
         <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
           {['', 'active', 'hit_tp', 'hit_sl', 'invalidated', 'expired'].map(st => (
             <button key={st} onClick={() => setStatusFilter(st)}
@@ -440,7 +543,7 @@ export default function MomentumModule() {
 
       {/* Content */}
       <div style={{ flex: 1, overflow: 'auto' }}>
-        {tab === 'predictions' && (
+        {(tab === 'predictions' || tab === 'predictions_2h') && (
           sortedPredictions.length === 0
             ? <div style={{ textAlign: 'center', color: 'var(--color-muted)', padding: 20 }}>Keine Predictions</div>
             : <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>

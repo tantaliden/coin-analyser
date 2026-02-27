@@ -39,22 +39,26 @@ async def health():
                 app_ok = True
     except: pass
     
-    # Momentum Scanner Health
-    scanner_ok = False
-    scanner_info = {}
-    try:
-        hb_path = '/opt/coin/logs/.scanner_heartbeat'
-        if os.path.exists(hb_path):
-            age_seconds = time.time() - os.path.getmtime(hb_path)
-            if age_seconds < 300:  # Max 5 Min alt
-                scanner_ok = True
-                with open(hb_path) as f:
-                    scanner_info = json.load(f)
-            scanner_info['age_seconds'] = round(age_seconds)
-    except Exception:
-        pass
+    # Momentum Scanner Health (Default + 2h)
+    def _check_scanner_heartbeat(hb_path):
+        info = {}
+        ok = False
+        try:
+            if os.path.exists(hb_path):
+                age_seconds = time.time() - os.path.getmtime(hb_path)
+                if age_seconds < 300:
+                    ok = True
+                    with open(hb_path) as f:
+                        info = json.load(f)
+                info['age_seconds'] = round(age_seconds)
+        except Exception:
+            pass
+        return ok, info
 
-    all_ok = coins_ok and app_ok and scanner_ok
+    scanner_ok, scanner_info = _check_scanner_heartbeat('/opt/coin/logs/.scanner_heartbeat')
+    scanner_2h_ok, scanner_2h_info = _check_scanner_heartbeat('/opt/coin/logs/.scanner_2h_heartbeat')
+
+    all_ok = coins_ok and app_ok and scanner_ok and scanner_2h_ok
     return {
         "status": "ok" if all_ok else ("degraded" if (coins_ok and app_ok) else "critical"),
         "version": SETTINGS['app']['version'],
@@ -65,6 +69,10 @@ async def health():
         "momentum_scanner": {
             "healthy": scanner_ok,
             **scanner_info
+        },
+        "momentum_scanner_2h": {
+            "healthy": scanner_2h_ok,
+            **scanner_2h_info
         },
         "timestamp": datetime.utcnow().isoformat()
     }

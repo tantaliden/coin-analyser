@@ -610,7 +610,7 @@ def check_active_predictions():
         acur = aconn.cursor()
         ccur = cconn.cursor()
 
-        acur.execute("SELECT * FROM momentum_predictions WHERE status = 'active'")
+        acur.execute("SELECT * FROM momentum_predictions WHERE status = 'active' AND (scanner_type = 'default' OR scanner_type IS NULL)")
         active = acur.fetchall()
 
         if not active:
@@ -1092,7 +1092,7 @@ def update_stats(user_id):
                     MIN(actual_result_pct) as worst,
                     AVG(duration_minutes) as avg_dur
                 FROM momentum_predictions
-                WHERE user_id = %s AND status != 'active' AND {time_where}{dir_where}
+                WHERE user_id = %s AND status != 'active' AND (scanner_type = 'default' OR scanner_type IS NULL) AND {time_where}{dir_where}
             """, (user_id,))
             
             row = cur.fetchone()
@@ -1101,11 +1101,11 @@ def update_stats(user_id):
             hit_rate = (correct / total * 100) if total > 0 else 0
 
             cur.execute("""
-                INSERT INTO momentum_stats (user_id, period, total_predictions, correct_predictions,
+                INSERT INTO momentum_stats (user_id, period, scanner_type, total_predictions, correct_predictions,
                     incorrect_predictions, expired_predictions, avg_confidence, avg_result_pct,
                     best_result_pct, worst_result_pct, hit_rate_pct, avg_duration_minutes, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (user_id, period) DO UPDATE SET
+                VALUES (%s, %s, 'default', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (user_id, period, scanner_type) DO UPDATE SET
                     total_predictions = EXCLUDED.total_predictions,
                     correct_predictions = EXCLUDED.correct_predictions,
                     incorrect_predictions = EXCLUDED.incorrect_predictions,
@@ -2069,15 +2069,15 @@ def scan_symbols(config, symbols):
 
         # Aktive Predictions holen (kein Doppel-Signal pro Symbol)
         acur.execute("""
-            SELECT symbol FROM momentum_predictions 
-            WHERE user_id = %s AND status = 'active'
+            SELECT symbol FROM momentum_predictions
+            WHERE user_id = %s AND status = 'active' AND (scanner_type = 'default' OR scanner_type IS NULL)
         """, (user_id,))
         active_symbols = {r['symbol'] for r in acur.fetchall()}
 
         # Cooldown: Symbole die in den letzten 60 Min resolved wurden nicht nochmal scannen
         acur.execute("""
             SELECT DISTINCT symbol FROM momentum_predictions
-            WHERE user_id = %s AND status != 'active'
+            WHERE user_id = %s AND status != 'active' AND (scanner_type = 'default' OR scanner_type IS NULL)
               AND resolved_at >= NOW() - INTERVAL '60 minutes'
         """, (user_id,))
         cooldown_symbols = {r['symbol'] for r in acur.fetchall()}

@@ -130,6 +130,7 @@ async def get_predictions(
     symbol: Optional[str] = Query(None),
     direction: Optional[str] = Query(None),
     hide_traded: Optional[bool] = Query(None),
+    scanner_type: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     current_user: dict = Depends(get_current_user)
@@ -138,6 +139,11 @@ async def get_predictions(
         with conn.cursor() as cur:
             where = ["user_id = %s"]
             params = [current_user['user_id']]
+            if scanner_type:
+                where.append("scanner_type = %s")
+                params.append(scanner_type)
+            else:
+                where.append("(scanner_type = 'default' OR scanner_type IS NULL)")
             if status:
                 where.append("status = %s")
                 params.append(status)
@@ -336,13 +342,17 @@ async def execute_trade(prediction_id: int, req: TradeRequest, current_user: dic
 # === STATS ===
 
 @router.get("/stats")
-async def get_stats(current_user: dict = Depends(get_current_user)):
+async def get_stats(scanner_type: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
+    st = scanner_type or 'default'
     with get_app_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM momentum_stats WHERE user_id = %s", (user_id,))
+            cur.execute("SELECT * FROM momentum_stats WHERE user_id = %s AND scanner_type = %s", (user_id, st))
             stats = {r['period']: dict(r) for r in cur.fetchall()}
-            cur.execute("SELECT COUNT(*) as c FROM momentum_predictions WHERE user_id = %s AND status = 'active'", (user_id,))
+            if st == 'default':
+                cur.execute("SELECT COUNT(*) as c FROM momentum_predictions WHERE user_id = %s AND status = 'active' AND (scanner_type = 'default' OR scanner_type IS NULL)", (user_id,))
+            else:
+                cur.execute("SELECT COUNT(*) as c FROM momentum_predictions WHERE user_id = %s AND status = 'active' AND scanner_type = %s", (user_id, st))
             active = cur.fetchone()['c']
 
             # Trade-Stats: echte Käufe/Verkäufe aus trade_history (Momentum-Trades)
@@ -392,3 +402,37 @@ async def get_optimizations(limit: int = Query(10, ge=1, le=50), current_user: d
                 WHERE user_id = %s ORDER BY run_at DESC LIMIT %s
             """, (current_user['user_id'], limit))
             return [dict(r) for r in cur.fetchall()]
+
+# === 2h SCANNER CONFIG ===
+
+@router.get("/config/2h")
+async def get_config_2h(current_user: dict = Depends(get_current_user)):
+    with get_app_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM momentum_scan_config_2h WHERE user_id = %s", (current_user['user_id'],))
+            config = cur.fetchone()
+            if not config:
+                cur.execute("""
+                    INSERT INTO momentum_scan_config_2h (user_id, is_active, scan_all_symbols, idle_seconds, min_confidence,
+                        tp_sl_mode, long_fixed_tp_pct, long_fixed_sl_pct, short_fixed_tp_pct, short_fixed_sl_pct)
+                    VALUES (%s, false, true, 60, 60, 'fixed', 2.0, 2.0, 2.0, 2.0) RETURNING *
+                """, (current_user['user_id'],))
+                config = cur.fetchone()
+                conn.commit()
+            return dict(config)
+
+@router.put("/config/2h")
+async def update_config_2h(data: ConfigUpdate, current_user: dict = Depends(get_current_user)):
+    updates = {k: v for k, v in data.dict().items() if v is not None}
+    if not updates:
+        raise HTTPException(400, "Keine Änderungen")
+    set_clauses = ", ".join(f"{k} = %s" for k in updates)
+    values = list(updates.values()) + [current_user['user_id']]
+    with get_app_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE momentum_scan_config_2h SET {set_clauses}, updated_at = NOW() WHERE user_id = %s RETURNING *", values)
+            config = cur.fetchone()
+            conn.commit()
+            if not config:
+                raise HTTPException(404, "Config nicht gefunden")
+            return dict(config)
