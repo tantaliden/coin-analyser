@@ -1,0 +1,150 @@
+================================================================================
+DIFFERENZ-SCANNER v1 — ERGEBNISSE
+Zeitpunkt: 2026-02-26 19:10:04
+Config: 30 Tage, ≥5.0% Moves
+================================================================================
+
+Events total: 40724
+  Long: 18242
+  Short: 22482
+
+Anomalien total: 18442265
+Durchschnitt pro Event: 452.9
+
+Anomalie-Verteilung:
+  volume_drop: 6098069
+  volume_spike: 2983606
+  trade_drop: 2180847
+  momentum_reversal: 1892104
+  trade_spike: 1436966
+  volatility_drop: 836682
+  taker_shift_buy: 656739
+  price_spike: 649151
+  taker_shift_sell: 646291
+  volatility_spike: 613430
+  wick_anomaly: 448380
+
+--------------------------------------------------------------------------------
+TOP 50 MUSTER (größter Long/Short-Unterschied)
+--------------------------------------------------------------------------------
+  #1: momentum_reversal | 2-4h | moderate | dir=down
+        Long=37.2%  Short=26.1%  Diff=+11.1pp → LONG
+  #2: momentum_reversal | 2-4h | moderate | dir=any
+        Long=56.1%  Short=46.3%  Diff=+9.9pp → LONG
+  #3: momentum_reversal | 8-12h | strong | dir=any
+        Long=28.5%  Short=18.7%  Diff=+9.8pp → LONG
+  #4: momentum_reversal | 6-8h | strong | dir=any
+        Long=28.9%  Short=19.2%  Diff=+9.7pp → LONG
+  #5: momentum_reversal | 4-6h | moderate | dir=down
+        Long=35.1%  Short=25.9%  Diff=+9.2pp → LONG
+  #6: momentum_reversal | 4-6h | strong | dir=any
+        Long=29.0%  Short=20.2%  Diff=+8.8pp → LONG
+  #7: momentum_reversal | 2-4h | mild | dir=down
+        Long=58.8%  Short=50.1%  Diff=+8.7pp → LONG
+  #8: volatility_spike | 8-12h | strong | dir=any
+        Long=23.9%  Short=15.6%  Diff=+8.3pp → LONG
+  #9: momentum_reversal | 1-2h | mild | dir=down
+        Long=40.9%  Short=32.7%  Diff=+8.2pp → LONG
+  #10: momentum_reversal | 2-4h | strong | dir=any
+        Long=30.9%  Short=22.8%  Diff=+8.0pp → LONG
+  #11: momentum_reversal | 8-12h | strong | dir=up
+        Long=19.7%  Short=11.8%  Diff=+7.9pp → LONG
+  #12: momentum_reversal | 4-6h | moderate | dir=any
+        Long=53.7%  Short=45.8%  Diff=+7.8pp → LONG
+  #13: momentum_reversal | 0-30min | mild | dir=down
+        Long=26.7%  Short=18.9%  Diff=+7.8pp → LONG
+  #14: momentum_reversal | 1-2h | moderate | dir=down
+        Long=24.6%  Short=16.9%  Diff=+7.7pp → LONG
+  #15: momentum_reversal | 6-8h | moderate | dir=down
+        Long=34.0%  Short=26.8%  Diff=+7.3pp → LONG
+  #16: momentum_reversal | 2-4h | strong | dir=down
+        Long=17.7%  Short=10.6%  Diff=+7.1pp → LONG
+  #17: momentum_reversal | 4-6h | mild | dir=down
+        Long=57.1%  Short=50.0%  Diff=+7.1pp → LONG
+  #18: momentum_reversal | 8-12h | moderate | dir=down
+        Long=36.3%  Short=29.4%  Diff=+6.9pp → LONG
+  #19: momentum_reversal | 0-30min | mild | dir=up
+        Long=19.3%  Short=26.1%  Diff=-6.8pp → SHORT
+  #20: momentum_reversal | 6-8h | moderate | dir=any
+        Long=52.0%  Short=45.4%  Diff=+6.7pp → LONG
+  #21: momentum_reversal | 6-8h | strong | dir=up
+        Long=18.8%  Short=12.4%  Diff=+6.3pp → LONG
+  #22: price_spike | 0-30min | moderate | dir=up
+        Long=13.5%  Short=19.8%  Diff=-6.3pp → SHORT
+  #23: momentum_reversal | 4-6h | strong | dir=down
+        Long=16.9%  Short=10.7%  Diff=+6.2pp → LONG
+  #24: momentum_reversal | 8-12h | strong | dir=down
+        Long=17.7%  Short=11.7%  Diff=+6.1pp → LONG
+  #25: trade_spike | 8-12h | extreme | dir=any
+        Long=45.4%  Short=39.3%  Diff=+6.0pp → LONG
+  #26: momentum_reversal | 1-2h | moderate | dir=any
+        Long=39.9%  Short=33.9%  Diff=+6.0pp → LONG
+  #27: volatility_spike | 8-12h | moderate | dir=any
+        Long=49.7%  Short=43.8%  Diff=+5.9pp → LONG
+  #28: momentum_reversal | 6-8h | strong | dir=down
+        Long=16.4%  Short=10.6%  Diff=+5.9pp → LONG
+  #29: volatility_spike | 4-6h | strong | dir=any
+        Long=19.2%  Short=13.8%  Diff=+5.4pp → LONG
+  #30: price_spike | 2-4h | strong | dir=up
+        Long=10.4%  Short=5.3%  Diff=+5.1pp → LONG
+  #31: volatility_spike | 6-8h | strong | dir=any
+        Long=18.8%  Short=13.7%  Diff=+5.0pp → LONG
+  #32: momentum_reversal | 8-12h | moderate | dir=any
+        Long=52.8%  Short=47.8%  Diff=+5.0pp → LONG
+  #33: momentum_reversal | 0-30min | moderate | dir=down
+        Long=15.4%  Short=10.4%  Diff=+4.9pp → LONG
+  #34: momentum_reversal | 8-12h | extreme | dir=any
+        Long=8.5%  Short=3.6%  Diff=+4.9pp → LONG
+  #35: momentum_reversal | 30-60min | mild | dir=any
+        Long=42.7%  Short=37.9%  Diff=+4.8pp → LONG
+  #36: momentum_reversal | 6-8h | moderate | dir=up
+        Long=36.2%  Short=31.4%  Diff=+4.8pp → LONG
+  #37: price_spike | 2-4h | strong | dir=any
+        Long=16.3%  Short=11.6%  Diff=+4.7pp → LONG
+  #38: momentum_reversal | 0-30min | moderate | dir=up
+        Long=11.9%  Short=16.6%  Diff=-4.7pp → SHORT
+  #39: momentum_reversal | 30-60min | moderate | dir=any
+        Long=26.9%  Short=22.3%  Diff=+4.6pp → LONG
+  #40: momentum_reversal | 1-2h | mild | dir=any
+        Long=60.7%  Short=56.1%  Diff=+4.6pp → LONG
+  #41: momentum_reversal | 4-6h | strong | dir=up
+        Long=18.2%  Short=13.7%  Diff=+4.5pp → LONG
+  #42: momentum_reversal | 8-12h | moderate | dir=up
+        Long=38.6%  Short=34.2%  Diff=+4.4pp → LONG
+  #43: momentum_reversal | 6-8h | mild | dir=down
+        Long=55.5%  Short=51.1%  Diff=+4.4pp → LONG
+  #44: volatility_spike | 6-8h | moderate | dir=any
+        Long=42.0%  Short=37.7%  Diff=+4.3pp → LONG
+  #45: momentum_reversal | 8-12h | extreme | dir=up
+        Long=6.1%  Short=1.9%  Diff=+4.2pp → LONG
+  #46: price_spike | 30-60min | moderate | dir=down
+        Long=10.7%  Short=14.9%  Diff=-4.2pp → SHORT
+  #47: momentum_reversal | 1-2h | strong | dir=down
+        Long=11.4%  Short=7.2%  Diff=+4.2pp → LONG
+  #48: wick_anomaly | 8-12h | strong | dir=any
+        Long=68.7%  Short=72.8%  Diff=-4.2pp → SHORT
+  #49: price_spike | 30-60min | moderate | dir=any
+        Long=22.2%  Short=26.3%  Diff=-4.0pp → SHORT
+  #50: momentum_reversal | 2-4h | mild | dir=any
+        Long=77.8%  Short=73.8%  Diff=+4.0pp → LONG
+
+--------------------------------------------------------------------------------
+VALIDIERTE LONG-INDIKATOREN (Einzel)
+--------------------------------------------------------------------------------
+  momentum_reversal | 2-4h | moderate | dir=down
+    Purity=53.6%  Coverage=37.2%  Contamination=26.1%
+    Long matches=6789  Short matches=5872
+
+--------------------------------------------------------------------------------
+VALIDIERTE SHORT-INDIKATOREN (Einzel)
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+LONG-PAARE
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+SHORT-PAARE
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+TRIPLES
+--------------------------------------------------------------------------------

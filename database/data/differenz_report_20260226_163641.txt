@@ -1,0 +1,440 @@
+==============================================================================================================
+DIFFERENZ-SCANNER v7 — TIEFENVERGLEICH
+Generated: 2026-02-26 16:36:41
+Period: 30 days | Min move: +/-5.0%
+Events: 41012 total (18518 Long [45.2%], 22494 Short [54.8%])
+Indikatoren pro Event: 126
+Runtime: 84s (1.4min / 0.0h)
+==============================================================================================================
+
+METHODE:
+  1. JEDES Event einzeln: 126 Indikatorwerte auf Ausreisser pruefen
+  2. Long und Short GETRENNT: Welche Ausreisser sind typisch pro Richtung?
+  3. Gegenprobe: Taucht ein Long-Muster auch bei >10% der Shorts auf? → verfeinern/verwerfen
+  4. Kombinationen: Mehrere Muster zusammen → weniger Fehlsignale
+
+==============================================================================================================
+PHASE 3: SIGNAL-BEREICHE (128 Rohsignale gefunden)
+  Getestet: ~1225 Bereiche pro Indikator (2% Schrittweite)
+  Min Purity: 60% | Min Coverage: 3%
+==============================================================================================================
+
+--- LONG-SIGNALE (validiert, Contamination <= 10%) ---
+  #   Indikator                               Von          Bis   Purity  Coverag   Contam        n   Ref?
+    1 range_pos_7d                         0.5820       1.0000    76.5%    36.1%     9.1%     8742     ja
+    2 vwap_dist_4h                         2.6810      41.9990    71.7%    29.0%     9.4%     7498     ja
+    3 pct_3d                               7.0300     123.9400    69.2%    24.5%     9.0%     6560     ja
+    4 bb_position_4h                       0.7920       1.5810    66.5%    23.7%     9.8%     6603     ja
+    5 trend_4h_5                           0.5000       1.0000    65.5%    22.6%     9.8%     6398     ja
+    6 bb_position_1h                       0.8630       1.5880    64.1%    21.1%     9.7%     6096     ja
+    7 mom_5m                             -11.6490      -0.4710    62.9%    19.9%     9.7%     5863     ja
+    8 mom_15m                            -14.7350      -0.8610    63.8%    19.4%     9.1%     5627     ja
+    9 mom_30m                            -25.5130      -1.1010    62.4%    19.8%     9.8%     5865     ja
+   10 mom_10m                            -12.8360      -0.6920    62.7%    19.1%     9.3%     5637     ja
+   11 range_pos_24h                        0.7960       1.0000    62.6%    19.1%     9.4%     5634     ja
+   12 atr_1h_pct                           3.1070       4.8830    62.1%    18.9%     9.5%     5632     ja
+   13 trend_4h_10                          0.3300       1.0000    61.6%    18.7%     9.6%     5625     ja
+   14 obv_trend_4h                         0.5574       1.4375    60.6%    18.4%     9.8%     5623     ja
+   15 max_candle_range_5h                  3.5480       9.0910    62.2%    16.5%     8.3%     4921       
+   16 pct_7d                              10.6900     191.0300    60.1%    17.1%     9.3%     5256     ja
+   17 mom_60m                            -25.1150      -1.6390    61.3%    16.3%     8.5%     4921       
+   18 max_candle_range_5h                  4.3200      77.6930    62.4%    13.8%     6.9%     4102       
+   19 atr_1h_pct                           3.5920       6.1430    60.9%    13.5%     7.1%     4101       
+   20 vwap_dist_1h                         3.5840      42.9750    60.4%    13.4%     7.2%     4102       
+   21 engulfing_bull_1h                    1.0000       1.0000    62.0%    13.0%     6.6%     3876     ja
+
+--- SHORT-SIGNALE (validiert, Contamination <= 10%) ---
+  #   Indikator                               Von          Bis   Purity  Coverag   Contam        n   Ref?
+    1 range_pos_7d                         0.0000       0.1670    84.6%    44.1%     9.8%    11734     ja
+    2 pct_3d                             -42.5800     -13.4800    82.3%    35.1%     9.2%     9598     ja
+    3 trend_4h_5                          -1.0000      -0.5000    78.7%    26.0%     8.6%     7439     ja
+    4 pct_7d                             -54.2700     -23.1700    78.2%    25.7%     8.7%     7397     ja
+    5 bb_position_4h                      -0.5680      -0.0000    78.5%    25.2%     8.4%     7217     ja
+    6 range_pos_24h                        0.0000       0.1160    74.7%    24.1%    10.0%     7269     ja
+    7 vwap_dist_4h                       -28.3390      -5.7190    72.0%    20.5%     9.7%     6404     ja
+    8 upper_wick_1h                        0.3790       0.8110    71.0%    19.8%     9.8%     6273     ja
+    9 mom_15m                              0.8930      32.5390    72.9%    19.3%     8.7%     5939     ja
+   10 mom_10m                              0.7660      32.7200    72.2%    19.1%     8.9%     5939     ja
+   11 bb_position_1h                      -0.1930       0.0420    74.0%    18.5%     7.9%     5633     ja
+   12 mom_5m                               0.5460      33.0830    71.7%    18.9%     9.1%     5938     ja
+   13 engulfing_bear_1h                    0.0000       1.0000    70.6%    18.3%     9.2%     5814     ja
+   14 consec_ups_1h                        0.0000       3.0000    68.4%    17.8%    10.0%     5840     ja
+   15 mom_30m                              1.1810      55.3420    69.7%    16.9%     9.0%     5469     ja
+   16 trend_1d_5                          -1.0000      -0.5000    71.4%    15.5%     7.5%     4885     ja
+   17 rsi_1h                               0.0000      20.2000    70.0%    15.6%     8.1%     5013     ja
+   18 spike_up_time_10m                    0.0000      25.0000    68.0%    15.9%     9.1%     5254     ja
+   19 spike_up_time_15m                    0.0000      25.0000    66.8%    15.8%     9.5%     5323     ja
+   20 spike_up_time_20m                    0.0000      25.0000    66.0%    15.9%     9.9%     5410     ja
+   21 trend_1h_10                         -1.0000      -0.5600    68.0%    15.2%     8.7%     5032     ja
+   22 trend_4h_10                         -1.0000      -0.5600    67.2%    15.0%     8.9%     5022     ja
+   23 hh_hl_6                              0.0000       0.2000    65.4%    15.4%     9.9%     5294     ja
+   24 trend_1d_10                         -1.0000      -0.5600    67.2%    14.5%     8.6%     4845     ja
+   25 spike_up_time_30m                    0.0000      20.0000    66.7%    14.4%     8.7%     4844     ja
+   26 bullish_candles_1h                   0.0000       1.0000    64.4%    14.8%    10.0%     5188     ja
+   27 consec_downs_1h                      8.0000      10.0000    68.6%    13.4%     7.4%     4380     ja
+   28 hh_hl_12                             0.0000       0.2300    65.4%    13.9%     8.9%     4786     ja
+   29 engulfing_bull_5m                    0.0000       1.0000    63.8%    14.1%     9.8%     4987     ja
+   30 bb_position_1h                      -0.5850      -0.0240    70.0%    12.8%     6.7%     4101       
+   31 spike_down_time_20m                 15.0000      50.0000    63.5%    14.1%     9.8%     5004     ja
+   32 spike_down_time_30m                 20.0000      55.0000    63.7%    14.1%     9.7%     4965     ja
+   33 obv_trend_4h                        -1.0588      -0.7784    63.5%    14.1%     9.9%     4998     ja
+   34 shooting_star_1h                     0.0000       1.0000    71.6%    12.4%     6.0%     3892     ja
+   35 trend_1h_5                          -1.0000      -0.5000    67.0%    13.2%     7.9%     4436     ja
+   36 spike_down_time_30m                 10.0000      45.0000    64.9%    13.6%     8.9%     4717     ja
+   37 spike_down_time_15m                 25.0000      55.0000    63.0%    13.6%     9.7%     4863     ja
+   38 atr_4h_pct                           3.3170       3.7630    63.6%    13.2%     9.2%     4687     ja
+   39 trend_1h_20                         -1.0000      -0.4700    64.9%    12.6%     8.3%     4369     ja
+   40 spike_down_time_20m                  5.0000      40.0000    62.0%    13.1%     9.7%     4737     ja
+
+==============================================================================================================
+PHASE 5: INDIKATOR-PAARE (2799 gefunden)
+  Beide Signale muessen gleichzeitig feuern.
+  Min Purity: 65% | Min Coverage: 2%
+==============================================================================================================
+
+--- TOP LONG-PAARE ---
+
+  Paar L#1: trend_4h_5 [0.5000 - 1.0000] + vwap_dist_4h [2.6810 - 41.9990]
+    n=5512 | Purity=73.8% | Coverage=22.0% | Contamination=6.4%
+    Richtig=4066 | Falsch=1446
+
+  Paar L#2: pct_3d [7.0300 - 123.9400] + range_pos_7d [0.5820 - 1.0000]
+    n=4785 | Purity=76.4% | Coverage=19.8% | Contamination=5.0%
+    Richtig=3657 | Falsch=1128
+
+  Paar L#3: range_pos_7d [0.5820 - 1.0000] + trend_4h_5 [0.5000 - 1.0000]
+    n=4317 | Purity=78.5% | Coverage=18.3% | Contamination=4.1%
+    Richtig=3390 | Falsch=927
+
+  Paar L#4: range_pos_7d [0.5820 - 1.0000] + vwap_dist_4h [2.6810 - 41.9990]
+    n=4330 | Purity=78.1% | Coverage=18.3% | Contamination=4.2%
+    Richtig=3383 | Falsch=947
+
+  Paar L#5: bb_position_4h [0.7920 - 1.5810] + range_pos_7d [0.5820 - 1.0000]
+    n=4520 | Purity=75.2% | Coverage=18.4% | Contamination=5.0%
+    Richtig=3399 | Falsch=1121
+
+  Paar L#6: bb_position_4h [0.7920 - 1.5810] + vwap_dist_4h [2.6810 - 41.9990]
+    n=4732 | Purity=72.7% | Coverage=18.6% | Contamination=5.8%
+    Richtig=3438 | Falsch=1294
+
+  Paar L#7: bb_position_4h [0.7920 - 1.5810] + pct_3d [7.0300 - 123.9400]
+    n=4211 | Purity=72.2% | Coverage=16.4% | Contamination=5.2%
+    Richtig=3041 | Falsch=1170
+
+  Paar L#8: bb_position_1h [0.8630 - 1.5880] + trend_4h_5 [0.5000 - 1.0000]
+    n=4375 | Purity=70.3% | Coverage=16.6% | Contamination=5.8%
+    Richtig=3075 | Falsch=1300
+
+  Paar L#9: bb_position_4h [0.7920 - 1.5810] + trend_4h_5 [0.5000 - 1.0000]
+    n=4417 | Purity=69.9% | Coverage=16.7% | Contamination=5.9%
+    Richtig=3089 | Falsch=1328
+
+  Paar L#10: bb_position_1h [0.8630 - 1.5880] + vwap_dist_4h [2.6810 - 41.9990]
+    n=3999 | Purity=73.3% | Coverage=15.8% | Contamination=4.7%
+    Richtig=2933 | Falsch=1066
+
+  Paar L#11: range_pos_24h [0.7960 - 1.0000] + vwap_dist_4h [2.6810 - 41.9990]
+    n=4010 | Purity=71.5% | Coverage=15.5% | Contamination=5.1%
+    Richtig=2865 | Falsch=1145
+
+  Paar L#12: pct_3d [7.0300 - 123.9400] + vwap_dist_4h [2.6810 - 41.9990]
+    n=3386 | Purity=76.5% | Coverage=14.0% | Contamination=3.5%
+    Richtig=2589 | Falsch=797
+
+  Paar L#13: range_pos_24h [0.7960 - 1.0000] + trend_4h_5 [0.5000 - 1.0000]
+    n=4070 | Purity=68.3% | Coverage=15.0% | Contamination=5.7%
+    Richtig=2782 | Falsch=1288
+
+  Paar L#14: pct_3d [7.0300 - 123.9400] + trend_4h_5 [0.5000 - 1.0000]
+    n=3238 | Purity=76.2% | Coverage=13.3% | Contamination=3.4%
+    Richtig=2467 | Falsch=771
+
+  Paar L#15: range_pos_7d [0.5820 - 1.0000] + trend_4h_10 [0.3300 - 1.0000]
+    n=3441 | Purity=73.7% | Coverage=13.7% | Contamination=4.0%
+    Richtig=2535 | Falsch=906
+
+  Paar L#16: bb_position_1h [0.8630 - 1.5880] + range_pos_24h [0.7960 - 1.0000]
+    n=3998 | Purity=68.0% | Coverage=14.7% | Contamination=5.7%
+    Richtig=2720 | Falsch=1278
+
+  Paar L#17: trend_4h_10 [0.3300 - 1.0000] + trend_4h_5 [0.5000 - 1.0000]
+    n=4084 | Purity=66.6% | Coverage=14.7% | Contamination=6.1%
+    Richtig=2720 | Falsch=1364
+
+  Paar L#18: range_pos_24h [0.7960 - 1.0000] + range_pos_7d [0.5820 - 1.0000]
+    n=3064 | Purity=76.4% | Coverage=12.7% | Contamination=3.2%
+    Richtig=2342 | Falsch=722
+
+  Paar L#19: bb_position_1h [0.8630 - 1.5880] + range_pos_7d [0.5820 - 1.0000]
+    n=3086 | Purity=75.6% | Coverage=12.6% | Contamination=3.3%
+    Richtig=2334 | Falsch=752
+
+  Paar L#20: trend_4h_10 [0.3300 - 1.0000] + vwap_dist_4h [2.6810 - 41.9990]
+    n=3360 | Purity=71.2% | Coverage=12.9% | Contamination=4.3%
+    Richtig=2394 | Falsch=966
+
+  Paar L#21: bb_position_4h [0.7920 - 1.5810] + range_pos_24h [0.7960 - 1.0000]
+    n=3078 | Purity=73.0% | Coverage=12.1% | Contamination=3.7%
+    Richtig=2246 | Falsch=832
+
+  Paar L#22: obv_trend_4h [0.5574 - 1.4375] + vwap_dist_4h [2.6810 - 41.9990]
+    n=3467 | Purity=68.7% | Coverage=12.8% | Contamination=4.8%
+    Richtig=2380 | Falsch=1087
+
+  Paar L#23: mom_15m [-14.7350 - -0.8610] + mom_30m [-25.5130 - -1.1010]
+    n=3726 | Purity=65.8% | Coverage=13.2% | Contamination=5.7%
+    Richtig=2450 | Falsch=1276
+
+  Paar L#24: pct_7d [10.6900 - 191.0300] + range_pos_7d [0.5820 - 1.0000]
+    n=3219 | Purity=70.7% | Coverage=12.3% | Contamination=4.2%
+    Richtig=2276 | Falsch=943
+
+  Paar L#25: bb_position_4h [0.7920 - 1.5810] + trend_4h_10 [0.3300 - 1.0000]
+    n=3554 | Purity=67.0% | Coverage=12.9% | Contamination=5.2%
+    Richtig=2383 | Falsch=1171
+
+--- TOP SHORT-PAARE ---
+
+  Paar S#1: shooting_star_1h [0.0000 - 1.0000] + trend_4h_5 [-1.0000 - -0.5000]
+    n=18546 | Purity=69.0% | Coverage=56.9% | Contamination=31.0%
+    Richtig=12806 | Falsch=5740
+
+  Paar S#2: engulfing_bear_1h [0.0000 - 1.0000] + trend_4h_5 [-1.0000 - -0.5000]
+    n=18482 | Purity=69.0% | Coverage=56.7% | Contamination=30.9%
+    Richtig=12759 | Falsch=5723
+
+  Paar S#3: range_pos_7d [0.0000 - 0.1670] + shooting_star_1h [0.0000 - 1.0000]
+    n=11679 | Purity=84.7% | Coverage=44.0% | Contamination=9.6%
+    Richtig=9893 | Falsch=1786
+
+  Paar S#4: engulfing_bear_1h [0.0000 - 1.0000] + range_pos_7d [0.0000 - 0.1670]
+    n=11604 | Purity=84.8% | Coverage=43.8% | Contamination=9.5%
+    Richtig=9841 | Falsch=1763
+
+  Paar S#5: shooting_star_5m [0.0000 - 1.0000] + trend_4h_5 [-1.0000 - -0.5000]
+    n=17239 | Purity=68.7% | Coverage=52.6% | Contamination=29.2%
+    Richtig=11840 | Falsch=5399
+
+  Paar S#6: range_pos_7d [0.0000 - 0.1670] + shooting_star_5m [0.0000 - 1.0000]
+    n=10644 | Purity=84.7% | Coverage=40.1% | Contamination=8.8%
+    Richtig=9011 | Falsch=1633
+
+  Paar S#7: engulfing_bull_5m [0.0000 - 1.0000] + trend_4h_5 [-1.0000 - -0.5000]
+    n=16143 | Purity=68.6% | Coverage=49.2% | Contamination=27.4%
+    Richtig=11077 | Falsch=5066
+
+  Paar S#8: engulfing_bull_5m [0.0000 - 1.0000] + range_pos_7d [0.0000 - 0.1670]
+    n=9846 | Purity=84.6% | Coverage=37.0% | Contamination=8.2%
+    Richtig=8328 | Falsch=1518
+
+  Paar S#9: pct_3d [-42.5800 - -13.4800] + shooting_star_1h [0.0000 - 1.0000]
+    n=9597 | Purity=82.3% | Coverage=35.1% | Contamination=9.2%
+    Richtig=7901 | Falsch=1696
+
+  Paar S#10: engulfing_bear_1h [0.0000 - 1.0000] + pct_3d [-42.5800 - -13.4800]
+    n=9594 | Purity=82.3% | Coverage=35.1% | Contamination=9.2%
+    Richtig=7898 | Falsch=1696
+
+  Paar S#11: range_pos_7d [0.0000 - 0.1670] + trend_1d_5 [-1.0000 - -0.5000]
+    n=9017 | Purity=84.7% | Coverage=33.9% | Contamination=7.5%
+    Richtig=7635 | Falsch=1382
+
+  Paar S#12: trend_1d_5 [-1.0000 - -0.5000] + trend_4h_5 [-1.0000 - -0.5000]
+    n=11787 | Purity=72.8% | Coverage=38.1% | Contamination=17.3%
+    Richtig=8578 | Falsch=3209
+
+  Paar S#13: pct_3d [-42.5800 - -13.4800] + shooting_star_5m [0.0000 - 1.0000]
+    n=9246 | Purity=82.0% | Coverage=33.7% | Contamination=9.0%
+    Richtig=7585 | Falsch=1661
+
+  Paar S#14: range_pos_7d [0.0000 - 0.1670] + trend_4h_5 [-1.0000 - -0.5000]
+    n=8000 | Purity=87.2% | Coverage=31.0% | Contamination=5.5%
+    Richtig=6974 | Falsch=1026
+
+  Paar S#15: engulfing_bull_5m [0.0000 - 1.0000] + pct_3d [-42.5800 - -13.4800]
+    n=8877 | Purity=81.9% | Coverage=32.3% | Contamination=8.7%
+    Richtig=7270 | Falsch=1607
+
+  Paar S#16: pct_3d [-42.5800 - -13.4800] + trend_1d_5 [-1.0000 - -0.5000]
+    n=8277 | Purity=83.2% | Coverage=30.6% | Contamination=7.5%
+    Richtig=6889 | Falsch=1388
+
+  Paar S#17: pct_3d [-42.5800 - -13.4800] + trend_4h_5 [-1.0000 - -0.5000]
+    n=7507 | Purity=83.6% | Coverage=27.9% | Contamination=6.7%
+    Richtig=6274 | Falsch=1233
+
+  Paar S#18: trend_1h_5 [-1.0000 - -0.5000] + trend_4h_5 [-1.0000 - -0.5000]
+    n=10514 | Purity=69.8% | Coverage=32.6% | Contamination=17.2%
+    Richtig=7338 | Falsch=3176
+
+  Paar S#19: consec_ups_1h [0.0000 - 3.0000] + trend_4h_5 [-1.0000 - -0.5000]
+    n=10060 | Purity=70.1% | Coverage=31.3% | Contamination=16.2%
+    Richtig=7050 | Falsch=3010
+
+  Paar S#20: pct_3d [-42.5800 - -13.4800] + range_pos_7d [0.0000 - 0.1670]
+    n=6177 | Purity=88.3% | Coverage=24.2% | Contamination=3.9%
+    Richtig=5452 | Falsch=725
+
+  Paar S#21: trend_1d_5 [-1.0000 - -0.5000] + trend_1h_5 [-1.0000 - -0.5000]
+    n=9586 | Purity=69.8% | Coverage=29.8% | Contamination=15.6%
+    Richtig=6694 | Falsch=2892
+
+  Paar S#22: consec_ups_1h [0.0000 - 3.0000] + engulfing_bull_5m [0.0000 - 1.0000]
+    n=10954 | Purity=65.0% | Coverage=31.7% | Contamination=20.7%
+    Richtig=7124 | Falsch=3830
+
+  Paar S#23: range_pos_7d [0.0000 - 0.1670] + trend_1h_5 [-1.0000 - -0.5000]
+    n=6302 | Purity=85.4% | Coverage=23.9% | Contamination=5.0%
+    Richtig=5379 | Falsch=923
+
+  Paar S#24: engulfing_bear_1h [0.0000 - 1.0000] + pct_7d [-54.2700 - -23.1700]
+    n=7409 | Purity=78.3% | Coverage=25.8% | Contamination=8.7%
+    Richtig=5798 | Falsch=1611
+
+  Paar S#25: pct_7d [-54.2700 - -23.1700] + shooting_star_1h [0.0000 - 1.0000]
+    n=7409 | Purity=78.3% | Coverage=25.8% | Contamination=8.7%
+    Richtig=5798 | Falsch=1611
+
+==============================================================================================================
+PHASE 6: TRIPLES (4866 gefunden)
+  Drei Signale muessen gleichzeitig feuern.
+==============================================================================================================
+
+--- TOP LONG-TRIPLES ---
+
+  Triple L#1: trend_4h_5 + vwap_dist_4h + range_pos_7d
+    n=3220 | Purity=79.2% | Coverage=13.8% | Contamination=3.0%
+    (Paar-Purity war 73.8%)
+
+  Triple L#2: trend_4h_5 + vwap_dist_4h + bb_position_4h
+    n=3604 | Purity=73.9% | Coverage=14.4% | Contamination=4.2%
+    (Paar-Purity war 73.8%)
+
+  Triple L#3: trend_4h_5 + vwap_dist_4h + bb_position_1h
+    n=3326 | Purity=74.9% | Coverage=13.5% | Contamination=3.7%
+    (Paar-Purity war 73.8%)
+
+  Triple L#4: trend_4h_5 + vwap_dist_4h + range_pos_24h
+    n=3338 | Purity=73.3% | Coverage=13.2% | Contamination=4.0%
+    (Paar-Purity war 73.8%)
+
+  Triple L#5: trend_4h_5 + vwap_dist_4h + pct_3d
+    n=2508 | Purity=77.7% | Coverage=10.5% | Contamination=2.5%
+    (Paar-Purity war 73.8%)
+
+  Triple L#6: trend_4h_5 + vwap_dist_4h + trend_4h_10
+    n=2881 | Purity=71.2% | Coverage=11.1% | Contamination=3.7%
+    (Paar-Purity war 73.8%)
+
+  Triple L#7: trend_4h_5 + vwap_dist_4h + pct_7d
+    n=1643 | Purity=74.4% | Coverage=6.6% | Contamination=1.9%
+    (Paar-Purity war 73.8%)
+
+  Triple L#8: trend_4h_5 + vwap_dist_4h + mom_5m
+    n=813 | Purity=81.7% | Coverage=3.6% | Contamination=0.7%
+    (Paar-Purity war 73.8%)
+
+  Triple L#9: trend_4h_5 + vwap_dist_4h + engulfing_bull_1h
+    n=709 | Purity=82.8% | Coverage=3.2% | Contamination=0.5%
+    (Paar-Purity war 73.8%)
+
+  Triple L#10: trend_4h_5 + vwap_dist_4h + mom_10m
+    n=752 | Purity=80.2% | Coverage=3.3% | Contamination=0.7%
+    (Paar-Purity war 73.8%)
+
+  Triple L#11: trend_4h_5 + vwap_dist_4h + atr_1h_pct
+    n=960 | Purity=70.9% | Coverage=3.7% | Contamination=1.2%
+    (Paar-Purity war 73.8%)
+
+  Triple L#12: trend_4h_5 + vwap_dist_4h + mom_15m
+    n=657 | Purity=81.3% | Coverage=2.9% | Contamination=0.5%
+    (Paar-Purity war 73.8%)
+
+  Triple L#13: trend_4h_5 + vwap_dist_4h + mom_30m
+    n=577 | Purity=79.4% | Coverage=2.5% | Contamination=0.5%
+    (Paar-Purity war 73.8%)
+
+  Triple L#14: trend_4h_5 + vwap_dist_4h + mom_60m
+    n=362 | Purity=75.1% | Coverage=1.5% | Contamination=0.4%
+    (Paar-Purity war 73.8%)
+
+--- TOP SHORT-TRIPLES ---
+
+  Triple S#1: range_pos_7d + shooting_star_1h + engulfing_bear_1h
+    n=11604 | Purity=84.8% | Coverage=43.8% | Contamination=9.5%
+    (Paar-Purity war 84.7%)
+
+  Triple S#2: engulfing_bear_1h + range_pos_7d + shooting_star_1h
+    n=11604 | Purity=84.8% | Coverage=43.8% | Contamination=9.5%
+    (Paar-Purity war 84.8%)
+
+  Triple S#3: range_pos_7d + shooting_star_1h + shooting_star_5m
+    n=10644 | Purity=84.7% | Coverage=40.1% | Contamination=8.8%
+    (Paar-Purity war 84.7%)
+
+  Triple S#4: range_pos_7d + shooting_star_5m + shooting_star_1h
+    n=10644 | Purity=84.7% | Coverage=40.1% | Contamination=8.8%
+    (Paar-Purity war 84.7%)
+
+  Triple S#5: engulfing_bear_1h + range_pos_7d + shooting_star_5m
+    n=10607 | Purity=84.7% | Coverage=39.9% | Contamination=8.8%
+    (Paar-Purity war 84.8%)
+
+  Triple S#6: range_pos_7d + shooting_star_5m + engulfing_bear_1h
+    n=10607 | Purity=84.7% | Coverage=39.9% | Contamination=8.8%
+    (Paar-Purity war 84.7%)
+
+  Triple S#7: range_pos_7d + shooting_star_1h + engulfing_bull_5m
+    n=9846 | Purity=84.6% | Coverage=37.0% | Contamination=8.2%
+    (Paar-Purity war 84.7%)
+
+  Triple S#8: range_pos_7d + shooting_star_5m + engulfing_bull_5m
+    n=9846 | Purity=84.6% | Coverage=37.0% | Contamination=8.2%
+    (Paar-Purity war 84.7%)
+
+  Triple S#9: engulfing_bull_5m + range_pos_7d + shooting_star_1h
+    n=9846 | Purity=84.6% | Coverage=37.0% | Contamination=8.2%
+    (Paar-Purity war 84.6%)
+
+  Triple S#10: engulfing_bull_5m + range_pos_7d + shooting_star_5m
+    n=9846 | Purity=84.6% | Coverage=37.0% | Contamination=8.2%
+    (Paar-Purity war 84.6%)
+
+  Triple S#11: engulfing_bear_1h + range_pos_7d + engulfing_bull_5m
+    n=9842 | Purity=84.6% | Coverage=37.0% | Contamination=8.2%
+    (Paar-Purity war 84.8%)
+
+  Triple S#12: engulfing_bull_5m + range_pos_7d + engulfing_bear_1h
+    n=9842 | Purity=84.6% | Coverage=37.0% | Contamination=8.2%
+    (Paar-Purity war 84.6%)
+
+  Triple S#13: pct_3d + shooting_star_1h + engulfing_bear_1h
+    n=9594 | Purity=82.3% | Coverage=35.1% | Contamination=9.2%
+    (Paar-Purity war 82.3%)
+
+  Triple S#14: engulfing_bear_1h + pct_3d + shooting_star_1h
+    n=9594 | Purity=82.3% | Coverage=35.1% | Contamination=9.2%
+    (Paar-Purity war 82.3%)
+
+  Triple S#15: range_pos_7d + shooting_star_1h + trend_1d_5
+    n=8958 | Purity=84.8% | Coverage=33.8% | Contamination=7.3%
+    (Paar-Purity war 84.7%)
+
+==============================================================================================================
+PHASE 7: TRAIN/TEST VALIDIERUNG
+  Alles auf Train-Haelfte NEU berechnet, dann auf Test geprueft
+  Train: 20506 | Test: 20506 | Signale auf Train: 195
+==============================================================================================================
+
+    MinSignale Classified   Coverage     Acc%   LongPred   LongAcc%  ShortPred  ShortAcc%
+             1      19823      96.7%    55.3%      10575      62.7%       9248      46.9%
+             2      18544      90.4%    55.7%       9924      63.0%       8620      47.3%
+             3      17220      84.0%    56.0%       9239      63.1%       7981      47.8%
+             5      14617      71.3%    56.5%       7830      63.0%       6787      49.0%
+             8      10935      53.3%    57.6%       5781      63.5%       5154      51.1%
+            10       8825      43.0%    58.7%       4543      64.5%       4282      52.5%
+
+==============================================================================================================
+END OF REPORT
+==============================================================================================================

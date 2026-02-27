@@ -43,6 +43,12 @@ MomentumModule.jsx, SearchModule.jsx, SearchResultsModule.jsx, ChartModule.jsx, 
 - Scanner resolved Predictions über Kursvergleich - wenn der Kurs nach OCO-Fill zurückläuft, verpasst der Scanner den Hit
 - trade_tracker (seit 2026-02-25) fängt das jetzt ab: resolved Predictions beim Sell-Log
 
+## Auto-Memory
+- **Pfad**: `/root/.claude/projects/-opt-coin/memory/MEMORY.md`
+- Bei jeder Session: MEMORY.md lesen und am Ende aktualisieren
+- Projektstand, offene Baustellen, Erkenntnisse dort festhalten
+- MEMORY.md ist das Gedächtnis zwischen Sessions - MUSS gepflegt werden!
+
 ## Kommunikation
 - Deutsch, per Du
 - Nicht raten, fragen wenn unklar

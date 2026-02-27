@@ -1,0 +1,424 @@
+==========================================================================================
+DIFFERENZ-SCANNER v5 — TIEFENANALYSE
+Generated: 2026-02-26 15:21:16
+Period: 30 days | Min move: +/-5.0%
+Events: 41012 total (18518 Long [+], 22494 Short [-])
+Indikatoren pro Event: 126
+Runtime: 5913s (98.6min / 1.6h)
+==========================================================================================
+
+METHODE: ALLE Events werden klassifiziert. Nichts wird weggefiltert.
+Accuracy = korrekte Vorhersagen / ALLE Events * 100%
+Baseline (immer Short raten): 54.8%
+
+==========================================================================================
+PHASE 3a: EINZELINDIKATOREN — Top 30 nach Accuracy auf ALLEN Events
+==========================================================================================
+
+  #   Indikator                              Op  Threshold   Accuracy        n
+    1 range_pos_7d                           >=     0.3010     70.77%    40893
+    2 vwap_dist_4h                           >=    -0.3330     65.95%    40996
+    3 pct_3d                                 >=    -0.1500     64.14%    40950
+    4 trend_4h_5                             >=     0.0000     62.43%    40996
+    5 pct_7d                                 >=    -6.0000     61.93%    40862
+    6 mom_10m                                 <    -0.1380     61.65%    41012
+    7 mom_15m                                 <    -0.2180     61.36%    41012
+    8 mom_5m                                  <    -0.1010     61.19%    41012
+    9 bb_position_4h                         >=     0.2760     60.99%    40955
+   10 bb_position_1h                         >=     0.7360     59.92%    41012
+   11 mom_30m                                 <    -0.4590     59.37%    41012
+   12 range_pos_24h                          >=     0.3100     59.13%    41012
+   13 trend_4h_10                            >=     0.1100     59.00%    40996
+   14 vwap_dist_1h                           >=     1.0160     58.99%    41012
+   15 rsi_4h                                 >=    54.4000     58.54%    40977
+   16 obv_trend_4h                           >=     0.3083     58.43%    40996
+   17 rsi_1h                                 >=    55.2000     58.39%    41012
+   18 atr_1h_pct                             >=     2.6670     58.33%    41012
+   19 upper_wick_1h                           <     0.2380     58.20%    41007
+   20 trend_1h_5                             >=     0.5000     58.16%    41012
+   21 trend_1h_10                            >=     0.1100     57.77%    41012
+   22 trend_1d_5                             >=     0.0000     57.74%    40950
+   23 bullish_ratio_5m                        <     0.5000     57.73%    40479
+   24 mom_60m                                 <    -1.6390     57.54%    41012
+   25 hh_hl_12                               >=     0.5500     57.50%    41012
+   26 max_candle_range_5h                    >=     3.8797     57.49%    41012
+   27 engulfing_bull_1h                      >=     1.0000     57.45%    40692
+   28 hh_hl_4h                               >=     0.6000     57.43%    40996
+   29 spike_up_30m                           >=     2.7810     57.35%    41012
+   30 consec_downs_1h                         <     5.0000     57.28%    41012
+
+==========================================================================================
+PHASE 3b: INDIKATOR-PAARE — Top 30 nach Accuracy auf ALLEN Events
+==========================================================================================
+
+------------------------------------------------------------------------------------------
+Paar #1: Accuracy=72.81% (29773/40893)
+  1. range_pos_7d >= 0.301
+  2. mom_15m >= 0.867
+  Quadranten: PP→short PF→long FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #2: Accuracy=72.55% (29666/40893)
+  1. range_pos_7d >= 0.301
+  2. mom_10m >= 0.556
+  Quadranten: PP→short PF→long FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #3: Accuracy=72.46% (29631/40893)
+  1. range_pos_7d >= 0.301
+  2. mom_30m >= 1.462
+  Quadranten: PP→short PF→long FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #4: Accuracy=72.29% (29562/40893)
+  1. range_pos_7d >= 0.301
+  2. mom_5m >= 0.526
+  Quadranten: PP→short PF→long FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #5: Accuracy=71.88% (29392/40893)
+  1. range_pos_7d >= 0.301
+  2. mom_60m >= 2.7914
+  Quadranten: PP→short PF→long FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #6: Accuracy=71.74% (29336/40893)
+  1. range_pos_7d >= 0.301
+  2. max_candle_range_5h >= 4.3148
+  Quadranten: PP→long PF→long FP→long FF→short
+
+------------------------------------------------------------------------------------------
+Paar #7: Accuracy=71.62% (29288/40893)
+  1. max_candle_range_5h >= 3.87968
+  2. range_pos_7d >= 0.301
+  Quadranten: PP→long PF→long FP→long FF→short
+
+------------------------------------------------------------------------------------------
+Paar #8: Accuracy=71.52% (29137/40737)
+  1. range_pos_7d >= 0.301
+  2. shooting_star_1h >= 1.0
+  Quadranten: PP→short PF→long FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #9: Accuracy=71.48% (29230/40893)
+  1. range_pos_7d >= 0.301
+  2. mom_120m >= 3.84
+  Quadranten: PP→short PF→long FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #10: Accuracy=71.42% (29204/40893)
+  1. ema_9_21_pct < -3.34634
+  2. range_pos_7d >= 0.301
+  Quadranten: PP→long PF→long FP→long FF→short
+
+------------------------------------------------------------------------------------------
+Paar #11: Accuracy=71.39% (29195/40893)
+  1. range_pos_7d >= 0.301
+  2. ema_9_21_pct >= -3.571
+  Quadranten: PP→long PF→long FP→short FF→long
+
+------------------------------------------------------------------------------------------
+Paar #12: Accuracy=71.38% (29188/40893)
+  1. range_pos_7d >= 0.301
+  2. spike_up_time_10m >= 15.0
+  Quadranten: PP→long PF→short FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #13: Accuracy=71.35% (28948/40573)
+  1. range_pos_7d >= 0.301
+  2. engulfing_bear_1h >= 1.0
+  Quadranten: PP→short PF→long FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #14: Accuracy=71.31% (29162/40893)
+  1. range_pos_7d >= 0.301
+  2. spike_up_time_15m >= 15.0
+  Quadranten: PP→long PF→short FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #15: Accuracy=71.31% (29160/40893)
+  1. range_pos_7d >= 0.301
+  2. spike_up_time_30m >= 15.0
+  Quadranten: PP→long PF→short FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #16: Accuracy=71.22% (29124/40893)
+  1. range_pos_7d >= 0.301
+  2. spike_up_time_20m >= 15.0
+  Quadranten: PP→long PF→short FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #17: Accuracy=71.06% (29060/40893)
+  1. range_pos_7d >= 0.301
+  2. consec_downs_5m >= 3.0
+  Quadranten: PP→long PF→short FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #18: Accuracy=71.04% (29052/40893)
+  1. range_pos_7d >= 0.301
+  2. consec_ups_5m >= 7.0
+  Quadranten: PP→short PF→long FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #19: Accuracy=71.03% (29046/40893)
+  1. range_pos_7d >= 0.301
+  2. range_15m >= 3.479
+  Quadranten: PP→short PF→long FP→long FF→short
+
+------------------------------------------------------------------------------------------
+Paar #20: Accuracy=70.99% (29029/40893)
+  1. range_pos_7d >= 0.301
+  2. atr_4h_pct >= 8.226
+  Quadranten: PP→short PF→long FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #21: Accuracy=70.99% (29029/40893)
+  1. range_pos_7d >= 0.301
+  2. range_30m >= 4.5998
+  Quadranten: PP→short PF→long FP→long FF→short
+
+------------------------------------------------------------------------------------------
+Paar #22: Accuracy=70.95% (29011/40888)
+  1. range_pos_7d >= 0.301
+  2. upper_wick_1h >= 0.407
+  Quadranten: PP→short PF→long FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #23: Accuracy=70.92% (29001/40893)
+  1. range_pos_7d >= 0.301
+  2. ema_price_50_pct >= 8.472
+  Quadranten: PP→short PF→long FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #24: Accuracy=70.92% (29000/40893)
+  1. range_pos_7d >= 0.301
+  2. trend_1d_5 >= -0.5
+  Quadranten: PP→long PF→short FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #25: Accuracy=70.92% (29002/40893)
+  1. range_pos_7d >= 0.301
+  2. vwap_dist_4h >= 3.317
+  Quadranten: PP→long PF→long FP→long FF→short
+
+------------------------------------------------------------------------------------------
+Paar #26: Accuracy=70.87% (28980/40893)
+  1. range_pos_7d >= 0.301
+  2. pct_3d >= -15.22
+  Quadranten: PP→long PF→short FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #27: Accuracy=70.83% (28965/40893)
+  1. range_pos_7d >= 0.301
+  2. vwap_dist_1h >= -6.2648
+  Quadranten: PP→long PF→short FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #28: Accuracy=70.82% (28962/40893)
+  1. range_pos_7d >= 0.301
+  2. bb_position_4h >= -0.173
+  Quadranten: PP→long PF→short FP→short FF→short
+
+------------------------------------------------------------------------------------------
+Paar #29: Accuracy=70.81% (28728/40573)
+  1. range_pos_7d >= 0.301
+  2. engulfing_bull_1h >= 0.0
+  Quadranten: PP→long PF→long FP→short FF→long
+
+------------------------------------------------------------------------------------------
+Paar #30: Accuracy=70.81% (28728/40573)
+  1. range_pos_7d >= 0.301
+  2. inside_bar_1h >= 0.0
+  Quadranten: PP→long PF→long FP→short FF→long
+
+==========================================================================================
+PHASE 3c: TRIPLES — Top 20 nach Accuracy auf ALLEN Events
+==========================================================================================
+
+------------------------------------------------------------------------------------------
+Triple #1: Accuracy=74.02% (30268/40893)
+  1. range_pos_7d >= 0.301
+  2. mom_15m >= 0.867
+  3. max_candle_range_5h >= 4.3148
+
+------------------------------------------------------------------------------------------
+Triple #2: Accuracy=73.82% (30189/40893)
+  1. range_pos_7d >= 0.301
+  2. max_candle_range_5h >= 4.3148
+  3. mom_15m >= 0.66
+
+------------------------------------------------------------------------------------------
+Triple #3: Accuracy=73.81% (30184/40893)
+  1. max_candle_range_5h >= 3.87968
+  2. range_pos_7d >= 0.301
+  3. mom_15m >= 0.66
+
+------------------------------------------------------------------------------------------
+Triple #4: Accuracy=73.69% (30134/40893)
+  1. range_pos_7d >= 0.301
+  2. mom_10m >= 0.556
+  3. max_candle_range_5h >= 4.3148
+
+------------------------------------------------------------------------------------------
+Triple #5: Accuracy=73.69% (30134/40893)
+  1. range_pos_7d >= 0.301
+  2. max_candle_range_5h >= 4.3148
+  3. mom_10m >= 0.556
+
+------------------------------------------------------------------------------------------
+Triple #6: Accuracy=73.67% (30127/40893)
+  1. max_candle_range_5h >= 3.87968
+  2. range_pos_7d >= 0.301
+  3. mom_10m >= 0.556
+
+------------------------------------------------------------------------------------------
+Triple #7: Accuracy=73.63% (30111/40893)
+  1. range_pos_7d >= 0.301
+  2. mom_30m >= 1.462
+  3. max_candle_range_5h >= 4.3148
+
+------------------------------------------------------------------------------------------
+Triple #8: Accuracy=73.63% (30111/40893)
+  1. range_pos_7d >= 0.301
+  2. max_candle_range_5h >= 4.3148
+  3. mom_30m >= 1.462
+
+------------------------------------------------------------------------------------------
+Triple #9: Accuracy=73.58% (30090/40893)
+  1. max_candle_range_5h >= 3.87968
+  2. range_pos_7d >= 0.301
+  3. mom_30m >= 1.462
+
+------------------------------------------------------------------------------------------
+Triple #10: Accuracy=73.51% (30062/40893)
+  1. ema_9_21_pct < -3.34634
+  2. range_pos_7d >= 0.301
+  3. mom_15m >= 0.66
+
+------------------------------------------------------------------------------------------
+Triple #11: Accuracy=73.47% (29931/40737)
+  1. range_pos_7d >= 0.301
+  2. mom_10m >= 0.556
+  3. wick_ratio_1h >= 0.58
+
+------------------------------------------------------------------------------------------
+Triple #12: Accuracy=73.46% (30038/40893)
+  1. range_pos_7d >= 0.301
+  2. ema_9_21_pct >= -3.571
+  3. mom_15m >= 0.66
+
+------------------------------------------------------------------------------------------
+Triple #13: Accuracy=73.40% (29900/40737)
+  1. range_pos_7d >= 0.301
+  2. mom_15m >= 0.867
+  3. wick_ratio_1h >= 0.58
+
+------------------------------------------------------------------------------------------
+Triple #14: Accuracy=73.38% (30007/40893)
+  1. ema_9_21_pct < -3.34634
+  2. range_pos_7d >= 0.301
+  3. mom_10m >= 0.556
+
+------------------------------------------------------------------------------------------
+Triple #15: Accuracy=73.37% (30004/40893)
+  1. range_pos_7d >= 0.301
+  2. mom_5m >= 0.526
+  3. max_candle_range_5h >= 4.3148
+
+------------------------------------------------------------------------------------------
+Triple #16: Accuracy=73.34% (29989/40893)
+  1. range_pos_7d >= 0.301
+  2. max_candle_range_5h >= 4.3148
+  3. mom_5m >= 0.743
+
+------------------------------------------------------------------------------------------
+Triple #17: Accuracy=73.33% (29988/40893)
+  1. max_candle_range_5h >= 3.87968
+  2. range_pos_7d >= 0.301
+  3. mom_5m >= 0.39
+
+------------------------------------------------------------------------------------------
+Triple #18: Accuracy=73.31% (29745/40573)
+  1. range_pos_7d >= 0.301
+  2. mom_10m >= 0.556
+  3. engulfing_bull_1h >= 1.0
+
+------------------------------------------------------------------------------------------
+Triple #19: Accuracy=73.28% (29967/40893)
+  1. range_pos_7d >= 0.301
+  2. ema_9_21_pct >= -3.571
+  3. mom_10m >= 0.556
+
+------------------------------------------------------------------------------------------
+Triple #20: Accuracy=73.25% (29956/40893)
+  1. ema_9_21_pct < -3.34634
+  2. range_pos_7d >= 0.301
+  3. mom_30m >= 1.462
+
+==========================================================================================
+PHASE 4: TRAIN/TEST VALIDIERUNG (Top 10 Paare + Top 10 Triples)
+==========================================================================================
+
+  Paar#1 range_pos_7d+mom_15m | Train=77.46% | Test=68.14%
+  Delta: -9.3pp (OVERFITTED)
+
+  Paar#2 range_pos_7d+mom_10m | Train=77.21% | Test=68.11%
+  Delta: -9.1pp (OVERFITTED)
+
+  Paar#3 range_pos_7d+mom_30m | Train=77.65% | Test=67.43%
+  Delta: -10.2pp (OVERFITTED)
+
+  Paar#4 range_pos_7d+mom_5m | Train=76.96% | Test=67.69%
+  Delta: -9.3pp (OVERFITTED)
+
+  Paar#5 range_pos_7d+mom_60m | Train=77.09% | Test=66.89%
+  Delta: -10.2pp (OVERFITTED)
+
+  Paar#6 range_pos_7d+max_candle_range_5h | Train=78.52% | Test=65.82%
+  Delta: -12.7pp (OVERFITTED)
+
+  Paar#7 max_candle_range_5h+range_pos_7d | Train=78.75% | Test=66.23%
+  Delta: -12.5pp (OVERFITTED)
+
+  Paar#8 range_pos_7d+shooting_star_1h | Train=76.74% | Test=66.27%
+  Delta: -10.5pp (OVERFITTED)
+
+  Paar#9 range_pos_7d+mom_120m | Train=76.67% | Test=66.37%
+  Delta: -10.3pp (OVERFITTED)
+
+  Paar#10 ema_9_21_pct+range_pos_7d | Train=77.82% | Test=65.55%
+  Delta: -12.3pp (OVERFITTED)
+
+  Triple#1 range_pos_7d+mom_15m+max_candle_rang | Train=79.99% | Test=68.33%
+  Delta: -11.7pp (OVERFITTED)
+
+  Triple#2 range_pos_7d+max_candle_rang+mom_15m | Train=80.11% | Test=67.96%
+  Delta: -12.2pp (OVERFITTED)
+
+  Triple#3 max_candle_rang+range_pos_7d+mom_15m | Train=80.08% | Test=67.96%
+  Delta: -12.1pp (OVERFITTED)
+
+  Triple#4 range_pos_7d+mom_10m+max_candle_rang | Train=79.58% | Test=68.56%
+  Delta: -11.0pp (OVERFITTED)
+
+  Triple#5 range_pos_7d+max_candle_rang+mom_10m | Train=79.86% | Test=68.11%
+  Delta: -11.8pp (OVERFITTED)
+
+  Triple#6 max_candle_rang+range_pos_7d+mom_10m | Train=79.81% | Test=68.11%
+  Delta: -11.7pp (OVERFITTED)
+
+  Triple#7 range_pos_7d+mom_30m+max_candle_rang | Train=79.78% | Test=67.61%
+  Delta: -12.2pp (OVERFITTED)
+
+  Triple#8 range_pos_7d+max_candle_rang+mom_30m | Train=80.12% | Test=67.43%
+  Delta: -12.7pp (OVERFITTED)
+
+  Triple#9 max_candle_rang+range_pos_7d+mom_30m | Train=80.01% | Test=67.43%
+  Delta: -12.6pp (OVERFITTED)
+
+  Triple#10 ema_9_21_pct+range_pos_7d+mom_15m | Train=79.05% | Test=67.99%
+  Delta: -11.1pp (OVERFITTED)
+
+==========================================================================================
+END OF REPORT
+==========================================================================================

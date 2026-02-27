@@ -1,0 +1,137 @@
+================================================================================
+GEGENPROBE REPORT
+Generated: 2026-02-26 10:01:02
+Period: 30 days | Min move: +/-5.0%
+Check window: 12h
+Runtime: 2793s (46.5min)
+================================================================================
+
+--------------------------------------------------------------------------------
+LONG-A (LONG)
+  Filter: range_pos_7d >= 0.838 AND atr_1h_pct < 0.929
+  Samples: 102328 | Matches: 1340
+  TP: 202 | FP: 1138 | PRECISION: 15.1%
+  Moves: min=0.0% median=2.1% mean=2.9% max=42.1%
+  Time: 686s
+
+  NACHFILTERUNG (zusaetzliche Filter um FP zu eliminieren):
+    + atr_4h_pct >= 1.477
+    + trend_1d_10 < 0.56
+    + consec_downs_1h >= 3.0
+    + rsi_4h < 76.9
+    + pct_3d >= 1.87
+    + trend_1h_5 < 1.0
+    + max_bull_run_1h >= 2.0
+    + atr_1h_pct >= 0.023
+    + atr_1h_pct >= 0.1099
+    + atr_1h_pct >= 0.225
+  -> Final: TP=188 FP=531 Precision=26.1% (n=719)
+
+  KOMPLETTES FILTERSET:
+    1. range_pos_7d >= 0.838
+    2. atr_1h_pct < 0.929
+    3. atr_4h_pct >= 1.477
+    4. trend_1d_10 < 0.56
+    5. consec_downs_1h >= 3.0
+    6. rsi_4h < 76.9
+    7. pct_3d >= 1.87
+    8. trend_1h_5 < 1.0
+    9. max_bull_run_1h >= 2.0
+    10. atr_1h_pct >= 0.023
+    11. atr_1h_pct >= 0.1099
+    12. atr_1h_pct >= 0.225
+
+--------------------------------------------------------------------------------
+SHORT-A (SHORT)
+  Filter: bb_position_4h < -0.202 AND atr_1h_pct < 0.99
+  Samples: 102328 | Matches: 290
+  TP: 77 | FP: 213 | PRECISION: 26.6%
+  Moves: min=0.0% median=3.6% mean=3.6% max=17.1%
+  Time: 686s
+
+  NACHFILTERUNG (zusaetzliche Filter um FP zu eliminieren):
+    + pct_7d < -3.31
+    + atr_4h_pct >= 1.645
+    + rsi_4h < 36.2
+    + ema_price_50_pct >= -5.0995
+    + body_ratio_1h < 0.8778
+    + vol_ratio_1h < 4.3125
+    + consec_ups_1h >= 1.0
+    + hh_hl_12 >= 0.09
+    + mom_120m >= -3.0887
+    + vwap_dist_4h < -2.4537
+  -> Final: TP=68 FP=47 Precision=59.1% (n=115)
+
+  KOMPLETTES FILTERSET:
+    1. bb_position_4h < -0.202
+    2. atr_1h_pct < 0.99
+    3. pct_7d < -3.31
+    4. atr_4h_pct >= 1.645
+    5. rsi_4h < 36.2
+    6. ema_price_50_pct >= -5.0995
+    7. body_ratio_1h < 0.8778
+    8. vol_ratio_1h < 4.3125
+    9. consec_ups_1h >= 1.0
+    10. hh_hl_12 >= 0.09
+    11. mom_120m >= -3.0887
+    12. vwap_dist_4h < -2.4537
+
+--------------------------------------------------------------------------------
+LONG-B (LONG)
+  Filter: range_pos_7d >= 0.838 AND atr_1h_pct < 0.99
+  Samples: 102328 | Matches: 1574
+  TP: 263 | FP: 1311 | PRECISION: 16.7%
+  Moves: min=0.0% median=2.3% mean=3.0% max=42.1%
+  Time: 686s
+
+  NACHFILTERUNG (zusaetzliche Filter um FP zu eliminieren):
+    + atr_4h_pct >= 1.3653
+    + trend_1d_10 < 0.56
+    + pct_3d >= 2.64
+    + hh_hl_12 < 0.73
+    + rsi_4h < 81.47
+    + consec_downs_1h >= 3.0
+    + trend_1h_5 < 1.0
+    + atr_1h_pct >= 0.0267
+    + atr_1h_pct >= 0.1398
+    + atr_1h_pct >= 0.259
+  -> Final: TP=249 FP=689 Precision=26.5% (n=938)
+
+  KOMPLETTES FILTERSET:
+    1. range_pos_7d >= 0.838
+    2. atr_1h_pct < 0.99
+    3. atr_4h_pct >= 1.3653
+    4. trend_1d_10 < 0.56
+    5. pct_3d >= 2.64
+    6. hh_hl_12 < 0.73
+    7. rsi_4h < 81.47
+    8. consec_downs_1h >= 3.0
+    9. trend_1h_5 < 1.0
+    10. atr_1h_pct >= 0.0267
+    11. atr_1h_pct >= 0.1398
+    12. atr_1h_pct >= 0.259
+
+--------------------------------------------------------------------------------
+SHORT-B (SHORT)
+  Filter: range_pos_7d < 0.064 AND consec_downs_5m < 3.0
+  Samples: 102338 | Matches: 26
+  TP: 20 | FP: 6 | PRECISION: 76.9%
+  Moves: min=0.5% median=6.2% mean=6.8% max=18.0%
+  Time: 706s
+
+  NACHFILTERUNG (zusaetzliche Filter um FP zu eliminieren):
+    + mom_10m >= -0.5597
+    + hh_hl_4h >= 0.1
+    + atr_1h_pct < 2.9565
+  -> Final: TP=19 FP=1 Precision=95.0% (n=20)
+
+  KOMPLETTES FILTERSET:
+    1. range_pos_7d < 0.064
+    2. consec_downs_5m < 3.0
+    3. mom_10m >= -0.5597
+    4. hh_hl_4h >= 0.1
+    5. atr_1h_pct < 2.9565
+
+================================================================================
+END OF REPORT
+================================================================================

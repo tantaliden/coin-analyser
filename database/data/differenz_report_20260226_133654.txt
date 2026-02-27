@@ -1,0 +1,116 @@
+==========================================================================================
+DIFFERENZ-SCANNER v4 — SCORING-MODELL
+Generated: 2026-02-26 13:36:54
+Period: 30 days | Min move: +/-5.0%
+Events: 41012 total (18518 Long [+], 22494 Short [-])
+Indikatoren pro Event: 126 | Im Modell: 118
+Runtime: 772s (12.9min)
+==========================================================================================
+
+METHODE: Fuer JEDES Event wird ein Score berechnet (Summe gewichteter Z-Scores).
+Score > 0 = Long-Vorhersage, Score < 0 = Short-Vorhersage.
+ALLE Events werden klassifiziert. Nichts wird weggefiltert.
+Train = zeitlich 1. Haelfte, Test = zeitlich 2. Haelfte (nie gesehen).
+
+==========================================================================================
+MODELL: TOP 30 INDIKATOREN (nach Gewicht)
+==========================================================================================
+
+  #   Indikator                                  d Richtung    Gewicht        p
+    1 range_pos_7d                         +1.0585    Long↑     1.0585  0.0e+00
+    2 atr_1h_pct                           +0.6998    Long↑     0.6998  0.0e+00
+    3 max_candle_range_5h                  +0.6476    Long↑     0.6476  0.0e+00
+    4 spike_down_10m                       +0.5737    Long↑     0.5737  0.0e+00
+    5 pct_3d                               +0.5557    Long↑     0.5557  0.0e+00
+    6 spike_down_20m                       +0.5498    Long↑     0.5498  0.0e+00
+    7 spike_down_15m                       +0.5473    Long↑     0.5473 1.2e-304
+    8 spike_up_30m                         +0.5458    Long↑     0.5458  0.0e+00
+    9 spike_up_15m                         +0.5214    Long↑     0.5214  0.0e+00
+   10 spike_down_30m                       +0.5198    Long↑     0.5198 3.5e-300
+   11 spike_up_10m                         +0.5051    Long↑     0.5051  0.0e+00
+   12 spike_up_20m                         +0.5033    Long↑     0.5033  0.0e+00
+   13 upper_wick_1h                        -0.4908   Short↑     0.4908 8.0e-204
+   14 mom_15m                              -0.4101   Short↑     0.4101 2.8e-263
+   15 range_60m                            +0.4091    Long↑     0.4091 1.3e-259
+   16 trend_4h_5                           +0.4066    Long↑     0.4066 2.2e-164
+   17 mom_30m                              -0.3999   Short↑     0.3999 8.3e-193
+   18 range_pos_24h                        +0.3997    Long↑     0.3997 3.6e-211
+   19 pct_7d                               +0.3944    Long↑     0.3944 4.1e-239
+   20 bullish_ratio_5m                     -0.3929   Short↑     0.3929 4.4e-154
+   21 mom_10m                              -0.3898   Short↑     0.3898 8.6e-247
+   22 range_30m                            +0.3811    Long↑     0.3811 1.2e-208
+   23 bb_position_4h                       +0.3732    Long↑     0.3732 9.8e-129
+   24 range_15m                            +0.3686    Long↑     0.3686 3.7e-169
+   25 ema_9_21_pct                         -0.3559   Short↑     0.3559 1.5e-141
+   26 mom_5m                               -0.3513   Short↑     0.3513 2.8e-227
+   27 vwap_dist_4h                         +0.3444    Long↑     0.3444 2.4e-116
+   28 engulfing_bear_1h                    -0.3436   Short↑     0.3436  5.8e-99
+   29 trend_1d_5                           +0.3339    Long↑     0.3339 8.1e-104
+   30 engulfing_bull_1h                    +0.3222    Long↑     0.3222 8.8e-116
+
+==========================================================================================
+ERGEBNIS: TRAIN (in-sample) (20506 Events)
+==========================================================================================
+
+  Gesamt-Accuracy: 78.5% (16092/20506 korrekt)
+  Long-Predictions:  8406 → 62.8% korrekt (5283/8406)
+  Short-Predictions: 12100 → 89.3% korrekt (10809/12100)
+
+  Konfidenz-Aufschluesselung:
+  Nur Events mit hohem |Score| — je hoeher, desto sicherer die Vorhersage
+
+     Bereich   Events  Korrekt   Accuracy   LongPrec  ShortPrec   Coverage
+  Top  50%%      10253     9032      88.1%      74.3%      97.3%      50.0%
+  Top  40%%       8203     7253      88.4%      74.8%      98.4%      40.0%
+  Top  30%%       6152     5406      87.9%      75.2%      99.2%      30.0%
+  Top  25%%       5127     4468      87.1%      75.7%      99.3%      25.0%
+  Top  20%%       4102     3516      85.7%      75.4%      99.6%      20.0%
+  Top  15%%       3076     2578      83.8%      76.2%      99.7%      15.0%
+  Top  10%%       2051     1634      79.7%      75.9%     100.0%      10.0%
+  Top   5%%       1026      806      78.6%      78.6%       0.0%       5.0%
+
+==========================================================================================
+ERGEBNIS: TEST (out-of-sample) (20506 Events)
+==========================================================================================
+
+  Gesamt-Accuracy: 65.3% (13390/20506 korrekt)
+  Long-Predictions:  13306 → 68.1% korrekt (9067/13306)
+  Short-Predictions: 7200 → 60.0% korrekt (4323/7200)
+
+  Konfidenz-Aufschluesselung:
+  Nur Events mit hohem |Score| — je hoeher, desto sicherer die Vorhersage
+
+     Bereich   Events  Korrekt   Accuracy   LongPrec  ShortPrec   Coverage
+  Top  50%%      10253     7215      70.4%      68.8%      74.6%      50.0%
+  Top  40%%       8203     5813      70.9%      68.2%      79.2%      40.0%
+  Top  30%%       6152     4342      70.6%      67.2%      84.2%      30.0%
+  Top  25%%       5127     3542      69.1%      65.6%      86.1%      25.0%
+  Top  20%%       4102     2754      67.1%      63.9%      88.6%      20.0%
+  Top  15%%       3076     1973      64.1%      61.9%      90.5%      15.0%
+  Top  10%%       2051     1228      59.9%      58.9%      87.1%      10.0%
+  Top   5%%       1026      541      52.7%      52.6%      66.7%       5.0%
+
+==========================================================================================
+ERGEBNIS: ALLE EVENTS (41012 Events)
+==========================================================================================
+
+  Gesamt-Accuracy: 71.9% (29482/41012 korrekt)
+  Long-Predictions:  21712 → 66.1% korrekt (14350/21712)
+  Short-Predictions: 19300 → 78.4% korrekt (15132/19300)
+
+  Konfidenz-Aufschluesselung:
+  Nur Events mit hohem |Score| — je hoeher, desto sicherer die Vorhersage
+
+     Bereich   Events  Korrekt   Accuracy   LongPrec  ShortPrec   Coverage
+  Top  50%%      20506    16355      79.8%      70.7%      91.1%      50.0%
+  Top  40%%      16405    13168      80.3%      70.6%      93.6%      40.0%
+  Top  30%%      12304     9801      79.7%      69.8%      95.8%      30.0%
+  Top  25%%      10253     8047      78.5%      69.2%      96.5%      25.0%
+  Top  20%%       8203     6302      76.8%      68.5%      97.5%      20.0%
+  Top  15%%       6152     4543      73.8%      67.9%      97.9%      15.0%
+  Top  10%%       4102     2826      68.9%      66.7%      96.7%      10.0%
+  Top   5%%       2051     1342      65.4%      65.4%      71.4%       5.0%
+
+==========================================================================================
+END OF REPORT
+==========================================================================================

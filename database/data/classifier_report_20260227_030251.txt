@@ -1,0 +1,68 @@
+================================================================================
+MULTI-TIMEFRAME CNN CLASSIFIER v2 — ERGEBNISSE
+Zeitpunkt: 2026-02-27 03:02:51
+Timeframes: agg_5m (12h), agg_1h (24h), agg_4h (48h), agg_1d (14d)
+Kanäle pro TF: 7 (price_ret, volume_rel, trades_rel, taker_ratio, range_pct, body_dir, hl_pos)
+================================================================================
+
+Train: 28409 (Long=11677, Short=16732)
+Test:  12176 (Long=6505, Short=5671)
+Baseline: 53.4%
+
+BESTE TEST-ACCURACY: 91.3% (Epoch 34)
+  vs Baseline: +37.9pp
+
+--------------------------------------------------------------------------------
+TRAINING HISTORY (Auszug)
+--------------------------------------------------------------------------------
+  Epoch    1 | Train: 87.2% | Test: 85.6% | LR=1.00e-03
+  Epoch    2 | Train: 94.8% | Test: 87.2% | LR=1.00e-03
+  Epoch    3 | Train: 96.0% | Test: 88.7% | LR=1.00e-03
+  Epoch    4 | Train: 96.7% | Test: 88.4% | LR=1.00e-03
+  Epoch    5 | Train: 96.8% | Test: 89.6% | LR=1.00e-03
+  Epoch   10 | Train: 98.0% | Test: 89.1% | LR=1.00e-03
+  Epoch   20 | Train: 98.8% | Test: 90.2% | LR=1.00e-03
+  Epoch   30 | Train: 99.2% | Test: 87.8% | LR=1.00e-03
+  Epoch   34 | Train: 99.2% | Test: 91.3% | LR=1.00e-03 <<<
+  Epoch   40 | Train: 99.2% | Test: 88.9% | LR=1.00e-03
+  Epoch   50 | Train: 99.8% | Test: 90.9% | LR=5.00e-04
+  Epoch   60 | Train: 99.9% | Test: 90.0% | LR=2.50e-04
+
+--------------------------------------------------------------------------------
+CLASSIFICATION REPORT (Test-Set)
+--------------------------------------------------------------------------------
+              precision    recall  f1-score   support
+
+       SHORT       0.90      0.92      0.91      5671
+        LONG       0.93      0.91      0.92      6505
+
+    accuracy                           0.91     12176
+   macro avg       0.91      0.91      0.91     12176
+weighted avg       0.91      0.91      0.91     12176
+
+Confusion Matrix:
+              Pred SHORT  Pred LONG
+  Act SHORT       5200        471
+  Act LONG         588       5917
+
+--------------------------------------------------------------------------------
+TIMEFRAME WICHTIGKEIT
+--------------------------------------------------------------------------------
+  4h  : 40.8%
+  1h  : 34.0%
+  5m  : 15.8%
+  1d  : 9.5%
+
+--------------------------------------------------------------------------------
+CONFIDENCE ANALYSE
+--------------------------------------------------------------------------------
+  ≥0.50: Coverage=100.0%, Accuracy=91.3%, N=12176
+  ≥0.55: Coverage=99.2%, Accuracy=91.6%, N=12078
+  ≥0.60: Coverage=98.4%, Accuracy=91.9%, N=11987
+  ≥0.65: Coverage=97.7%, Accuracy=92.1%, N=11896
+  ≥0.70: Coverage=96.9%, Accuracy=92.4%, N=11799
+  ≥0.75: Coverage=95.8%, Accuracy=92.8%, N=11666
+  ≥0.80: Coverage=94.8%, Accuracy=93.1%, N=11544
+  ≥0.85: Coverage=93.2%, Accuracy=93.6%, N=11347
+  ≥0.90: Coverage=91.3%, Accuracy=94.2%, N=11119
+  ≥0.95: Coverage=88.1%, Accuracy=95.2%, N=10728
