@@ -3,7 +3,9 @@ META ROUTES - Health, Config, Symbols, Stats
 Lädt alle Werte aus naming.js und settings.json
 """
 
+import os
 import json
+import time
 from pathlib import Path
 from datetime import datetime
 from fastapi import APIRouter, Depends
@@ -37,13 +39,33 @@ async def health():
                 app_ok = True
     except: pass
     
+    # Momentum Scanner Health
+    scanner_ok = False
+    scanner_info = {}
+    try:
+        hb_path = '/opt/coin/logs/.scanner_heartbeat'
+        if os.path.exists(hb_path):
+            age_seconds = time.time() - os.path.getmtime(hb_path)
+            if age_seconds < 300:  # Max 5 Min alt
+                scanner_ok = True
+                with open(hb_path) as f:
+                    scanner_info = json.load(f)
+            scanner_info['age_seconds'] = round(age_seconds)
+    except Exception:
+        pass
+
+    all_ok = coins_ok and app_ok and scanner_ok
     return {
-        "status": "ok" if (coins_ok and app_ok) else "degraded", 
+        "status": "ok" if all_ok else ("degraded" if (coins_ok and app_ok) else "critical"),
         "version": SETTINGS['app']['version'],
         "databases": {
-            "coins": {"connected": coins_ok}, 
+            "coins": {"connected": coins_ok},
             "app": {"connected": app_ok}
-        }, 
+        },
+        "momentum_scanner": {
+            "healthy": scanner_ok,
+            **scanner_info
+        },
         "timestamp": datetime.utcnow().isoformat()
     }
 

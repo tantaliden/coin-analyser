@@ -713,13 +713,6 @@ def check_active_predictions():
             if not new_status and pred['expires_at'] and datetime.now(timezone.utc) >= pred['expires_at']:
                 new_status = 'expired'
 
-            # Invalidierung: Trend komplett gedreht (Confidence < 20 bei Neuberechnung)
-            if not new_status:
-                # Einfacher Check: wenn pct_change < -3% bei Long oder > +3% bei Short → invalidieren
-                if (pred['direction'] == 'long' and pct_change < -3) or \
-                   (pred['direction'] == 'short' and pct_change < -3):
-                    new_status = 'invalidated'
-
             if new_status:
                 was_correct = new_status == 'hit_tp'
                 acur.execute("""
@@ -1567,6 +1560,483 @@ def get_market_context(ccur):
         return None
 
 
+# ============================================
+# HEARTBEAT
+# ============================================
+SCANNER_HEARTBEAT_FILE = '/opt/coin/logs/.scanner_heartbeat'
+
+def write_heartbeat(status='ok', extra=None):
+    """Schreibt Scanner-Heartbeat für Watchdog-Monitoring."""
+    try:
+        data = {
+            'status': status,
+            'pid': os.getpid(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        }
+        if extra:
+            data.update(extra)
+        with open(SCANNER_HEARTBEAT_FILE, 'w') as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+# ============================================
+# CNN LEARNING THREAD
+# ============================================
+
+class MultiTFDataset(Dataset):
+    """Dataset für Multi-Timeframe CNN Training."""
+    def __init__(self, x5m, x1h, x4h, x1d, y):
+        self.x5m = torch.FloatTensor(x5m)
+        self.x1h = torch.FloatTensor(x1h)
+        self.x4h = torch.FloatTensor(x4h)
+        self.x1d = torch.FloatTensor(x1d)
+        self.y   = torch.FloatTensor(y)
+    def __len__(self):
+        return len(self.y)
+    def __getitem__(self, idx):
+        return self.x5m[idx], self.x1h[idx], self.x4h[idx], self.x1d[idx], self.y[idx]
+
+
+def _load_recent_events(days=30, min_pct=5):
+    """
+    Lädt Events der letzten N Tage — identisch zu find_events_strict() aus differenz_scanner.py.
+    Nutzt kline_metrics (pct_60m..pct_600m) für Event-Erkennung + Gegenextrem-Prüfung via agg_5m.
+    """
+    PCT_COLS = ['pct_60m','pct_90m','pct_120m','pct_180m','pct_240m',
+                'pct_300m','pct_360m','pct_420m','pct_480m','pct_540m','pct_600m']
+    DUR_MAP = {'pct_60m':60,'pct_90m':90,'pct_120m':120,'pct_180m':180,'pct_240m':240,
+               'pct_300m':300,'pct_360m':360,'pct_420m':420,'pct_480m':480,'pct_540m':540,'pct_600m':600}
+
+    with coins_db() as conn:
+        cur = conn.cursor()
+
+        # 1. Alle Kandidaten aus kline_metrics holen (alle pct-Spalten ≥min_pct%)
+        where = ' OR '.join(f'ABS({col}) >= {min_pct}' for col in PCT_COLS)
+        cols = ', '.join(PCT_COLS)
+
+        t0 = time.time()
+        cur.execute(f"""
+            SELECT symbol, open_time, {cols}
+            FROM kline_metrics
+            WHERE open_time >= NOW() - INTERVAL '{days} days'
+              AND ({where})
+            ORDER BY symbol, open_time
+        """)
+        rows = cur.fetchall()
+        logger.info(f"[LEARNER] kline_metrics Query: {len(rows)} Kandidaten in {time.time()-t0:.1f}s")
+
+        if not rows:
+            return []
+
+        # 2. Bestes pct-Feld pro Row → Kandidaten-Liste
+        candidates = []
+        for row in rows:
+            best_col = None
+            best_pct = 0
+            for col in PCT_COLS:
+                val = row[col]
+                if val is not None and abs(float(val)) >= min_pct:
+                    best_col = col
+                    best_pct = float(val)
+                    break
+            if best_col is None:
+                continue
+            duration = DUR_MAP[best_col]
+            direction = 'long' if best_pct > 0 else 'short'
+            entry_time = row['open_time'] - timedelta(minutes=duration)
+            candidates.append({
+                'symbol': row['symbol'],
+                'time': entry_time,
+                'event_time': row['open_time'],
+                'duration_min': duration,
+                'direction': direction,
+                'best_pct': round(best_pct, 2),
+                'best_tf': best_col,
+            })
+
+        # 3. Dedup: max 1 Event pro Symbol pro 60 Min
+        candidates.sort(key=lambda e: (e['symbol'], e['time']))
+        deduped = []
+        last_by_sym = {}
+        for e in candidates:
+            key = e['symbol']
+            if key in last_by_sym:
+                diff = (e['time'] - last_by_sym[key]).total_seconds() / 60
+                if diff < 60:
+                    continue
+            last_by_sym[key] = e['time']
+            deduped.append(e)
+
+        logger.info(f"[LEARNER] Nach Dedup: {len(deduped)} Events")
+
+        # 4. Gegenextrem-Prüfung via agg_5m
+        valid_events = []
+        rejected = 0
+        threshold = min_pct / 100.0
+
+        for i, event in enumerate(deduped):
+            if not running:
+                return []
+            if i > 0 and i % 5000 == 0:
+                logger.info(f"[LEARNER] Gegenprüfung: {i}/{len(deduped)}, valid={len(valid_events)}, rejected={rejected}")
+
+            try:
+                cur.execute("""
+                    SELECT bucket, open, high, low, close
+                    FROM agg_5m
+                    WHERE symbol = %s AND bucket >= %s AND bucket < %s
+                    ORDER BY bucket
+                """, (event['symbol'], event['time'], event['event_time']))
+                candles = cur.fetchall()
+            except Exception:
+                conn.rollback()
+                continue
+
+            if len(candles) < 2:
+                valid_events.append(event)
+                continue
+
+            ref_price = float(candles[0]['open'])
+            if ref_price <= 0:
+                valid_events.append(event)
+                continue
+
+            if event['direction'] == 'long':
+                for c in candles:
+                    low_pct = (float(c['low']) - ref_price) / ref_price
+                    high_pct = (float(c['high']) - ref_price) / ref_price
+                    if low_pct <= -threshold:
+                        rejected += 1
+                        break
+                    if high_pct >= threshold:
+                        valid_events.append(event)
+                        break
+                else:
+                    valid_events.append(event)
+            else:
+                for c in candles:
+                    high_pct = (float(c['high']) - ref_price) / ref_price
+                    low_pct = (float(c['low']) - ref_price) / ref_price
+                    if high_pct >= threshold:
+                        rejected += 1
+                        break
+                    if low_pct <= -threshold:
+                        valid_events.append(event)
+                        break
+                else:
+                    valid_events.append(event)
+
+        longs = sum(1 for e in valid_events if e['direction'] == 'long')
+        shorts = sum(1 for e in valid_events if e['direction'] == 'short')
+        logger.info(f"[LEARNER] Events: {len(valid_events)} valid ({longs} Long, {shorts} Short), {rejected} rejected (letzte {days}d)")
+        return valid_events
+
+
+def _load_timeframes_for_events(events):
+    """Lädt alle 4 Timeframe-Daten für Events."""
+    timeframes = {
+        '5m':  {'table': 'agg_5m',  'hours_back': 12, 'expected': 144, 'min': 72},
+        '1h':  {'table': 'agg_1h',  'hours_back': 24, 'expected': 24,  'min': 12},
+        '4h':  {'table': 'agg_4h',  'hours_back': 48, 'expected': 12,  'min': 6},
+        '1d':  {'table': 'agg_1d',  'hours_back': 336, 'expected': 14, 'min': 7},
+    }
+
+    results = []
+    with coins_db() as conn:
+        cur = conn.cursor()
+        for i, event in enumerate(events):
+            entry_time = event['time']
+            symbol = event['symbol']
+            tf_data = {}
+            valid = True
+
+            for tf_name, tf_cfg in timeframes.items():
+                window_start = entry_time - timedelta(hours=tf_cfg['hours_back'])
+                try:
+                    cur.execute(f"""
+                        SELECT bucket, open, high, low, close, volume,
+                               number_of_trades, taker_buy_base_asset_volume
+                        FROM {tf_cfg['table']}
+                        WHERE symbol = %s AND bucket >= %s AND bucket < %s
+                        ORDER BY bucket
+                    """, (symbol, window_start, entry_time))
+                    candles = cur.fetchall()
+                except Exception:
+                    conn.rollback()
+                    valid = False
+                    break
+
+                if len(candles) < tf_cfg['min']:
+                    valid = False
+                    break
+
+                tf_data[tf_name] = candles
+
+            if valid:
+                results.append({'event': event, 'tf': tf_data})
+
+            if (i + 1) % 2000 == 0:
+                logger.info(f"[LEARNER] TF-Laden: {i+1}/{len(events)}, valid={len(results)}")
+
+    logger.info(f"[LEARNER] {len(results)} Events mit allen TFs geladen")
+    return results
+
+
+def _normalize_tf_candles(candles, expected_len):
+    """Normalisiert rohe DB-Candles zu 7 Kanälen (identisch zu normalize_candles_for_cnn)."""
+    import warnings
+    warnings.filterwarnings('ignore', category=RuntimeWarning)
+    n = len(candles)
+    closes  = np.array([float(c['close']) for c in candles])
+    opens   = np.array([float(c['open']) for c in candles])
+    highs   = np.array([float(c['high']) for c in candles])
+    lows    = np.array([float(c['low']) for c in candles])
+    volumes = np.array([float(c['volume']) for c in candles])
+    trades  = np.array([float(c.get('number_of_trades') or 0) for c in candles])
+    taker   = np.array([float(c.get('taker_buy_base_asset_volume') or 0) for c in candles])
+
+    price_ret = np.zeros(n)
+    for j in range(1, n):
+        if closes[j-1] > 0:
+            price_ret[j] = (closes[j] / closes[j-1] - 1) * 100
+
+    med_vol = np.median(volumes)
+    volume_rel = volumes / med_vol if med_vol > 0 else np.ones(n)
+    med_trades = np.median(trades)
+    trades_rel = trades / med_trades if med_trades > 0 else np.ones(n)
+    taker_ratio = np.where(volumes > 0, taker / volumes, 0.5)
+    range_pct = np.where(closes > 0, (highs - lows) / closes * 100, 0)
+    full_range = highs - lows
+    body_dir = np.where(full_range > 0, (closes - opens) / full_range, 0)
+    hl_pos = np.where(full_range > 0, (closes - lows) / full_range, 0.5)
+
+    channels = np.stack([price_ret, volume_rel, trades_rel, taker_ratio,
+                         range_pct, body_dir, hl_pos])
+    if n >= expected_len:
+        channels = channels[:, -expected_len:]
+    else:
+        pad = np.zeros((7, expected_len - n))
+        channels = np.concatenate([pad, channels], axis=1)
+    channels = np.nan_to_num(channels, nan=0.0, posinf=20.0, neginf=-20.0)
+    channels = np.clip(channels, -50, 50)
+    return channels.astype(np.float32)
+
+
+def _train_new_model(events_with_tf):
+    """Trainiert ein neues CNN-Modell und gibt (model, test_accuracy) zurück."""
+    TF_EXPECTED = {'5m': 144, '1h': 24, '4h': 12, '1d': 14}
+
+    # Tensoren vorbereiten
+    X_5m, X_1h, X_4h, X_1d, y_all, times = [], [], [], [], [], []
+    for ed in events_with_tf:
+        X_5m.append(_normalize_tf_candles(ed['tf']['5m'], TF_EXPECTED['5m']))
+        X_1h.append(_normalize_tf_candles(ed['tf']['1h'], TF_EXPECTED['1h']))
+        X_4h.append(_normalize_tf_candles(ed['tf']['4h'], TF_EXPECTED['4h']))
+        X_1d.append(_normalize_tf_candles(ed['tf']['1d'], TF_EXPECTED['1d']))
+        y_all.append(1.0 if ed['event']['direction'] == 'long' else 0.0)
+        times.append(ed['event']['time'])
+
+    X_5m = np.array(X_5m)
+    X_1h = np.array(X_1h)
+    X_4h = np.array(X_4h)
+    X_1d = np.array(X_1d)
+    y = np.array(y_all, dtype=np.float32)
+
+    # Zeitlicher Split 70/30
+    indices = np.argsort([t.timestamp() if hasattr(t, 'timestamp') else 0 for t in times])
+    X_5m, X_1h, X_4h, X_1d, y = X_5m[indices], X_1h[indices], X_4h[indices], X_1d[indices], y[indices]
+    s = int(len(y) * 0.7)
+
+    train_ds = MultiTFDataset(X_5m[:s], X_1h[:s], X_4h[:s], X_1d[:s], y[:s])
+    test_ds  = MultiTFDataset(X_5m[s:], X_1h[s:], X_4h[s:], X_1d[s:], y[s:])
+    train_loader = DataLoader(train_ds, batch_size=256, shuffle=True, num_workers=0)
+    test_loader  = DataLoader(test_ds,  batch_size=256, shuffle=False, num_workers=0)
+
+    n_long = y[:s].sum()
+    n_short = s - n_long
+    baseline = max(y[s:].mean(), 1 - y[s:].mean()) * 100
+
+    logger.info(f"[LEARNER] Training: {s} train, {len(y)-s} test, "
+                f"Long={int(n_long)}, Short={int(n_short)}, Baseline={baseline:.1f}%")
+
+    model = MultiTimeframeCNN()
+    pos_weight = torch.FloatTensor([n_short / max(n_long, 1)])
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=10, factor=0.5, min_lr=1e-6)
+
+    best_acc = 0
+    best_epoch = 0
+    patience_counter = 0
+    patience = 30
+
+    for epoch in range(1000):
+        if not running:
+            logger.info("[LEARNER] Scanner stopping, abort training")
+            return None, 0
+
+        # Train
+        model.train()
+        train_correct = 0
+        train_total = 0
+        for x5, x1, x4, xd, yb in train_loader:
+            optimizer.zero_grad()
+            out = model(x5, x1, x4, xd)
+            loss = criterion(out, yb)
+            loss.backward()
+            optimizer.step()
+            preds = (torch.sigmoid(out) >= 0.5).float()
+            train_correct += (preds == yb).sum().item()
+            train_total += len(yb)
+
+        # Test
+        model.eval()
+        test_correct = 0
+        test_total = 0
+        with torch.no_grad():
+            for x5, x1, x4, xd, yb in test_loader:
+                out = model(x5, x1, x4, xd)
+                preds = (torch.sigmoid(out) >= 0.5).float()
+                test_correct += (preds == yb).sum().item()
+                test_total += len(yb)
+
+        train_acc = train_correct / train_total * 100
+        test_acc = test_correct / test_total * 100
+        scheduler.step(test_acc)
+
+        if (epoch + 1) % 10 == 0:
+            logger.info(f"[LEARNER] Epoch {epoch+1}: Train {train_acc:.1f}% Test {test_acc:.1f}% (Best {best_acc:.1f}%@{best_epoch})")
+
+        if test_acc > best_acc:
+            best_acc = test_acc
+            best_epoch = epoch + 1
+            patience_counter = 0
+            # Temporär speichern
+            torch.save(model.state_dict(), '/opt/coin/database/data/models/cnn_candidate.pth')
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                logger.info(f"[LEARNER] Early Stop: Epoch {epoch+1}, best {best_acc:.1f}% @ Epoch {best_epoch}")
+                break
+
+    # Bestes Modell laden
+    model.load_state_dict(torch.load('/opt/coin/database/data/models/cnn_candidate.pth', weights_only=True))
+    model.eval()
+    return model, best_acc
+
+
+def _get_current_model_accuracy():
+    """Liest die Accuracy des aktuellen Modells aus der letzten Trainings-Info."""
+    info_path = '/opt/coin/database/data/models/model_info.json'
+    if os.path.exists(info_path):
+        with open(info_path) as f:
+            info = json.load(f)
+        return info.get('test_accuracy', 0)
+    return 91.3  # Initiale Accuracy vom ersten Training
+
+
+def run_learning_cycle():
+    """Kompletter Lernzyklus: Events laden → Timeframes → Training → Hot-Swap."""
+    logger.info("=" * 60)
+    logger.info("[LEARNER] === LERNZYKLUS START ===")
+    logger.info("=" * 60)
+    t0 = time.time()
+
+    try:
+        # 1. Events laden (letzte 30 Tage)
+        events = _load_recent_events(days=30)
+        if len(events) < 500:
+            logger.info(f"[LEARNER] Nur {len(events)} Events, brauche min. 500. Skip.")
+            return
+
+        # 2. Timeframe-Daten laden
+        events_with_tf = _load_timeframes_for_events(events)
+        if len(events_with_tf) < 400:
+            logger.info(f"[LEARNER] Nur {len(events_with_tf)} Events mit TF-Daten. Skip.")
+            return
+
+        # 3. Neues Modell trainieren
+        new_model, new_acc = _train_new_model(events_with_tf)
+        if new_model is None:
+            return
+
+        # 4. Vergleich mit aktuellem Modell
+        current_acc = _get_current_model_accuracy()
+        logger.info(f"[LEARNER] Neues Modell: {new_acc:.1f}% vs Aktuelles: {current_acc:.1f}%")
+
+        if new_acc > current_acc:
+            # Hot-Swap: Neues Modell übernimmt
+            global _cnn_model
+            model_path = '/opt/coin/database/data/models/best_cnn_v2.pth'
+
+            # Backup des alten Modells
+            backup_path = f'/opt/coin/database/data/models/cnn_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pth'
+            if os.path.exists(model_path):
+                import shutil
+                shutil.copy2(model_path, backup_path)
+                logger.info(f"[LEARNER] Backup: {backup_path}")
+
+            # Neues Modell speichern + aktivieren
+            torch.save(new_model.state_dict(), model_path)
+            _cnn_model = new_model
+
+            # Info speichern
+            info_path = '/opt/coin/database/data/models/model_info.json'
+            with open(info_path, 'w') as f:
+                json.dump({
+                    'test_accuracy': round(new_acc, 2),
+                    'trained_at': datetime.now(timezone.utc).isoformat(),
+                    'events_used': len(events_with_tf),
+                    'previous_accuracy': round(current_acc, 2),
+                }, f, indent=2)
+
+            elapsed = (time.time() - t0) / 60
+            logger.info(f"[LEARNER] HOT-SWAP: {current_acc:.1f}% → {new_acc:.1f}% (+{new_acc-current_acc:.1f}pp) in {elapsed:.1f}min")
+        else:
+            # Kandidat verworfen
+            elapsed = (time.time() - t0) / 60
+            logger.info(f"[LEARNER] KEIN SWAP: Neues {new_acc:.1f}% ≤ Aktuelles {current_acc:.1f}% ({elapsed:.1f}min)")
+            # Kandidat-Datei aufräumen
+            cand = '/opt/coin/database/data/models/cnn_candidate.pth'
+            if os.path.exists(cand):
+                os.remove(cand)
+
+    except Exception as e:
+        logger.error(f"[LEARNER] Fehler: {e}")
+        logger.error(traceback.format_exc())
+
+
+class LearnerThread(threading.Thread):
+    """Background-Thread der alle 12h das CNN-Modell nachtrainiert."""
+
+    def __init__(self, interval_hours=12):
+        super().__init__(daemon=True, name='CNN-Learner')
+        self.interval = interval_hours * 3600
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        logger.info(f"[LEARNER] Thread gestartet — Intervall: alle {self.interval // 3600}h")
+        # Erster Lauf nach 1h (Scanner soll erst warm werden)
+        self._stop_event.wait(3600)
+
+        while not self._stop_event.is_set() and running:
+            try:
+                run_learning_cycle()
+            except Exception as e:
+                logger.error(f"[LEARNER] Thread-Fehler: {e}")
+                logger.error(traceback.format_exc())
+
+            # Warten bis zum nächsten Zyklus
+            self._stop_event.wait(self.interval)
+
+        logger.info("[LEARNER] Thread beendet")
+
+
 def scan_symbols(config, symbols):
     """Scannt eine Liste von Symbolen und erstellt Predictions"""
     user_id = config['user_id']
@@ -1720,7 +2190,7 @@ def scan_symbols(config, symbols):
                         (user_id, symbol, direction, entry_price, take_profit_price,
                          stop_loss_price, take_profit_pct, stop_loss_pct,
                          confidence, reason, signals, expires_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW() + INTERVAL '72 hours')
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW() + INTERVAL '48 hours')
                         RETURNING prediction_id
                     """, (user_id, symbol, signal['direction'], entry,
                           float(tp_price), float(sl_price),
@@ -1747,7 +2217,7 @@ def scan_symbols(config, symbols):
 def main():
     """Main Loop"""
     logger.info("=" * 60)
-    logger.info("Momentum Scanner v4 (CNN) starting...")
+    logger.info("Momentum Scanner v4 (CNN) + Learning starting...")
     logger.info(f"PID: {os.getpid()}")
     logger.info("=" * 60)
 
@@ -1758,6 +2228,14 @@ def main():
         logger.error("[CNN] Bitte erst ts_classifier.py ausführen um das Modell zu trainieren.")
         return
     logger.info("[CNN] Modell bereit — Scanner läuft mit CNN-basierter Erkennung")
+
+    # Learning Thread starten (trainiert alle 12h nach)
+    learner = LearnerThread(interval_hours=12)
+    learner.start()
+    logger.info("[LEARNER] Background-Thread gestartet (12h Intervall)")
+
+    # Initiales Heartbeat
+    write_heartbeat('starting')
 
     while running:
         try:
@@ -1823,6 +2301,12 @@ def main():
                 # 3. Stats updaten
                 update_stats(user_id)
 
+                # Heartbeat nach jedem Zyklus
+                write_heartbeat('ok', {
+                    'learner_alive': learner.is_alive(),
+                    'model_loaded': _cnn_model is not None,
+                })
+
                 # Idle
                 logger.info(f"[LOOP] Cycle done, sleeping {idle}s...")
                 for _ in range(idle):
@@ -1833,8 +2317,13 @@ def main():
         except Exception as e:
             logger.error(f"[MAIN] Error: {e}")
             logger.error(traceback.format_exc())
+            write_heartbeat('error', {'error': str(e)})
             time.sleep(30)
 
+    # Learner Thread stoppen
+    learner.stop()
+    learner.join(timeout=5)
+    write_heartbeat('stopped')
     logger.info("Momentum Scanner stopped.")
 
 
