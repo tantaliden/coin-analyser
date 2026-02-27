@@ -15,6 +15,10 @@ logs/
 # Alt/Backup
 alt/
 
+# Large data files
+database/data/checkpoints/
+*.pkl
+
 # IDE
 .vscode/
 .idea/
