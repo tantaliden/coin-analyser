@@ -16,6 +16,7 @@ import logging
 import traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from datetime import datetime, timedelta, timezone
+from simclock import clock
 from contextlib import contextmanager
 
 import threading
@@ -131,7 +132,7 @@ def write_prediction_feedback(pred, new_status, was_correct, pct_change, duratio
                  detected_at, resolved_at, status, was_correct, actual_result_pct,
                  duration_minutes, time_result, peak_pct, trough_pct,
                  confidence, take_profit_pct, stop_loss_pct)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (prediction_id, scanner_type) DO UPDATE SET
                     status = EXCLUDED.status,
                     was_correct = EXCLUDED.was_correct,
@@ -142,7 +143,7 @@ def write_prediction_feedback(pred, new_status, was_correct, pct_change, duratio
                     trough_pct = EXCLUDED.trough_pct,
                     resolved_at = EXCLUDED.resolved_at
             """, (pred['prediction_id'], SCANNER_TYPE, pred['symbol'], pred['direction'],
-                  pred['entry_price'], pred['detected_at'], new_status, was_correct,
+                  pred['entry_price'], pred['detected_at'], clock.now(), new_status, was_correct,
                   round(pct_change, 4), duration, time_result, round(peak, 4), round(trough, 4),
                   pred['confidence'], float(pred['take_profit_pct']), float(pred['stop_loss_pct'])))
             conn.commit()
@@ -281,22 +282,22 @@ def analyze_symbol_cnn(ccur, symbol, current_price, market_context=None, scan_co
     try:
         ccur.execute("""SELECT bucket, open, high, low, close, volume,
                                number_of_trades, taker_buy_base_asset_volume
-                        FROM agg_5m WHERE symbol = %s ORDER BY bucket DESC LIMIT 144""", (symbol,))
+                        FROM agg_5m WHERE symbol = %s AND bucket <= %s ORDER BY bucket DESC LIMIT 144""", (symbol, clock.now()))
         candles_5m = list(reversed(ccur.fetchall()))
 
         ccur.execute("""SELECT bucket, open, high, low, close, volume,
                                number_of_trades, taker_buy_base_asset_volume
-                        FROM agg_1h WHERE symbol = %s ORDER BY bucket DESC LIMIT 24""", (symbol,))
+                        FROM agg_1h WHERE symbol = %s AND bucket <= %s ORDER BY bucket DESC LIMIT 24""", (symbol, clock.now()))
         candles_1h = list(reversed(ccur.fetchall()))
 
         ccur.execute("""SELECT bucket, open, high, low, close, volume,
                                number_of_trades, taker_buy_base_asset_volume
-                        FROM agg_4h WHERE symbol = %s ORDER BY bucket DESC LIMIT 12""", (symbol,))
+                        FROM agg_4h WHERE symbol = %s AND bucket <= %s ORDER BY bucket DESC LIMIT 12""", (symbol, clock.now()))
         candles_4h = list(reversed(ccur.fetchall()))
 
         ccur.execute("""SELECT bucket, open, high, low, close, volume,
                                number_of_trades, taker_buy_base_asset_volume
-                        FROM agg_1d WHERE symbol = %s ORDER BY bucket DESC LIMIT 14""", (symbol,))
+                        FROM agg_1d WHERE symbol = %s AND bucket <= %s ORDER BY bucket DESC LIMIT 14""", (symbol, clock.now()))
         candles_1d = list(reversed(ccur.fetchall()))
     except Exception as e:
         logger.debug(f"[CNN] {symbol} Daten-Fehler: {e}")
@@ -413,17 +414,17 @@ def check_active_predictions():
 
             ccur.execute("""
                 SELECT close FROM klines
-                WHERE symbol = %s AND interval = '1m'
+                WHERE symbol = %s AND interval = '1m' AND open_time <= %s
                 ORDER BY open_time DESC LIMIT 1
-            """, (symbol,))
+            """, (symbol, clock.now()))
             row_1m = ccur.fetchone()
             if not row_1m:
                 continue
 
             ccur.execute("""
                 SELECT MAX(high) as high, MIN(low) as low FROM klines
-                WHERE symbol = %s AND interval = '1m' AND open_time >= %s
-            """, (symbol, pred['detected_at']))
+                WHERE symbol = %s AND interval = '1m' AND open_time >= %s AND open_time <= %s
+            """, (symbol, pred['detected_at'], clock.now()))
             row_hl = ccur.fetchone()
 
             current = row_1m['close']
@@ -447,7 +448,7 @@ def check_active_predictions():
                 live_sl = entry * (1 + short_sl / 100)
 
             new_status = None
-            duration = int((datetime.now(timezone.utc) - pred['detected_at']).total_seconds() / 60)
+            duration = int((clock.now() - pred['detected_at']).total_seconds() / 60)
 
             if pred['direction'] == 'long':
                 if current >= live_tp:
@@ -461,7 +462,7 @@ def check_active_predictions():
                     new_status = 'hit_sl'
 
             # Expiry: 72h
-            if not new_status and pred['expires_at'] and datetime.now(timezone.utc) >= pred['expires_at']:
+            if not new_status and pred['expires_at'] and clock.now() >= pred['expires_at']:
                 new_status = 'expired'
 
             # time_result: Feedback innerhalb Zeitfenster (2h = 120min für 2h-Scanner)
@@ -490,11 +491,11 @@ def check_active_predictions():
 
                 acur.execute("""
                     UPDATE momentum_predictions
-                    SET status = %s, resolved_at = NOW(), actual_result_pct = %s,
+                    SET status = %s, resolved_at = %s, actual_result_pct = %s,
                         peak_pct = %s, trough_pct = %s, duration_minutes = %s,
                         was_correct = %s, max_favorable_pct = %s, time_result = %s
                     WHERE prediction_id = %s
-                """, (new_status, round(pct_change, 4), round(peak, 4), round(trough, 4),
+                """, (new_status, clock.now(), round(pct_change, 4), round(peak, 4), round(trough, 4),
                       duration, was_correct, round(peak, 4), time_result, pred['prediction_id']))
                 resolved_count += 1
                 logger.info(f"[RESOLVE] {symbol} {pred['direction']} → {new_status} ({pct_change:+.2f}%) time_result={time_result}")
@@ -527,11 +528,12 @@ def update_stats(user_id):
     with app_db() as conn:
         cur = conn.cursor()
 
+        now = clock.now()
         time_periods = {
-            '24h': "detected_at >= NOW() - INTERVAL '24 hours'",
-            '7d': "detected_at >= NOW() - INTERVAL '7 days'",
-            '30d': "detected_at >= NOW() - INTERVAL '30 days'",
-            'all': "TRUE"
+            '24h': ("detected_at >= %s - INTERVAL '24 hours'", (now,)),
+            '7d': ("detected_at >= %s - INTERVAL '7 days'", (now,)),
+            '30d': ("detected_at >= %s - INTERVAL '30 days'", (now,)),
+            'all': ("TRUE", ())
         }
 
         combos = []
@@ -540,7 +542,7 @@ def update_stats(user_id):
             combos.append((f'long_{tp}', tw, 'long'))
             combos.append((f'short_{tp}', tw, 'short'))
 
-        for period_key, time_where, direction in combos:
+        for period_key, (time_where, time_params), direction in combos:
             dir_where = f" AND direction = '{direction}'" if direction else ""
             cur.execute(f"""
                 SELECT
@@ -555,7 +557,7 @@ def update_stats(user_id):
                     AVG(duration_minutes) as avg_dur
                 FROM momentum_predictions
                 WHERE user_id = %s AND status != 'active' AND scanner_type = %s AND {time_where}{dir_where}
-            """, (user_id, SCANNER_TYPE))
+            """, (user_id, SCANNER_TYPE) + time_params)
 
             row = cur.fetchone()
             total = row['total'] or 0
@@ -566,7 +568,7 @@ def update_stats(user_id):
                 INSERT INTO momentum_stats (user_id, period, scanner_type, total_predictions, correct_predictions,
                     incorrect_predictions, expired_predictions, avg_confidence, avg_result_pct,
                     best_result_pct, worst_result_pct, hit_rate_pct, avg_duration_minutes, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (user_id, period, scanner_type) DO UPDATE SET
                     total_predictions = EXCLUDED.total_predictions,
                     correct_predictions = EXCLUDED.correct_predictions,
@@ -578,11 +580,11 @@ def update_stats(user_id):
                     worst_result_pct = EXCLUDED.worst_result_pct,
                     hit_rate_pct = EXCLUDED.hit_rate_pct,
                     avg_duration_minutes = EXCLUDED.avg_duration_minutes,
-                    updated_at = NOW()
+                    updated_at = %s
             """, (user_id, period_key, SCANNER_TYPE, total, correct, row['incorrect'] or 0,
                   row['expired'] or 0, row['avg_conf'], row['avg_result'],
                   row['best'], row['worst'], round(hit_rate, 2),
-                  int(row['avg_dur']) if row['avg_dur'] else None))
+                  int(row['avg_dur']) if row['avg_dur'] else None, now, now))
 
         conn.commit()
 
@@ -617,10 +619,10 @@ def get_market_context(ccur):
             FROM kline_metrics
             WHERE open_time = (
                 SELECT MAX(open_time) FROM kline_metrics
-                WHERE open_time <= date_trunc('hour', NOW())
+                WHERE open_time <= date_trunc('hour', %s::timestamptz)
             )
             AND pct_240m IS NOT NULL
-        """)
+        """, (clock.now(),))
         row = ccur.fetchone()
         if not row or row['avg_4h'] is None:
             return None
@@ -655,7 +657,7 @@ def write_heartbeat(status='ok', extra=None):
         data = {
             'status': status,
             'pid': os.getpid(),
-            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'timestamp': clock.now().isoformat(),
             'scanner_type': SCANNER_TYPE,
         }
         if extra:
@@ -698,10 +700,10 @@ def _load_recent_events(days=30, min_pct=None):
         cur.execute(f"""
             SELECT symbol, open_time, {cols}
             FROM kline_metrics
-            WHERE open_time >= NOW() - INTERVAL '{days} days'
+            WHERE open_time >= %s - INTERVAL '{days} days'
               AND ({where})
             ORDER BY symbol, open_time
-        """)
+        """, (clock.now(),))
         rows = cur.fetchall()
         logger.info(f"[LEARNER] kline_metrics Query: {len(rows)} Kandidaten in {time.time()-t0:.1f}s")
 
@@ -1031,7 +1033,7 @@ def run_learning_cycle():
             global _cnn_model
             import shutil
 
-            backup_path = f'{MODEL_BACKUP_DIR}/cnn_2h_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pth'
+            backup_path = f'{MODEL_BACKUP_DIR}/cnn_2h_backup_{clock.now().strftime("%Y%m%d_%H%M%S")}.pth'
             if os.path.exists(MODEL_PATH):
                 shutil.copy2(MODEL_PATH, backup_path)
                 logger.info(f"[LEARNER] Backup: {backup_path}")
@@ -1042,7 +1044,7 @@ def run_learning_cycle():
             with open(MODEL_INFO_PATH, 'w') as f:
                 json.dump({
                     'test_accuracy': round(new_acc, 2),
-                    'trained_at': datetime.now(timezone.utc).isoformat(),
+                    'trained_at': clock.now().isoformat(),
                     'events_used': len(events_with_tf),
                     'previous_accuracy': round(current_acc, 2),
                 }, f, indent=2)
@@ -1122,8 +1124,8 @@ def scan_symbols(config, symbols):
         acur.execute("""
             SELECT DISTINCT symbol FROM momentum_predictions
             WHERE user_id = %s AND status != 'active' AND scanner_type = %s
-              AND resolved_at >= NOW() - INTERVAL '30 minutes'
-        """, (user_id, SCANNER_TYPE))
+              AND resolved_at >= %s - INTERVAL '30 minutes'
+        """, (user_id, SCANNER_TYPE, clock.now()))
         cooldown_symbols = {r['symbol'] for r in acur.fetchall()}
         active_symbols = active_symbols | cooldown_symbols
 
@@ -1147,9 +1149,9 @@ def scan_symbols(config, symbols):
             try:
                 ccur.execute("""
                     SELECT close FROM klines
-                    WHERE symbol = %s AND interval = '1m'
+                    WHERE symbol = %s AND interval = '1m' AND open_time <= %s
                     ORDER BY open_time DESC LIMIT 1
-                """, (symbol,))
+                """, (symbol, clock.now()))
                 row_1m = ccur.fetchone()
                 if not row_1m or not row_1m['close'] or row_1m['close'] == 0:
                     continue
@@ -1165,9 +1167,9 @@ def scan_symbols(config, symbols):
                     # Momentum-Check
                     ccur.execute("""
                         SELECT pct_30m, pct_60m FROM kline_metrics
-                        WHERE symbol = %s
+                        WHERE symbol = %s AND open_time <= %s
                         ORDER BY open_time DESC LIMIT 1
-                    """, (symbol,))
+                    """, (symbol, clock.now()))
                     metrics_row = ccur.fetchone()
                     if metrics_row and metrics_row['pct_30m'] is not None:
                         pct_30m = float(metrics_row['pct_30m'])
@@ -1203,14 +1205,14 @@ def scan_symbols(config, symbols):
                         INSERT INTO momentum_predictions
                         (user_id, symbol, direction, entry_price, take_profit_price,
                          stop_loss_price, take_profit_pct, stop_loss_pct,
-                         confidence, reason, signals, expires_at, scanner_type)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW() + INTERVAL '72 hours', %s)
+                         confidence, reason, signals, detected_at, expires_at, scanner_type)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s + INTERVAL '72 hours', %s)
                         RETURNING prediction_id
                     """, (user_id, symbol, signal['direction'], entry,
                           float(tp_price), float(sl_price),
                           float(tp_pct), float(sl_pct),
                           int(signal["confidence"]), signal["reason"],
-                          Json(signal['signals']), SCANNER_TYPE))
+                          Json(signal['signals']), clock.now(), clock.now(), SCANNER_TYPE))
 
                     pred_id = acur.fetchone()['prediction_id']
                     new_predictions += 1
@@ -1231,6 +1233,91 @@ def scan_symbols(config, symbols):
 # MAIN LOOP
 # ============================================
 
+def sim_main(sim_end, sim_step=5):
+    """Simulation Main Loop — Zeitmaschine, gleicher Code wie Live"""
+    logger.info("=" * 60)
+    logger.info(f"[SIM] Simulation Start: {clock.now().isoformat()}")
+    logger.info(f"[SIM] Simulation Ende:  {sim_end.isoformat()}")
+    logger.info(f"[SIM] Zeitschritt:      {sim_step} Minuten")
+    logger.info(f"[SIM] Scanner Type:     {SCANNER_TYPE}")
+    logger.info(f"[SIM] PID: {os.getpid()}")
+    logger.info("=" * 60)
+
+    model = get_cnn_model()
+    if model is None:
+        logger.error("[SIM] KEIN MODELL VERFÜGBAR — Simulation kann nicht starten!")
+        return
+
+    logger.info("[SIM] Modell bereit — Simulation startet")
+
+    with app_db() as conn:
+        cur = conn.cursor()
+        cur.execute(f"SELECT * FROM {CONFIG_TABLE} WHERE is_active = true")
+        configs = cur.fetchall()
+
+    if not configs:
+        logger.error("[SIM] Keine aktive Scan-Config gefunden!")
+        return
+
+    config = configs[0]
+    user_id = config['user_id']
+    symbols = get_symbols_for_config(config)
+    logger.info(f"[SIM] {len(symbols)} Symbole geladen, User {user_id}")
+
+    learner_counter = 0
+    cycle_count = 0
+    total_predictions = 0
+    total_resolved = 0
+    last_day = None
+
+    while clock.now() < sim_end:
+        try:
+            current_day = clock.now().strftime('%Y-%m-%d')
+            if current_day != last_day:
+                logger.info(f"[SIM] === {current_day} === (Zyklus {cycle_count}, Predictions bisher: {total_predictions}, Resolved: {total_resolved})")
+                last_day = current_day
+
+            # 1. Aktive Predictions prüfen
+            resolved = check_active_predictions()
+            total_resolved += resolved
+            if resolved > 0:
+                update_stats(user_id)
+
+            # 2. Neue Symbole scannen
+            new = scan_symbols(config, symbols)
+            total_predictions += new
+
+            # 3. Stats updaten
+            update_stats(user_id)
+
+            # 4. Learner alle 12h (720 Minuten)
+            learner_counter += sim_step
+            if learner_counter >= 720:
+                logger.info(f"[SIM] Learner-Zyklus bei {clock.now().isoformat()}")
+                try:
+                    run_learning_cycle()
+                except Exception as le:
+                    logger.error(f"[SIM] Learner-Fehler: {le}")
+                learner_counter = 0
+
+            # 5. Zeit vorspulen
+            clock.advance(sim_step)
+            cycle_count += 1
+
+        except Exception as e:
+            logger.error(f"[SIM] Zyklus-Fehler bei {clock.now().isoformat()}: {e}")
+            logger.error(traceback.format_exc())
+            clock.advance(sim_step)
+            cycle_count += 1
+
+    logger.info("=" * 60)
+    logger.info(f"[SIM] Simulation ABGESCHLOSSEN")
+    logger.info(f"[SIM] Zyklen:      {cycle_count}")
+    logger.info(f"[SIM] Predictions: {total_predictions}")
+    logger.info(f"[SIM] Resolved:    {total_resolved}")
+    logger.info("=" * 60)
+
+
 def main():
     logger.info("=" * 60)
     logger.info("Momentum Scanner 2h (CNN) + Learning starting...")
@@ -1246,9 +1333,11 @@ def main():
         return
     logger.info("[CNN] Modell bereit — Scanner 2h läuft")
 
-    learner = LearnerThread(interval_hours=12)
-    learner.start()
-    logger.info("[LEARNER] Background-Thread gestartet (12h Intervall)")
+    # Learning Thread DEAKTIVIERT — Simulation läuft, Learner werden dort getriggert
+    # learner = LearnerThread(interval_hours=12)
+    # learner.start()
+    learner = None
+    logger.info("[LEARNER] DEAKTIVIERT — wird über Simulation gesteuert")
 
     write_heartbeat('starting')
 
@@ -1289,7 +1378,7 @@ def main():
                 update_stats(user_id)
 
                 write_heartbeat('ok', {
-                    'learner_alive': learner.is_alive(),
+                    'learner_alive': learner.is_alive() if learner else False,
                     'model_loaded': _cnn_model is not None,
                 })
 
@@ -1305,11 +1394,23 @@ def main():
             write_heartbeat('error', {'error': str(e)})
             time.sleep(30)
 
-    learner.stop()
-    learner.join(timeout=5)
+    if learner:
+        learner.stop()
+        learner.join(timeout=5)
     write_heartbeat('stopped')
     logger.info("Momentum Scanner 2h stopped.")
 
 
 if __name__ == '__main__':
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == '--sim':
+        if len(sys.argv) < 4:
+            print("Usage: scanner_2h.py --sim <start_iso> <end_iso> [step_minutes]")
+            print("  Beispiel: scanner_2h.py --sim 2026-01-01T00:00:00+00:00 2026-03-01T00:00:00+00:00 5")
+            sys.exit(1)
+        sim_start = datetime.fromisoformat(sys.argv[2])
+        sim_end = datetime.fromisoformat(sys.argv[3])
+        sim_step = int(sys.argv[4]) if len(sys.argv) > 4 else 5
+        clock.set_time(sim_start)
+        sim_main(sim_end, sim_step)
+    else:
+        main()
