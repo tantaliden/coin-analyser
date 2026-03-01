@@ -50,6 +50,7 @@ with open(ROOT_DIR / 'settings.json') as f:
 
 COINS_DB_CFG = SETTINGS['databases']['coins']
 APP_DB_CFG = SETTINGS['databases']['app']
+LEARNER_DB_CFG = SETTINGS['databases']['learner']
 
 # ============================================
 # SCANNER-SPEZIFISCHE KONSTANTEN
@@ -105,6 +106,49 @@ def app_db():
         yield conn
     finally:
         conn.close()
+
+@contextmanager
+def learner_db():
+    conn = psycopg2.connect(
+        host=LEARNER_DB_CFG['host'], port=LEARNER_DB_CFG['port'],
+        dbname=LEARNER_DB_CFG['name'], user=LEARNER_DB_CFG['user'],
+        password=LEARNER_DB_CFG['password'], cursor_factory=RealDictCursor
+    )
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def write_prediction_feedback(pred, new_status, was_correct, pct_change, duration, time_result, peak, trough):
+    """Schreibt Feedback einer resolved Prediction in die Learner-DB."""
+    try:
+        with learner_db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO prediction_feedback
+                (prediction_id, scanner_type, symbol, direction, entry_price,
+                 detected_at, resolved_at, status, was_correct, actual_result_pct,
+                 duration_minutes, time_result, peak_pct, trough_pct,
+                 confidence, take_profit_pct, stop_loss_pct)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (prediction_id, scanner_type) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    was_correct = EXCLUDED.was_correct,
+                    actual_result_pct = EXCLUDED.actual_result_pct,
+                    duration_minutes = EXCLUDED.duration_minutes,
+                    time_result = EXCLUDED.time_result,
+                    peak_pct = EXCLUDED.peak_pct,
+                    trough_pct = EXCLUDED.trough_pct,
+                    resolved_at = EXCLUDED.resolved_at
+            """, (pred['prediction_id'], SCANNER_TYPE, pred['symbol'], pred['direction'],
+                  pred['entry_price'], pred['detected_at'], new_status, was_correct,
+                  round(pct_change, 4), duration, time_result, round(peak, 4), round(trough, 4),
+                  pred['confidence'], float(pred['take_profit_pct']), float(pred['stop_loss_pct'])))
+            conn.commit()
+            logger.info(f"[FEEDBACK] #{pred['prediction_id']} → learner DB ({time_result})")
+    except Exception as e:
+        logger.error(f"[FEEDBACK] Fehler: {e}")
 
 
 # ============================================
@@ -420,23 +464,56 @@ def check_active_predictions():
             if not new_status and pred['expires_at'] and datetime.now(timezone.utc) >= pred['expires_at']:
                 new_status = 'expired'
 
+            # time_result: Feedback innerhalb Zeitfenster (2h = 120min für 2h-Scanner)
+            TIME_RESULT_THRESHOLD = 120  # 2 Stunden in Minuten
+            time_result = pred.get('time_result')
+            if time_result is None and duration >= TIME_RESULT_THRESHOLD:
+                tp_pct = float(pred['take_profit_pct'])
+                sl_pct = float(pred['stop_loss_pct'])
+                if peak >= tp_pct:
+                    time_result = 'in_time_tp'
+                elif trough <= -sl_pct:
+                    time_result = 'in_time_sl'
+                # Sonst bleibt NULL — wird bei Resolution gesetzt
+
             if new_status:
                 was_correct = new_status == 'hit_tp'
+
+                # time_result bei Resolution setzen wenn noch NULL
+                if time_result is None:
+                    if new_status == 'hit_tp':
+                        time_result = 'expired_positive'
+                    elif new_status == 'hit_sl':
+                        time_result = 'expired_negative'
+                    elif new_status == 'expired':
+                        time_result = 'expired_neutral'
+
                 acur.execute("""
                     UPDATE momentum_predictions
                     SET status = %s, resolved_at = NOW(), actual_result_pct = %s,
                         peak_pct = %s, trough_pct = %s, duration_minutes = %s,
-                        was_correct = %s, max_favorable_pct = %s
+                        was_correct = %s, max_favorable_pct = %s, time_result = %s
                     WHERE prediction_id = %s
                 """, (new_status, round(pct_change, 4), round(peak, 4), round(trough, 4),
-                      duration, was_correct, round(peak, 4), pred['prediction_id']))
+                      duration, was_correct, round(peak, 4), time_result, pred['prediction_id']))
                 resolved_count += 1
-                logger.info(f"[RESOLVE] {symbol} {pred['direction']} → {new_status} ({pct_change:+.2f}%)")
+                logger.info(f"[RESOLVE] {symbol} {pred['direction']} → {new_status} ({pct_change:+.2f}%) time_result={time_result}")
+
+                # Feedback in Learner-DB schreiben
+                write_prediction_feedback(pred, new_status, was_correct, pct_change, duration, time_result, peak, trough)
             else:
-                acur.execute("""
-                    UPDATE momentum_predictions SET peak_pct = %s, trough_pct = %s
-                    WHERE prediction_id = %s
-                """, (round(peak, 4), round(trough, 4), pred['prediction_id']))
+                # Peak/Trough updaten + time_result wenn gerade gesetzt
+                if time_result is not None and pred.get('time_result') is None:
+                    acur.execute("""
+                        UPDATE momentum_predictions SET peak_pct = %s, trough_pct = %s, time_result = %s
+                        WHERE prediction_id = %s
+                    """, (round(peak, 4), round(trough, 4), time_result, pred['prediction_id']))
+                    logger.info(f"[TIME_RESULT] {symbol} {pred['direction']} → {time_result} (duration={duration}min)")
+                else:
+                    acur.execute("""
+                        UPDATE momentum_predictions SET peak_pct = %s, trough_pct = %s
+                        WHERE prediction_id = %s
+                    """, (round(peak, 4), round(trough, 4), pred['prediction_id']))
 
         aconn.commit()
         return resolved_count

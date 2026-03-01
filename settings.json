@@ -54,6 +54,15 @@
         "min": 2,
         "max": 10
       }
+    },
+    "learner": {
+      "type": "postgres",
+      "host": "localhost",
+      "port": 5432,
+      "name": "learner",
+      "user": "app_user",
+      "password": "AppUser2025!Secure",
+      "ssl": false
     }
   },
   "binance": {
