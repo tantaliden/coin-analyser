@@ -935,16 +935,28 @@ def _train_new_model(events_with_tf):
     logger.info(f"[LEARNER] Training: {s} train, {len(y)-s} test, "
                 f"Long={int(n_long)}, Short={int(n_short)}, Baseline={baseline:.1f}%")
 
-    model = MultiTimeframeCNN()
+    # Fine-Tuning: Bestehendes Modell weitertrainieren statt from scratch
+    model = get_cnn_model()
+    if model is None:
+        logger.info("[LEARNER] Kein bestehendes Modell — trainiere from scratch")
+        model = MultiTimeframeCNN()
+        lr = 0.001
+        patience = 30
+    else:
+        import copy
+        model = copy.deepcopy(model)  # Kopie, damit Live-Modell nicht verändert wird
+        lr = 0.0001  # Fine-Tuning: 10x niedrigere Learning Rate
+        patience = 15
+        logger.info("[LEARNER] Fine-Tuning auf bestehendem Modell (lr=0.0001)")
+
     pos_weight = torch.FloatTensor([n_short / max(n_long, 1)])
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=10, factor=0.5, min_lr=1e-6)
 
     best_acc = 0
     best_epoch = 0
     patience_counter = 0
-    patience = 30
 
     for epoch in range(1000):
         if not running:
