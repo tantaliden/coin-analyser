@@ -2313,104 +2313,19 @@ def scan_symbols(config, symbols):
     return new_predictions
 
 
-def sim_main(sim_end, sim_step=5):
-    """Simulation Main Loop — Zeitmaschine, gleicher Code wie Live"""
+def main(sim_end=None, sim_step=5):
+    """Main Loop — identisch für Live und Simulation.
+    Live:  sim_end=None → clock.is_sim=False, echte Sleeps
+    Sim:   sim_end gesetzt → clock.is_sim=True, clock.advance statt sleep
+    """
     logger.info("=" * 60)
-    logger.info(f"[SIM] Simulation Start: {clock.now().isoformat()}")
-    logger.info(f"[SIM] Simulation Ende:  {sim_end.isoformat()}")
-    logger.info(f"[SIM] Zeitschritt:      {sim_step} Minuten")
-    logger.info(f"[SIM] PID: {os.getpid()}")
-    logger.info("=" * 60)
-
-    # CNN-Modell laden
-    model = get_cnn_model()
-    if model is None:
-        logger.error("[SIM] KEIN MODELL VERFÜGBAR — Simulation kann nicht starten!")
-        return
-
-    logger.info("[SIM] Modell bereit — Simulation startet")
-
-    # Config laden
-    with app_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM momentum_scan_config WHERE is_active = true")
-        configs = cur.fetchall()
-
-    if not configs:
-        logger.error("[SIM] Keine aktive Scan-Config gefunden!")
-        return
-
-    config = configs[0]
-    user_id = config['user_id']
-    symbols = get_symbols_for_config(config)
-    logger.info(f"[SIM] {len(symbols)} Symbole geladen, User {user_id}")
-
-    learner_counter = 0
-    cycle_count = 0
-    total_predictions = 0
-    total_resolved = 0
-    last_day = None
-
-    while clock.now() < sim_end:
-        try:
-            # Tages-Log (einmal pro Sim-Tag)
-            current_day = clock.now().strftime('%Y-%m-%d')
-            if current_day != last_day:
-                logger.info(f"[SIM] === {current_day} === (Zyklus {cycle_count}, Predictions bisher: {total_predictions}, Resolved: {total_resolved})")
-                last_day = current_day
-
-            # 1. Aktive Predictions prüfen
-            resolved = check_active_predictions()
-            total_resolved += resolved
-            if resolved > 0:
-                update_stats(user_id)
-
-            # 1b. Post-Resolve Tracking
-            try:
-                track_resolved_predictions()
-            except Exception as te:
-                logger.debug(f"[SIM] Post-track error: {te}")
-
-            # 2. Neue Symbole scannen
-            new = scan_symbols(config, symbols)
-            total_predictions += new
-
-            # 3. Stats updaten
-            update_stats(user_id)
-
-            # 4. Learner alle 12h (720 Minuten)
-            learner_counter += sim_step
-            if learner_counter >= 720:
-                logger.info(f"[SIM] Learner-Zyklus bei {clock.now().isoformat()}")
-                try:
-                    run_learning_cycle()
-                except Exception as le:
-                    logger.error(f"[SIM] Learner-Fehler: {le}")
-                learner_counter = 0
-
-            # 5. Zeit vorspulen
-            clock.advance(sim_step)
-            cycle_count += 1
-
-        except Exception as e:
-            logger.error(f"[SIM] Zyklus-Fehler bei {clock.now().isoformat()}: {e}")
-            logger.error(traceback.format_exc())
-            clock.advance(sim_step)
-            cycle_count += 1
-
-    # Finale Stats
-    logger.info("=" * 60)
-    logger.info(f"[SIM] Simulation ABGESCHLOSSEN")
-    logger.info(f"[SIM] Zyklen:      {cycle_count}")
-    logger.info(f"[SIM] Predictions: {total_predictions}")
-    logger.info(f"[SIM] Resolved:    {total_resolved}")
-    logger.info("=" * 60)
-
-
-def main():
-    """Main Loop"""
-    logger.info("=" * 60)
-    logger.info("Momentum Scanner v4 (CNN) + Learning starting...")
+    if clock.is_sim:
+        logger.info(f"Momentum Scanner v4 (CNN) — SIMULATION")
+        logger.info(f"Sim Start: {clock.now().isoformat()}")
+        logger.info(f"Sim Ende:  {sim_end.isoformat()}")
+        logger.info(f"Zeitschritt: {sim_step} Minuten")
+    else:
+        logger.info("Momentum Scanner v4 (CNN) + Learning starting...")
     logger.info(f"PID: {os.getpid()}")
     logger.info("=" * 60)
 
@@ -2422,17 +2337,34 @@ def main():
         return
     logger.info("[CNN] Modell bereit — Scanner läuft mit CNN-basierter Erkennung")
 
-    # Learning Thread DEAKTIVIERT — Simulation läuft, Learner werden dort getriggert
-    # learner = LearnerThread(interval_hours=12)
-    # learner.start()
-    learner = None
-    logger.info("[LEARNER] DEAKTIVIERT — wird über Simulation gesteuert")
+    # Learning Thread: Im Sim-Modus manuell getriggert, im Live-Modus als Thread
+    if clock.is_sim:
+        learner = None
+        learner_counter = 0
+        logger.info("[LEARNER] Sim-Modus — wird manuell alle 12h getriggert")
+    else:
+        learner = LearnerThread(interval_hours=12)
+        learner.start()
+        logger.info("[LEARNER] Thread gestartet (12h Intervall)")
 
     # Initiales Heartbeat
     write_heartbeat('starting')
 
-    while running:
+    # Sim-Tracking
+    last_day = None
+    cycle_count = 0
+    total_predictions = 0
+    total_resolved = 0
+
+    while running and (not clock.is_sim or clock.now() < sim_end):
         try:
+            # Sim: Tages-Log
+            if clock.is_sim:
+                current_day = clock.now().strftime('%Y-%m-%d')
+                if current_day != last_day:
+                    logger.info(f"[SIM] === {current_day} === (Zyklus {cycle_count}, Predictions: {total_predictions}, Resolved: {total_resolved})")
+                    last_day = current_day
+
             # Aktive Configs laden
             with app_db() as conn:
                 cur = conn.cursor()
@@ -2440,7 +2372,11 @@ def main():
                 configs = cur.fetchall()
 
             if not configs:
-                time.sleep(10)
+                if clock.is_sim:
+                    clock.advance(sim_step)
+                    cycle_count += 1
+                else:
+                    time.sleep(10)
                 continue
 
             for config in configs:
@@ -2475,6 +2411,8 @@ def main():
                 if resolved > 0:
                     update_stats(user_id)
                     logger.info(f"[MONITOR] Resolved {resolved} predictions for user {user_id}")
+                if clock.is_sim:
+                    total_resolved += resolved
 
                 # 1b. Post-Resolve Tracking (max favorable + Trendwende)
                 try:
@@ -2491,6 +2429,8 @@ def main():
                     new = scan_symbols(config, symbols)
                     if new > 0:
                         logger.info(f"[SCAN] Created {new} new predictions for user {user_id}")
+                    if clock.is_sim:
+                        total_predictions += new
 
                 # 3. Stats updaten
                 update_stats(user_id)
@@ -2501,18 +2441,48 @@ def main():
                     'model_loaded': _cnn_model is not None,
                 })
 
-                # Idle
-                logger.info(f"[LOOP] Cycle done, sleeping {idle}s...")
-                for _ in range(idle):
-                    if not running:
-                        break
-                    time.sleep(1)
+                # Idle: Sim → advance, Live → sleep
+                if clock.is_sim:
+                    pass  # Advance kommt nach dem for-loop
+                else:
+                    logger.info(f"[LOOP] Cycle done, sleeping {idle}s...")
+                    for _ in range(idle):
+                        if not running:
+                            break
+                        time.sleep(1)
+
+            # Sim: Learner alle 12h + Zeit vorspulen
+            if clock.is_sim:
+                learner_counter += sim_step
+                if learner_counter >= 720:
+                    logger.info(f"[SIM] Learner-Zyklus bei {clock.now().isoformat()}")
+                    try:
+                        run_learning_cycle()
+                    except Exception as le:
+                        logger.error(f"[SIM] Learner-Fehler: {le}")
+                    learner_counter = 0
+
+                clock.advance(sim_step)
+                cycle_count += 1
 
         except Exception as e:
             logger.error(f"[MAIN] Error: {e}")
             logger.error(traceback.format_exc())
             write_heartbeat('error', {'error': str(e)})
-            time.sleep(30)
+            if clock.is_sim:
+                clock.advance(sim_step)
+                cycle_count += 1
+            else:
+                time.sleep(30)
+
+    # Sim: Finale Stats
+    if clock.is_sim:
+        logger.info("=" * 60)
+        logger.info(f"[SIM] Simulation ABGESCHLOSSEN")
+        logger.info(f"[SIM] Zyklen:      {cycle_count}")
+        logger.info(f"[SIM] Predictions: {total_predictions}")
+        logger.info(f"[SIM] Resolved:    {total_resolved}")
+        logger.info("=" * 60)
 
     # Learner Thread stoppen (wenn aktiv)
     if learner:
@@ -2533,6 +2503,6 @@ if __name__ == '__main__':
         sim_step = int(sys.argv[4]) if len(sys.argv) > 4 else 5
         # SimClock auf Startzeit setzen
         clock.set_time(sim_start)
-        sim_main(sim_end, sim_step)
+        main(sim_end, sim_step)
     else:
         main()

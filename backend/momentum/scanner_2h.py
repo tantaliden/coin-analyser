@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from datetime import datetime, timedelta, timezone
 from simclock import clock
 from contextlib import contextmanager
+from threshold_optimizer import run_threshold_optimization
 
 import threading
 import psycopg2
@@ -588,6 +589,368 @@ def update_stats(user_id):
 
         conn.commit()
 
+
+# ============================================
+# OPTIMIZER (identisch zu scanner.py, 6h versetzt)
+# ============================================
+
+_last_optimization_run = None
+
+def should_run_optimization():
+    """Prüft ob Optimierung laufen soll (Montag 14:00 Berlin, wöchentlich — 6h nach Default-Scanner)"""
+    global _last_optimization_run
+    from zoneinfo import ZoneInfo
+    now = clock.now().astimezone(ZoneInfo('Europe/Berlin'))
+    run_hours = [14]  # 6h versetzt zum Default-Scanner (08:00)
+
+    if now.weekday() == 0 and now.hour in run_hours:  # Nur Montag
+        today_key = f"{now.date()}-{now.hour}"
+        if _last_optimization_run != today_key:
+            return today_key
+    return None
+
+
+def _optimize_direction(user_id, direction, resolved, config, acur, ccur):
+    """Optimiert eine einzelne Richtung (long oder short)"""
+    prefix = f"{direction}_" if direction else ""
+
+    preds = [p for p in resolved if p['direction'] == direction] if direction else resolved
+
+    if len(preds) < 5:
+        logger.info(f"[OPTIMIZER] {direction}: Nur {len(preds)} predictions, brauche min. 5. Skip.")
+        return None
+
+    total = len(preds)
+    tp_hits = [p for p in preds if p['status'] == 'hit_tp']
+    sl_hits = [p for p in preds if p['status'] == 'hit_sl']
+    current_hit_rate = (len(tp_hits) / total * 100) if total > 0 else 0
+
+    logger.info(f"[OPTIMIZER] {direction.upper()}: {total} predictions: {len(tp_hits)} TP, "
+                f"{len(sl_hits)} SL = {current_hit_rate:.1f}% hit rate")
+
+    # Aktuelle direction-spezifische Config (Fallback auf global)
+    current_conf = config.get(f'{prefix}min_confidence') or config.get('min_confidence', 60)
+    current_mode = config.get(f'{prefix}tp_sl_mode') or config.get('tp_sl_mode', 'dynamic')
+
+    # Varianten generieren
+    variants = []
+
+    for conf in [60, 65, 70, 75, 80, 85, 90]:
+        if conf != current_conf:
+            variants.append({'min_confidence': conf, 'label': f'conf={conf}'})
+
+    for tp in [2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]:
+        for sl in [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]:
+            if sl < tp:
+                variants.append({
+                    'fixed_tp_pct': tp, 'fixed_sl_pct': sl, 'tp_sl_mode': 'fixed',
+                    'label': f'fixed tp={tp} sl={sl}'
+                })
+
+    for conf in [65, 70, 75, 80]:
+        for tp in [3.0, 5.0, 7.0]:
+            for sl in [1.5, 2.0, 3.0]:
+                if sl < tp:
+                    variants.append({
+                        'min_confidence': conf, 'fixed_tp_pct': tp, 'fixed_sl_pct': sl,
+                        'tp_sl_mode': 'fixed',
+                        'label': f'conf={conf} tp={tp} sl={sl}'
+                    })
+
+    # pct_30m zum Zeitpunkt jeder Prediction einmalig laden
+    for pred in preds:
+        ccur.execute("""
+            SELECT pct_30m FROM kline_metrics
+            WHERE symbol = %s AND open_time <= %s
+            ORDER BY open_time DESC LIMIT 1
+        """, (pred['symbol'], pred['detected_at']))
+        row = ccur.fetchone()
+        pred['_pct_30m'] = float(row['pct_30m']) if row and row['pct_30m'] is not None else None
+
+    # pct_30m Varianten hinzufügen (richtungsabhängig)
+    for pct_thresh in [1.0, 1.5, 2.0, 2.5, 3.0]:
+        variants.append({
+            'pct_30m_min': pct_thresh,
+            'label': f'pct_30m>={pct_thresh}%'
+        })
+        # Kombis mit TP/SL
+        for tp in [2.0, 3.0, 5.0]:
+            for sl in [1.5, 2.0, 3.0]:
+                if sl < tp:
+                    variants.append({
+                        'pct_30m_min': pct_thresh,
+                        'fixed_tp_pct': tp, 'fixed_sl_pct': sl, 'tp_sl_mode': 'fixed',
+                        'label': f'pct_30m>={pct_thresh} tp={tp} sl={sl}'
+                    })
+
+    logger.info(f"[OPTIMIZER] {direction.upper()}: Testing {len(variants)} variants")
+
+    best_variant = None
+    best_score = current_hit_rate
+    best_details = None
+
+    for variant in variants:
+        sim_tp = 0
+        sim_sl = 0
+        sim_eliminated = 0
+        sim_tp_lost = 0
+        sim_total = 0
+
+        v_conf = variant.get('min_confidence', current_conf)
+        v_tp_pct = variant.get('fixed_tp_pct', None)
+        v_sl_pct = variant.get('fixed_sl_pct', None)
+
+        v_pct_30m_min = variant.get('pct_30m_min', None)
+
+        for pred in preds:
+            if pred['confidence'] < v_conf:
+                sim_eliminated += 1
+                if pred['status'] == 'hit_tp':
+                    sim_tp_lost += 1
+                continue
+
+            # pct_30m Filter
+            if v_pct_30m_min is not None and pred.get('_pct_30m') is not None:
+                pct_val = pred['_pct_30m']
+                if direction == 'long' and pct_val < v_pct_30m_min:
+                    sim_eliminated += 1
+                    if pred['status'] == 'hit_tp':
+                        sim_tp_lost += 1
+                    continue
+                if direction == 'short' and pct_val > -v_pct_30m_min:
+                    sim_eliminated += 1
+                    if pred['status'] == 'hit_tp':
+                        sim_tp_lost += 1
+                    continue
+
+            sim_total += 1
+
+            if v_tp_pct and v_sl_pct:
+                ccur.execute("""
+                    SELECT high, low, close FROM klines
+                    WHERE symbol = %s AND interval = '1m'
+                      AND open_time >= %s AND open_time <= %s + INTERVAL '72 hours'
+                    ORDER BY open_time
+                """, (pred['symbol'], pred['detected_at'], pred['detected_at']))
+                candles = ccur.fetchall()
+
+                if not candles:
+                    if pred['status'] == 'hit_tp':
+                        sim_tp += 1
+                    else:
+                        sim_sl += 1
+                    continue
+
+                entry = pred['entry_price']
+                if pred['direction'] == 'long':
+                    sim_tp_price = entry * (1 + v_tp_pct / 100)
+                    sim_sl_price = entry * (1 - v_sl_pct / 100)
+                else:
+                    sim_tp_price = entry * (1 - v_tp_pct / 100)
+                    sim_sl_price = entry * (1 + v_sl_pct / 100)
+
+                hit = None
+                for c in candles:
+                    if pred['direction'] == 'long':
+                        if c['high'] >= sim_tp_price:
+                            hit = 'tp'
+                            break
+                        if c['low'] <= sim_sl_price:
+                            hit = 'sl'
+                            break
+                    else:
+                        if c['low'] <= sim_tp_price:
+                            hit = 'tp'
+                            break
+                        if c['high'] >= sim_sl_price:
+                            hit = 'sl'
+                            break
+
+                if hit == 'tp':
+                    sim_tp += 1
+                else:
+                    sim_sl += 1
+            else:
+                if pred['status'] == 'hit_tp':
+                    sim_tp += 1
+                else:
+                    sim_sl += 1
+
+        if sim_total == 0:
+            continue
+
+        sim_hit_rate = (sim_tp / sim_total * 100)
+        score = sim_hit_rate - (sim_tp_lost * 5)
+
+        if score > best_score and sim_tp_lost <= 1:
+            best_score = score
+            best_variant = variant
+            best_details = {
+                'sim_total': sim_total,
+                'sim_tp': sim_tp,
+                'sim_sl': sim_sl,
+                'sim_eliminated': sim_eliminated,
+                'sim_tp_lost': sim_tp_lost,
+                'sim_hit_rate': round(sim_hit_rate, 2),
+            }
+
+    return {
+        'direction': direction,
+        'total': total,
+        'tp_hits': len(tp_hits),
+        'sl_hits': len(sl_hits),
+        'current_hit_rate': current_hit_rate,
+        'variants_tested': len(variants),
+        'best_variant': best_variant,
+        'best_details': best_details or {'sim_total': 0, 'sim_tp': 0, 'sim_sl': 0,
+                                          'sim_eliminated': 0, 'sim_tp_lost': 0, 'sim_hit_rate': 0},
+    }
+
+
+def run_daily_optimization(user_id, config):
+    """Tägliche Optimierung: Long und Short GETRENNT optimieren."""
+    global _last_optimization_run
+
+    logger.info(f"[OPTIMIZER] Starting daily optimization for user {user_id}...")
+
+    with app_db() as aconn, coins_db() as cconn:
+        acur = aconn.cursor()
+        ccur = cconn.cursor()
+
+        acur.execute("""
+            SELECT p.*, p.signals::text as signals_text
+            FROM momentum_predictions p
+            WHERE p.user_id = %s
+              AND p.scanner_type = %s
+              AND p.status IN ('hit_tp', 'hit_sl', 'expired', 'invalidated')
+              AND p.detected_at >= %s - INTERVAL '7 days'
+            ORDER BY p.detected_at
+        """, (user_id, SCANNER_TYPE, clock.now()))
+        resolved = acur.fetchall()
+
+        if len(resolved) < 10:
+            logger.info(f"[OPTIMIZER] Nur {len(resolved)} resolved predictions, brauche min. 10. Skip.")
+            return
+
+        total = len(resolved)
+        tp_hits = [p for p in resolved if p['status'] == 'hit_tp']
+        sl_hits = [p for p in resolved if p['status'] == 'hit_sl']
+        expired = [p for p in resolved if p['status'] in ('expired', 'invalidated')]
+        current_hit_rate = (len(tp_hits) / total * 100) if total > 0 else 0
+
+        logger.info(f"[OPTIMIZER] {total} predictions total: {len(tp_hits)} TP, {len(sl_hits)} SL, "
+                     f"{len(expired)} exp/inv = {current_hit_rate:.1f}% hit rate")
+
+        for direction in ['long', 'short']:
+            result = _optimize_direction(user_id, direction, resolved, config, acur, ccur)
+
+            if result is None:
+                continue
+
+            prefix = f"{direction}_"
+            best_variant = result['best_variant']
+            best_details = result['best_details']
+
+            if best_variant and best_details:
+                improvement = best_details['sim_hit_rate'] - result['current_hit_rate']
+
+                if improvement >= 3.0 and best_details['sim_tp_lost'] <= 2:
+                    recommendation = 'apply'
+                    reason = (f"{direction.upper()} hit rate {result['current_hit_rate']:.1f}% -> "
+                              f"{best_details['sim_hit_rate']:.1f}% (+{improvement:.1f}%), "
+                              f"{best_details['sim_eliminated']} eliminated, "
+                              f"{best_details['sim_tp_lost']} TP lost")
+
+                    logger.info(f"[OPTIMIZER] APPLY {direction.upper()}: {best_variant['label']} -> {reason}")
+
+                    changes = {}
+                    if 'min_confidence' in best_variant:
+                        field = f'{prefix}min_confidence'
+                        old_val = config.get(field) or config.get('min_confidence', 60)
+                        new_val = best_variant['min_confidence']
+                        if old_val != new_val:
+                            changes[field] = {'old': old_val, 'new': new_val}
+
+                    if 'tp_sl_mode' in best_variant:
+                        field = f'{prefix}tp_sl_mode'
+                        old_val = config.get(field) or config.get('tp_sl_mode', 'dynamic')
+                        new_val = best_variant['tp_sl_mode']
+                        if old_val != new_val:
+                            changes[field] = {'old': old_val, 'new': new_val}
+
+                    if 'fixed_tp_pct' in best_variant:
+                        field = f'{prefix}fixed_tp_pct'
+                        old_val = float(config.get(field) or config.get('fixed_tp_pct', 5.0))
+                        new_val = best_variant['fixed_tp_pct']
+                        if old_val != new_val:
+                            changes[field] = {'old': old_val, 'new': new_val}
+
+                    if 'fixed_sl_pct' in best_variant:
+                        field = f'{prefix}fixed_sl_pct'
+                        old_val = float(config.get(field) or config.get('fixed_sl_pct', 2.0))
+                        new_val = best_variant['fixed_sl_pct']
+                        if old_val != new_val:
+                            changes[field] = {'old': old_val, 'new': new_val}
+
+                    if 'pct_30m_min' in best_variant:
+                        field = f'{prefix}pct_30m_min'
+                        old_val = float(config.get(field) or 1.5)
+                        new_val = best_variant['pct_30m_min']
+                        if old_val != new_val:
+                            changes[field] = {'old': old_val, 'new': new_val}
+
+                    if changes:
+                        set_parts = []
+                        set_vals = []
+                        for field, vals in changes.items():
+                            set_parts.append(f"{field} = %s")
+                            set_vals.append(vals['new'])
+                        set_vals.append(clock.now())
+                        set_vals.append(user_id)
+
+                        acur.execute(
+                            f"UPDATE {CONFIG_TABLE} SET {', '.join(set_parts)}, updated_at = %s "
+                            f"WHERE user_id = %s",
+                            set_vals
+                        )
+                        logger.info(f"[OPTIMIZER] {direction.upper()} config updated: {changes}")
+
+                    applied = True
+                else:
+                    recommendation = 'no_change'
+                    reason = (f"{direction.upper()} improvement {improvement:.1f}% too small (need >=3%) or "
+                              f"too many TP lost ({best_details['sim_tp_lost']})")
+                    applied = False
+                    changes = {}
+                    logger.info(f"[OPTIMIZER] {direction.upper()} NO CHANGE: {reason}")
+            else:
+                recommendation = 'no_change'
+                reason = f"{direction.upper()}: No variant improves current performance"
+                applied = False
+                changes = {}
+                best_details = {'sim_total': 0, 'sim_tp': 0, 'sim_sl': 0,
+                               'sim_eliminated': 0, 'sim_tp_lost': 0, 'sim_hit_rate': 0}
+                logger.info(f"[OPTIMIZER] {direction.upper()} NO CHANGE: {reason}")
+
+            # Log speichern (pro Richtung)
+            acur.execute("""
+                INSERT INTO momentum_optimization_log
+                (user_id, period_start, period_end, total_predictions, total_tp, total_sl,
+                 total_expired, current_hit_rate, simulations_run, best_variant,
+                 best_sim_hit_rate, best_sim_tp, best_sim_sl, best_sim_eliminated,
+                 best_sim_tp_lost, recommendation, applied, reason, changes_applied)
+                VALUES (%s, %s - INTERVAL '7 days', %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (user_id, clock.now(), clock.now(), result['total'], result['tp_hits'], result['sl_hits'],
+                  0, round(result['current_hit_rate'], 2), result['variants_tested'],
+                  Json(best_variant) if best_variant else None,
+                  best_details['sim_hit_rate'], best_details['sim_tp'],
+                  best_details['sim_sl'], best_details['sim_eliminated'],
+                  best_details['sim_tp_lost'], recommendation, applied, reason,
+                  Json(changes) if changes else None))
+
+        aconn.commit()
+        logger.info(f"[OPTIMIZER] Done. Long and Short optimized separately.")
 
 # ============================================
 # HELPERS
@@ -1245,94 +1608,19 @@ def scan_symbols(config, symbols):
 # MAIN LOOP
 # ============================================
 
-def sim_main(sim_end, sim_step=5):
-    """Simulation Main Loop — Zeitmaschine, gleicher Code wie Live"""
+def main(sim_end=None, sim_step=5):
+    """Main Loop — identisch für Live und Simulation.
+    Live:  sim_end=None → clock.is_sim=False, echte Sleeps
+    Sim:   sim_end gesetzt → clock.is_sim=True, clock.advance statt sleep
+    """
     logger.info("=" * 60)
-    logger.info(f"[SIM] Simulation Start: {clock.now().isoformat()}")
-    logger.info(f"[SIM] Simulation Ende:  {sim_end.isoformat()}")
-    logger.info(f"[SIM] Zeitschritt:      {sim_step} Minuten")
-    logger.info(f"[SIM] Scanner Type:     {SCANNER_TYPE}")
-    logger.info(f"[SIM] PID: {os.getpid()}")
-    logger.info("=" * 60)
-
-    model = get_cnn_model()
-    if model is None:
-        logger.error("[SIM] KEIN MODELL VERFÜGBAR — Simulation kann nicht starten!")
-        return
-
-    logger.info("[SIM] Modell bereit — Simulation startet")
-
-    with app_db() as conn:
-        cur = conn.cursor()
-        cur.execute(f"SELECT * FROM {CONFIG_TABLE} WHERE is_active = true")
-        configs = cur.fetchall()
-
-    if not configs:
-        logger.error("[SIM] Keine aktive Scan-Config gefunden!")
-        return
-
-    config = configs[0]
-    user_id = config['user_id']
-    symbols = get_symbols_for_config(config)
-    logger.info(f"[SIM] {len(symbols)} Symbole geladen, User {user_id}")
-
-    learner_counter = 0
-    cycle_count = 0
-    total_predictions = 0
-    total_resolved = 0
-    last_day = None
-
-    while clock.now() < sim_end:
-        try:
-            current_day = clock.now().strftime('%Y-%m-%d')
-            if current_day != last_day:
-                logger.info(f"[SIM] === {current_day} === (Zyklus {cycle_count}, Predictions bisher: {total_predictions}, Resolved: {total_resolved})")
-                last_day = current_day
-
-            # 1. Aktive Predictions prüfen
-            resolved = check_active_predictions()
-            total_resolved += resolved
-            if resolved > 0:
-                update_stats(user_id)
-
-            # 2. Neue Symbole scannen
-            new = scan_symbols(config, symbols)
-            total_predictions += new
-
-            # 3. Stats updaten
-            update_stats(user_id)
-
-            # 4. Learner alle 12h (720 Minuten)
-            learner_counter += sim_step
-            if learner_counter >= 720:
-                logger.info(f"[SIM] Learner-Zyklus bei {clock.now().isoformat()}")
-                try:
-                    run_learning_cycle()
-                except Exception as le:
-                    logger.error(f"[SIM] Learner-Fehler: {le}")
-                learner_counter = 0
-
-            # 5. Zeit vorspulen
-            clock.advance(sim_step)
-            cycle_count += 1
-
-        except Exception as e:
-            logger.error(f"[SIM] Zyklus-Fehler bei {clock.now().isoformat()}: {e}")
-            logger.error(traceback.format_exc())
-            clock.advance(sim_step)
-            cycle_count += 1
-
-    logger.info("=" * 60)
-    logger.info(f"[SIM] Simulation ABGESCHLOSSEN")
-    logger.info(f"[SIM] Zyklen:      {cycle_count}")
-    logger.info(f"[SIM] Predictions: {total_predictions}")
-    logger.info(f"[SIM] Resolved:    {total_resolved}")
-    logger.info("=" * 60)
-
-
-def main():
-    logger.info("=" * 60)
-    logger.info("Momentum Scanner 2h (CNN) + Learning starting...")
+    if clock.is_sim:
+        logger.info(f"Momentum Scanner 2h (CNN) — SIMULATION")
+        logger.info(f"Sim Start: {clock.now().isoformat()}")
+        logger.info(f"Sim Ende:  {sim_end.isoformat()}")
+        logger.info(f"Zeitschritt: {sim_step} Minuten")
+    else:
+        logger.info("Momentum Scanner 2h (CNN) + Learning starting...")
     logger.info(f"PID: {os.getpid()}")
     logger.info(f"Model: {MODEL_PATH}")
     logger.info(f"Config: {CONFIG_TABLE}")
@@ -1345,23 +1633,45 @@ def main():
         return
     logger.info("[CNN] Modell bereit — Scanner 2h läuft")
 
-    # Learning Thread DEAKTIVIERT — Simulation läuft, Learner werden dort getriggert
-    # learner = LearnerThread(interval_hours=12)
-    # learner.start()
-    learner = None
-    logger.info("[LEARNER] DEAKTIVIERT — wird über Simulation gesteuert")
+    # Learning Thread: Im Sim-Modus manuell getriggert, im Live-Modus als Thread
+    if clock.is_sim:
+        learner = None
+        learner_counter = 0
+        logger.info("[LEARNER] Sim-Modus — wird manuell alle 12h getriggert")
+    else:
+        learner = LearnerThread(interval_hours=12)
+        learner.start()
+        logger.info("[LEARNER] Thread gestartet (12h Intervall)")
 
     write_heartbeat('starting')
 
-    while running:
+    # Sim-Tracking
+    last_day = None
+    cycle_count = 0
+    total_predictions = 0
+    total_resolved = 0
+
+    while running and (not clock.is_sim or clock.now() < sim_end):
         try:
+            # Sim: Tages-Log
+            if clock.is_sim:
+                current_day = clock.now().strftime('%Y-%m-%d')
+                if current_day != last_day:
+                    logger.info(f"[SIM] === {current_day} === (Zyklus {cycle_count}, Predictions: {total_predictions}, Resolved: {total_resolved})")
+                    last_day = current_day
+
+            # Aktive Configs laden
             with app_db() as conn:
                 cur = conn.cursor()
                 cur.execute(f"SELECT * FROM {CONFIG_TABLE} WHERE is_active = true")
                 configs = cur.fetchall()
 
             if not configs:
-                time.sleep(10)
+                if clock.is_sim:
+                    clock.advance(sim_step)
+                    cycle_count += 1
+                else:
+                    time.sleep(10)
                 continue
 
             for config in configs:
@@ -1371,12 +1681,32 @@ def main():
                 user_id = config['user_id']
                 idle = config['idle_seconds'] or 60
 
+                # 0. Daily Optimizer (Montag 14:00 Berlin, 6h nach Default-Scanner)
+                opt_key = should_run_optimization()
+                if opt_key:
+                    try:
+                        global _last_optimization_run
+                        # Threshold Optimizer
+                        try:
+                            run_threshold_optimization(14, 4.0)
+                            logger.info("[OPTIMIZER] Threshold optimization complete")
+                        except Exception as te:
+                            logger.error(f"[OPTIMIZER] Threshold optimization failed: {te}")
+                        # Legacy TP/SL Optimizer
+                        run_daily_optimization(user_id, config)
+                        _last_optimization_run = opt_key
+                    except Exception as oe:
+                        logger.error(f"[OPTIMIZER] Error: {oe}")
+                        logger.error(traceback.format_exc())
+
                 # 1. Aktive Predictions prüfen
                 logger.info(f"[LOOP] Checking active 2h predictions...")
                 resolved = check_active_predictions()
                 logger.info(f"[LOOP] Resolved: {resolved}")
                 if resolved > 0:
                     update_stats(user_id)
+                if clock.is_sim:
+                    total_resolved += resolved
 
                 # 2. Neue Symbole scannen
                 symbols = get_symbols_for_config(config)
@@ -1385,26 +1715,58 @@ def main():
                     new = scan_symbols(config, symbols)
                     if new > 0:
                         logger.info(f"[SCAN] Created {new} new 2h predictions for user {user_id}")
+                    if clock.is_sim:
+                        total_predictions += new
 
                 # 3. Stats updaten
                 update_stats(user_id)
 
+                # Heartbeat nach jedem Zyklus
                 write_heartbeat('ok', {
                     'learner_alive': learner.is_alive() if learner else False,
                     'model_loaded': _cnn_model is not None,
                 })
 
-                logger.info(f"[LOOP] Cycle done, sleeping {idle}s...")
-                for _ in range(idle):
-                    if not running:
-                        break
-                    time.sleep(1)
+                # Idle: Sim → advance, Live → sleep
+                if not clock.is_sim:
+                    logger.info(f"[LOOP] Cycle done, sleeping {idle}s...")
+                    for _ in range(idle):
+                        if not running:
+                            break
+                        time.sleep(1)
+
+            # Sim: Learner alle 12h + Zeit vorspulen
+            if clock.is_sim:
+                learner_counter += sim_step
+                if learner_counter >= 720:
+                    logger.info(f"[SIM] Learner-Zyklus bei {clock.now().isoformat()}")
+                    try:
+                        run_learning_cycle()
+                    except Exception as le:
+                        logger.error(f"[SIM] Learner-Fehler: {le}")
+                    learner_counter = 0
+
+                clock.advance(sim_step)
+                cycle_count += 1
 
         except Exception as e:
             logger.error(f"[MAIN] Error: {e}")
             logger.error(traceback.format_exc())
             write_heartbeat('error', {'error': str(e)})
-            time.sleep(30)
+            if clock.is_sim:
+                clock.advance(sim_step)
+                cycle_count += 1
+            else:
+                time.sleep(30)
+
+    # Sim: Finale Stats
+    if clock.is_sim:
+        logger.info("=" * 60)
+        logger.info(f"[SIM] Simulation ABGESCHLOSSEN")
+        logger.info(f"[SIM] Zyklen:      {cycle_count}")
+        logger.info(f"[SIM] Predictions: {total_predictions}")
+        logger.info(f"[SIM] Resolved:    {total_resolved}")
+        logger.info("=" * 60)
 
     if learner:
         learner.stop()
@@ -1423,6 +1785,6 @@ if __name__ == '__main__':
         sim_end = datetime.fromisoformat(sys.argv[3])
         sim_step = int(sys.argv[4]) if len(sys.argv) > 4 else 5
         clock.set_time(sim_start)
-        sim_main(sim_end, sim_step)
+        main(sim_end, sim_step)
     else:
         main()
