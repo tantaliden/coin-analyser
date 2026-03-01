@@ -51,7 +51,7 @@ def get_binance_client(user_row):
     api_secret = decrypt_value(user_row['binance_api_secret_encrypted'])
     return BinanceClient(api_key, api_secret)
 
-def resolve_stats(cur, user_id):
+def resolve_stats(cur, user_id, scanner_type='default'):
     """Stats aktualisieren nach Prediction-Resolution"""
     time_periods = {
         '24h': "detected_at >= NOW() - INTERVAL '24 hours'",
@@ -79,18 +79,18 @@ def resolve_stats(cur, user_id):
                 MIN(actual_result_pct) as worst,
                 AVG(duration_minutes) as avg_dur
             FROM momentum_predictions
-            WHERE user_id = %s AND status != 'active' AND {time_where}{dir_where}
-        """, (user_id,))
+            WHERE user_id = %s AND scanner_type = %s AND status != 'active' AND {time_where}{dir_where}
+        """, (user_id, scanner_type))
         row = cur.fetchone()
         total = row['total'] or 0
         correct = row['correct'] or 0
         hit_rate = (correct / total * 100) if total > 0 else 0
         cur.execute("""
-            INSERT INTO momentum_stats (user_id, period, total_predictions, correct_predictions,
+            INSERT INTO momentum_stats (user_id, period, scanner_type, total_predictions, correct_predictions,
                 incorrect_predictions, expired_predictions, avg_confidence, avg_result_pct,
                 best_result_pct, worst_result_pct, hit_rate_pct, avg_duration_minutes, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (user_id, period) DO UPDATE SET
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (user_id, period, scanner_type) DO UPDATE SET
                 total_predictions = EXCLUDED.total_predictions,
                 correct_predictions = EXCLUDED.correct_predictions,
                 incorrect_predictions = EXCLUDED.incorrect_predictions,
@@ -102,7 +102,7 @@ def resolve_stats(cur, user_id):
                 hit_rate_pct = EXCLUDED.hit_rate_pct,
                 avg_duration_minutes = EXCLUDED.avg_duration_minutes,
                 updated_at = NOW()
-        """, (user_id, period_key, total, correct, row['incorrect'] or 0,
+        """, (user_id, period_key, scanner_type, total, correct, row['incorrect'] or 0,
               row['expired'] or 0, row['avg_conf'], row['avg_result'],
               row['best'], row['worst'], round(hit_rate, 2),
               int(row['avg_dur']) if row['avg_dur'] else None))
@@ -210,9 +210,13 @@ def check_open_trades():
                             duration_minutes = %s, resolved_at = %s
                         WHERE prediction_id = %s AND status = 'active'
                     """, (new_status, pnl >= 0, round(result_pct, 4), duration, sell_time, buy['prediction_id']))
-                    print(f"[TRACKER] Prediction #{buy['prediction_id']} → {new_status} ({result_pct:+.2f}%)")
+                    # scanner_type der Prediction holen
+                    cur.execute("SELECT scanner_type FROM momentum_predictions WHERE prediction_id = %s", (buy['prediction_id'],))
+                    pred_row = cur.fetchone()
+                    st = pred_row['scanner_type'] if pred_row else 'default'
+                    print(f"[TRACKER] Prediction #{buy['prediction_id']} ({st}) → {new_status} ({result_pct:+.2f}%)")
                     # Stats aktualisieren
-                    resolve_stats(cur, user_id)
+                    resolve_stats(cur, user_id, scanner_type=st)
 
                 conn.commit()
                 filled_count += 1

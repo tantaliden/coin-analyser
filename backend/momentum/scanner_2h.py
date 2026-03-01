@@ -61,7 +61,7 @@ MODEL_CANDIDATE_PATH = '/opt/CNN/models/cnn_2h_candidate.pth'
 MODEL_BACKUP_DIR = '/opt/CNN/models'
 HEARTBEAT_FILE = '/opt/coin/logs/.scanner_2h_heartbeat'
 CONFIG_TABLE = 'momentum_scan_config_2h'
-EXPIRES_INTERVAL = '2 hours'
+EXPIRES_INTERVAL = '72 hours'
 LEARNER_MIN_PCT = 2
 LEARNER_PCT_COLS = ['pct_60m', 'pct_90m', 'pct_120m']
 LEARNER_DUR_MAP = {'pct_60m': 60, 'pct_90m': 90, 'pct_120m': 120}
@@ -416,7 +416,7 @@ def check_active_predictions():
                 elif current >= live_sl:
                     new_status = 'hit_sl'
 
-            # Expiry: 2h
+            # Expiry: 72h
             if not new_status and pred['expires_at'] and datetime.now(timezone.utc) >= pred['expires_at']:
                 new_status = 'expired'
 
@@ -994,7 +994,7 @@ class LearnerThread(threading.Thread):
 
     def run(self):
         logger.info(f"[LEARNER] Thread gestartet — Intervall: alle {self.interval // 3600}h")
-        self._stop_event.wait(3600)
+        self._stop_event.wait(3600 * 6)  # 6h Delay — versetzt zum Default-Scanner (der nach 1h startet)
 
         while not self._stop_event.is_set() and running:
             try:
@@ -1050,6 +1050,10 @@ def scan_symbols(config, symbols):
         cooldown_symbols = {r['symbol'] for r in acur.fetchall()}
         active_symbols = active_symbols | cooldown_symbols
 
+        # Hyperliquid-Coins laden (Short nur für diese)
+        acur.execute("SELECT symbol FROM coin_info WHERE 'hyperliquid' = ANY(exchanges)")
+        hl_symbols = {r['symbol'] for r in acur.fetchall()}
+
         market_context = get_market_context(ccur)
         if market_context:
             logger.info(f"[MKT_CTX] avg_4h={market_context['avg_4h']:+.2f}% breadth_4h={market_context['breadth_4h']:.2f}")
@@ -1077,6 +1081,10 @@ def scan_symbols(config, symbols):
                 signal = analyze_symbol_cnn(ccur, symbol, current_price, market_context=market_context, scan_config=config)
 
                 if signal and signal['confidence'] >= dir_config[signal['direction']]['min_conf']:
+                    # Short nur für Hyperliquid-Coins
+                    if signal['direction'] == 'short' and symbol not in hl_symbols:
+                        continue
+
                     # Momentum-Check
                     ccur.execute("""
                         SELECT pct_30m, pct_60m FROM kline_metrics
@@ -1119,7 +1127,7 @@ def scan_symbols(config, symbols):
                         (user_id, symbol, direction, entry_price, take_profit_price,
                          stop_loss_price, take_profit_pct, stop_loss_pct,
                          confidence, reason, signals, expires_at, scanner_type)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW() + INTERVAL '2 hours', %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW() + INTERVAL '72 hours', %s)
                         RETURNING prediction_id
                     """, (user_id, symbol, signal['direction'], entry,
                           float(tp_price), float(sl_price),

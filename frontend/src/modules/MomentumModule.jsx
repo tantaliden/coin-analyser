@@ -53,6 +53,15 @@ export default function MomentumModule() {
   const [expandedId, setExpandedId] = useState(null)
   const [statsDrill, setStatsDrill] = useState(null) // z.B. {period:'24h',dir:'long',type:'tp'}
   const [resolvedPreds, setResolvedPreds] = useState([])
+  const [statsFilter, setStatsFilter] = useState('all') // 'all' | 'default' | 'cnn_2h'
+  const [statsAll, setStatsAll] = useState({})
+  const [tradeStatsAll, setTradeStatsAll] = useState({})
+  const [inTimeStats, setInTimeStats] = useState({})
+  const [inTimeStats2h, setInTimeStats2h] = useState({})
+  const [inTimeStatsAll, setInTimeStatsAll] = useState({})
+  const [inTimeThreshold, setInTimeThreshold] = useState('')
+  const [inTimeThreshold2h, setInTimeThreshold2h] = useState('')
+  const [inTimeThresholdAll, setInTimeThresholdAll] = useState('')
   const [tradeStats, setTradeStats] = useState({})
   // 2h Scanner State
   const [config2h, setConfig2h] = useState(null)
@@ -111,6 +120,8 @@ export default function MomentumModule() {
       setStats(res.data.stats || {})
       setActivePredictions(res.data.active_predictions || 0)
       setTradeStats(res.data.trade_stats || {})
+      setInTimeStats(res.data.in_time_stats || {})
+      setInTimeThreshold(res.data.in_time_threshold || '10h')
     } catch (err) { console.error('Stats load failed:', err) }
   }, [])
 
@@ -120,7 +131,19 @@ export default function MomentumModule() {
       setStats2h(res.data.stats || {})
       setActivePredictions2h(res.data.active_predictions || 0)
       setTradeStats2h(res.data.trade_stats || {})
+      setInTimeStats2h(res.data.in_time_stats || {})
+      setInTimeThreshold2h(res.data.in_time_threshold || '2h')
     } catch (err) { console.error('Stats 2h load failed:', err) }
+  }, [])
+
+  const loadStatsAll = useCallback(async () => {
+    try {
+      const res = await api.get('/api/v1/momentum/stats', { params: { scanner_type: 'all' } })
+      setStatsAll(res.data.stats || {})
+      setTradeStatsAll(res.data.trade_stats || {})
+      setInTimeStatsAll(res.data.in_time_stats || {})
+      setInTimeThresholdAll(res.data.in_time_threshold || '10h/2h')
+    } catch (err) { console.error('Stats all load failed:', err) }
   }, [])
 
   const loadGroups = useCallback(async () => {
@@ -145,10 +168,10 @@ export default function MomentumModule() {
   }, [])
 
   useEffect(() => {
-    loadConfig(); loadConfig2h(); loadPredictions(); loadPredictions2h(); loadStats(); loadStats2h(); loadGroups()
-    const interval = setInterval(() => { loadPredictions(); loadPredictions2h(); loadStats(); loadStats2h() }, 15000)
+    loadConfig(); loadConfig2h(); loadPredictions(); loadPredictions2h(); loadStats(); loadStats2h(); loadStatsAll(); loadGroups()
+    const interval = setInterval(() => { loadPredictions(); loadPredictions2h(); loadStats(); loadStats2h(); loadStatsAll() }, 15000)
     return () => clearInterval(interval)
-  }, [loadConfig, loadConfig2h, loadPredictions, loadPredictions2h, loadStats, loadStats2h, loadGroups])
+  }, [loadConfig, loadConfig2h, loadPredictions, loadPredictions2h, loadStats, loadStats2h, loadStatsAll, loadGroups])
 
   useEffect(() => { loadPredictions(); loadPredictions2h() }, [statusFilter, hideShort, hideTradedFilter])
 
@@ -363,6 +386,10 @@ export default function MomentumModule() {
 
   // Stats nach direction filtern
   const getStatsKey = (period) => statsDirection ? `${statsDirection}_${period}` : period
+  const filteredStats = statsFilter === 'all' ? statsAll : statsFilter === 'cnn_2h' ? stats2h : stats
+  const filteredTradeStats = statsFilter === 'all' ? tradeStatsAll : statsFilter === 'cnn_2h' ? tradeStats2h : tradeStats
+  const filteredInTime = statsFilter === 'all' ? inTimeStatsAll : statsFilter === 'cnn_2h' ? inTimeStats2h : inTimeStats
+  const filteredThreshold = statsFilter === 'all' ? inTimeThresholdAll : statsFilter === 'cnn_2h' ? inTimeThreshold2h : inTimeThreshold
   const currentStats = tab === 'stats' ? stats : stats2h
   const currentTradeStats = tab === 'stats' ? tradeStats : tradeStats2h
   const currentActive = tab === 'predictions_2h' ? activePredictions2h : activePredictions
@@ -403,7 +430,7 @@ export default function MomentumModule() {
             {hideShort ? <Eye size={12} /> : <EyeOff size={12} />}
             <span style={{ fontSize: '0.5625rem' }}>S</span>
           </button>
-          <button onClick={() => { loadPredictions(); loadPredictions2h(); loadStats(); loadStats2h() }} style={{ ...s.btn, background: 'var(--color-bg)' }}><RefreshCw size={12} /></button>
+          <button onClick={() => { loadPredictions(); loadPredictions2h(); loadStats(); loadStats2h(); loadStatsAll() }} style={{ ...s.btn, background: 'var(--color-bg)' }}><RefreshCw size={12} /></button>
           {tab === 'predictions_2h'
             ? <button onClick={() => setShowSettings2h(!showSettings2h)} style={{ ...s.btn, background: showSettings2h ? '#3b82f6' : 'var(--color-bg)', color: showSettings2h ? '#fff' : 'var(--color-text)' }}><Settings size={12} /></button>
             : <button onClick={() => setShowSettings(!showSettings)} style={{ ...s.btn, background: showSettings ? '#3b82f6' : 'var(--color-bg)', color: showSettings ? '#fff' : 'var(--color-text)' }}><Settings size={12} /></button>
@@ -627,6 +654,8 @@ export default function MomentumModule() {
         {tab === 'stats' && (() => {
           // Filter resolved predictions fuer drill-down
           const drillPreds = statsDrill ? resolvedPreds.filter(p => {
+            if (statsFilter === 'default' && p.scanner_type && p.scanner_type !== 'default') return false
+            if (statsFilter === 'cnn_2h' && p.scanner_type !== 'cnn_2h') return false
             if (statsDrill.dir && p.direction !== statsDrill.dir) return false
             const now = new Date()
             if (statsDrill.period === '24h' && (now - new Date(p.detected_at)) > 86400000) return false
@@ -703,13 +732,20 @@ export default function MomentumModule() {
 
           return (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: 4 }}>
+              {/* Scanner-Filter */}
+              <div style={{ display: 'flex', gap: 0 }}>
+                {[['all', 'Gesamt'], ['default', 'Scanner'], ['cnn_2h', '2h']].map(([val, label]) => (
+                  <button key={val} onClick={() => { setStatsFilter(val); setStatsDrill(null) }}
+                    style={{ ...s.tab(statsFilter === val), fontSize: '0.625rem', padding: '3px 10px' }}>{label}</button>
+                ))}
+              </div>
               {/* Trade P/L */}
-              {Object.keys(tradeStats).length > 0 && (
+              {Object.keys(filteredTradeStats).length > 0 && (
                 <div style={{ padding: '6px 8px', background: 'var(--color-bg)', borderRadius: 6, border: '1px solid var(--color-border)' }}>
                   <div style={{ fontWeight: 700, fontSize: '0.75rem', marginBottom: 4 }}>Trades (echtes Geld)</div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6, fontSize: '0.625rem' }}>
                     {['7d', '30d', 'all'].map(p => {
-                      const ts = tradeStats[p]
+                      const ts = filteredTradeStats[p]
                       if (!ts || !ts.trades) return null
                       const pnlColor = ts.realized_pnl >= 0 ? '#22c55e' : '#ef4444'
                       return (
@@ -724,10 +760,39 @@ export default function MomentumModule() {
                   </div>
                 </div>
               )}
+              {/* In-Time Stats */}
+              {filteredInTime && Object.keys(filteredInTime).length > 0 && (
+                <div style={{ padding: '6px 8px', background: 'var(--color-bg)', borderRadius: 6, border: '1px solid var(--color-border)' }}>
+                  <div style={{ fontWeight: 700, fontSize: '0.75rem', marginBottom: 4 }}>Erfolgreich innerhalb Zeitfenster ({filteredThreshold})</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6, fontSize: '0.625rem' }}>
+                    {['7d', '30d', 'all'].map(p => {
+                      const it = filteredInTime[p]
+                      if (!it) return null
+                      const itColor = it.in_time_hit_rate >= 60 ? '#22c55e' : it.in_time_hit_rate >= 50 ? '#f59e0b' : '#ef4444'
+                      const otColor = it.out_of_time_hit_rate >= 60 ? '#22c55e' : it.out_of_time_hit_rate >= 50 ? '#f59e0b' : '#ef4444'
+                      return (
+                        <div key={p} style={{ textAlign: 'center' }}>
+                          <div style={{ fontWeight: 600, marginBottom: 2 }}>{p === 'all' ? 'Gesamt' : p}</div>
+                          <div style={{ marginBottom: 2 }}>
+                            <span style={s.label}>In Time: </span>
+                            <span style={{ color: itColor, fontWeight: 700 }}>{it.in_time_hit_rate}%</span>
+                            <span style={{ color: 'var(--color-muted)', fontSize: '0.5rem' }}> ({it.in_time_correct}/{it.in_time_total})</span>
+                          </div>
+                          <div>
+                            <span style={s.label}>Später: </span>
+                            <span style={{ color: otColor, fontWeight: 700 }}>{it.out_of_time_hit_rate}%</span>
+                            <span style={{ color: 'var(--color-muted)', fontSize: '0.5rem' }}> ({it.out_of_time_correct}/{it.out_of_time_total})</span>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
               {['24h', '7d', '30d', 'all'].map(period => {
-                const st = stats[getStatsKey(period)]
-                const stL = stats[`long_${period}`]
-                const stS = stats[`short_${period}`]
+                const st = filteredStats[getStatsKey(period)]
+                const stL = filteredStats[`long_${period}`]
+                const stS = filteredStats[`short_${period}`]
                 if (!st) return <div key={period} style={{ color: 'var(--color-muted)', fontSize: '0.6875rem' }}>{period}: Keine Daten</div>
                 return (
                   <div key={period} style={{ padding: '6px 8px', background: 'var(--color-bg)', borderRadius: 6, border: '1px solid var(--color-border)' }}>

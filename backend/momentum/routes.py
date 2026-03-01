@@ -347,13 +347,58 @@ async def get_stats(scanner_type: Optional[str] = Query(None), current_user: dic
     st = scanner_type or 'default'
     with get_app_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM momentum_stats WHERE user_id = %s AND scanner_type = %s", (user_id, st))
-            stats = {r['period']: dict(r) for r in cur.fetchall()}
-            if st == 'default':
-                cur.execute("SELECT COUNT(*) as c FROM momentum_predictions WHERE user_id = %s AND status = 'active' AND (scanner_type = 'default' OR scanner_type IS NULL)", (user_id,))
+            if st == 'all':
+                # Gesamt über alle Scanner: aus momentum_predictions direkt berechnen
+                time_periods = {
+                    '24h': "detected_at >= NOW() - INTERVAL '24 hours'",
+                    '7d': "detected_at >= NOW() - INTERVAL '7 days'",
+                    '30d': "detected_at >= NOW() - INTERVAL '30 days'",
+                    'all': "TRUE"
+                }
+                stats = {}
+                for period_key, time_where in time_periods.items():
+                    for dir_prefix, dir_where in [('', ''), ('long_', " AND direction = 'long'"), ('short_', " AND direction = 'short'")]:
+                        key = f"{dir_prefix}{period_key}"
+                        cur.execute(f"""
+                            SELECT COUNT(*) as total,
+                                COUNT(*) FILTER (WHERE was_correct = true) as correct,
+                                COUNT(*) FILTER (WHERE was_correct = false) as incorrect,
+                                COUNT(*) FILTER (WHERE status = 'expired') as expired,
+                                AVG(confidence) as avg_confidence,
+                                AVG(actual_result_pct) as avg_result_pct,
+                                MAX(actual_result_pct) as best_result_pct,
+                                MIN(actual_result_pct) as worst_result_pct,
+                                AVG(duration_minutes) as avg_duration_minutes
+                            FROM momentum_predictions
+                            WHERE user_id = %s AND status != 'active' AND {time_where}{dir_where}
+                        """, (user_id,))
+                        row = cur.fetchone()
+                        total = row['total'] or 0
+                        correct = row['correct'] or 0
+                        stats[key] = {
+                            'period': key, 'total_predictions': total,
+                            'correct_predictions': correct,
+                            'incorrect_predictions': row['incorrect'] or 0,
+                            'expired_predictions': row['expired'] or 0,
+                            'avg_confidence': float(row['avg_confidence']) if row['avg_confidence'] else None,
+                            'avg_result_pct': float(row['avg_result_pct']) if row['avg_result_pct'] else None,
+                            'best_result_pct': float(row['best_result_pct']) if row['best_result_pct'] else None,
+                            'worst_result_pct': float(row['worst_result_pct']) if row['worst_result_pct'] else None,
+                            'hit_rate_pct': round(correct / total * 100, 2) if total > 0 else 0,
+                            'avg_duration_minutes': int(row['avg_duration_minutes']) if row['avg_duration_minutes'] else None
+                        }
+                cur.execute("SELECT COUNT(*) as c FROM momentum_predictions WHERE user_id = %s AND status = 'active'", (user_id,))
+                active = cur.fetchone()['c']
+                scanner_filter = ""
             else:
-                cur.execute("SELECT COUNT(*) as c FROM momentum_predictions WHERE user_id = %s AND status = 'active' AND scanner_type = %s", (user_id, st))
-            active = cur.fetchone()['c']
+                cur.execute("SELECT * FROM momentum_stats WHERE user_id = %s AND scanner_type = %s", (user_id, st))
+                stats = {r['period']: dict(r) for r in cur.fetchall()}
+                if st == 'default':
+                    cur.execute("SELECT COUNT(*) as c FROM momentum_predictions WHERE user_id = %s AND status = 'active' AND (scanner_type = 'default' OR scanner_type IS NULL)", (user_id,))
+                else:
+                    cur.execute("SELECT COUNT(*) as c FROM momentum_predictions WHERE user_id = %s AND status = 'active' AND scanner_type = %s", (user_id, st))
+                active = cur.fetchone()['c']
+                scanner_filter = f" AND t.prediction_id IN (SELECT prediction_id FROM momentum_predictions WHERE scanner_type = '{st}')"
 
             # Trade-Stats: echte Käufe/Verkäufe aus trade_history (Momentum-Trades)
             trade_stats = {}
@@ -365,7 +410,7 @@ async def get_stats(scanner_type: Optional[str] = Query(None), current_user: dic
                         COALESCE(SUM(t.quote_amount) FILTER (WHERE t.side = 'buy'), 0) as total_buy,
                         COALESCE(SUM(t.quote_amount) FILTER (WHERE t.side = 'sell'), 0) as total_sell
                     FROM trade_history t
-                    WHERE t.user_id = %s AND t.prediction_id IS NOT NULL {time_filter}
+                    WHERE t.user_id = %s AND t.prediction_id IS NOT NULL {time_filter}{scanner_filter}
                 """, (user_id,))
                 row = cur.fetchone()
                 total_buy = float(row['total_buy'] or 0)
@@ -377,7 +422,57 @@ async def get_stats(scanner_type: Optional[str] = Query(None), current_user: dic
                     'realized_pnl': round(total_sell - total_buy, 2)
                 }
 
-            return {"stats": stats, "active_predictions": active, "trade_stats": trade_stats}
+            # In-Time Stats: Erfolgreich innerhalb Zeitfenster
+            # Default: 10h (600min), cnn_2h: 2h (120min)
+            in_time_stats = {}
+            time_periods_it = {
+                '7d': "detected_at >= NOW() - INTERVAL '7 days'",
+                '30d': "detected_at >= NOW() - INTERVAL '30 days'",
+                'all': "TRUE"
+            }
+            if st == 'all':
+                threshold_where = "((scanner_type = 'default' AND duration_minutes <= 600) OR (scanner_type = 'cnn_2h' AND duration_minutes <= 120))"
+            elif st == 'cnn_2h':
+                threshold_where = "duration_minutes <= 120"
+            else:
+                threshold_where = "duration_minutes <= 600"
+
+            scanner_where = ""
+            if st == 'cnn_2h':
+                scanner_where = " AND scanner_type = 'cnn_2h'"
+            elif st == 'default':
+                scanner_where = " AND (scanner_type = 'default' OR scanner_type IS NULL)"
+
+            for period, time_where in time_periods_it.items():
+                cur.execute(f"""
+                    SELECT
+                        COUNT(*) FILTER (WHERE {threshold_where}) as in_time_total,
+                        COUNT(*) FILTER (WHERE {threshold_where} AND was_correct) as in_time_correct,
+                        COUNT(*) FILTER (WHERE {threshold_where} AND NOT was_correct) as in_time_incorrect,
+                        COUNT(*) FILTER (WHERE NOT ({threshold_where})) as out_of_time_total,
+                        COUNT(*) FILTER (WHERE NOT ({threshold_where}) AND was_correct) as out_of_time_correct
+                    FROM momentum_predictions
+                    WHERE user_id = %s AND status NOT IN ('active', 'expired')
+                        AND duration_minutes IS NOT NULL AND {time_where}{scanner_where}
+                """, (user_id,))
+                row = cur.fetchone()
+                it_total = row['in_time_total'] or 0
+                it_correct = row['in_time_correct'] or 0
+                ot_total = row['out_of_time_total'] or 0
+                ot_correct = row['out_of_time_correct'] or 0
+                in_time_stats[period] = {
+                    'in_time_total': it_total,
+                    'in_time_correct': it_correct,
+                    'in_time_incorrect': row['in_time_incorrect'] or 0,
+                    'in_time_hit_rate': round(it_correct / it_total * 100, 1) if it_total > 0 else 0,
+                    'out_of_time_total': ot_total,
+                    'out_of_time_correct': ot_correct,
+                    'out_of_time_hit_rate': round(ot_correct / ot_total * 100, 1) if ot_total > 0 else 0
+                }
+
+            threshold_label = "10h" if st == 'default' else "2h" if st == 'cnn_2h' else "10h/2h"
+            return {"stats": stats, "active_predictions": active, "trade_stats": trade_stats,
+                    "in_time_stats": in_time_stats, "in_time_threshold": threshold_label}
 
 # === CORRECTIONS & OPTIMIZATIONS ===
 

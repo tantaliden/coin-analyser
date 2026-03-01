@@ -2083,6 +2083,10 @@ def scan_symbols(config, symbols):
         cooldown_symbols = {r['symbol'] for r in acur.fetchall()}
         active_symbols = active_symbols | cooldown_symbols
 
+        # Hyperliquid-Coins laden (Short nur für diese)
+        acur.execute("SELECT symbol FROM coin_info WHERE 'hyperliquid' = ANY(exchanges)")
+        hl_symbols = {r['symbol'] for r in acur.fetchall()}
+
         # Marktkontext einmal pro Loop holen (alle USDC-Symbole aus kline_metrics)
         market_context = get_market_context(ccur)
         if market_context:
@@ -2115,6 +2119,10 @@ def scan_symbols(config, symbols):
                 signal = analyze_symbol_cnn(ccur, symbol, current_price, market_context=market_context, scan_config=config)
 
                 if signal and signal['confidence'] >= dir_config[signal['direction']]['min_conf']:
+                    # Short nur für Hyperliquid-Coins
+                    if signal['direction'] == 'short' and symbol not in hl_symbols:
+                        continue
+
                     # Filter: erwartete Bewegung muss min_target_pct überschreiten
                     if signal['expected_move_pct'] < (config['min_target_pct'] or 5.0):
                         continue
