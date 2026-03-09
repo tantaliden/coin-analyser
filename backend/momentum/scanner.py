@@ -2028,6 +2028,96 @@ def _get_current_model_accuracy():
     return 91.3  # Initiale Accuracy vom ersten Training
 
 
+LEARNER_HEALTH_LOG = '/opt/coin/logs/learner_health.json'
+
+
+def _log_learner_health(status: str, detail: str = ''):
+    """Schreibt Health-Eintrag für Learner. Health-Check prüft ob 2 Einträge in 26h."""
+    import json as _json
+    entry = {
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'status': status,
+        'detail': detail,
+    }
+    try:
+        entries = []
+        if os.path.exists(LEARNER_HEALTH_LOG):
+            with open(LEARNER_HEALTH_LOG) as f:
+                entries = _json.load(f)
+        entries.append(entry)
+        # Nur letzte 10 Einträge behalten
+        entries = entries[-10:]
+        with open(LEARNER_HEALTH_LOG, 'w') as f:
+            _json.dump(entries, f, indent=2)
+    except Exception as e:
+        logger.error(f"[LEARNER] Health-Log schreiben fehlgeschlagen: {e}")
+
+
+def _load_prediction_feedback_events(days=30):
+    """
+    Lädt eigene Prediction-Ergebnisse als Trainingsbeispiele.
+    - TP-Hit → bestätigt die Richtung (positives Beispiel)
+    - SL-Hit → invertiert die Richtung (negatives Beispiel: CNN lag falsch)
+    So lernt das CNN aus seinen eigenen Fehlern.
+    """
+    try:
+        with learner_db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT symbol, direction, detected_at, status, was_correct,
+                       confidence, actual_result_pct, peak_pct, trough_pct
+                FROM prediction_feedback
+                WHERE resolved_at >= %s - INTERVAL '%s days'
+                  AND status IN ('hit_tp', 'hit_sl')
+            """, (clock.now(), days))
+            rows = cur.fetchall()
+
+        if not rows:
+            logger.info("[LEARNER] Kein Prediction-Feedback vorhanden")
+            return []
+
+        feedback_events = []
+        tp_count = 0
+        sl_count = 0
+
+        for row in rows:
+            if row['status'] == 'hit_tp':
+                # TP-Hit: CNN hatte recht → Richtung beibehalten als Bestätigung
+                feedback_events.append({
+                    'symbol': row['symbol'],
+                    'time': row['detected_at'],
+                    'event_time': row['detected_at'] + timedelta(hours=4),
+                    'duration_min': 240,
+                    'direction': row['direction'],
+                    'best_pct': float(row['actual_result_pct'] or 5.0),
+                    'best_tf': 'prediction_tp',
+                    'source': 'feedback',
+                })
+                tp_count += 1
+
+            elif row['status'] == 'hit_sl':
+                # SL-Hit: CNN lag falsch → invertierte Richtung als Gegenbeispiel
+                inverted = 'short' if row['direction'] == 'long' else 'long'
+                feedback_events.append({
+                    'symbol': row['symbol'],
+                    'time': row['detected_at'],
+                    'event_time': row['detected_at'] + timedelta(hours=4),
+                    'duration_min': 240,
+                    'direction': inverted,
+                    'best_pct': abs(float(row['actual_result_pct'] or 3.0)),
+                    'best_tf': 'prediction_sl',
+                    'source': 'feedback',
+                })
+                sl_count += 1
+
+        logger.info(f"[LEARNER] Prediction-Feedback: {tp_count} TP-Bestätigungen, {sl_count} SL-Korrekturen")
+        return feedback_events
+
+    except Exception as e:
+        logger.error(f"[LEARNER] Prediction-Feedback laden fehlgeschlagen: {e}")
+        return []
+
+
 def run_learning_cycle():
     """Kompletter Lernzyklus: Events laden → Timeframes → Training → Hot-Swap."""
     logger.info("=" * 60)
@@ -2038,19 +2128,29 @@ def run_learning_cycle():
     try:
         # 1. Events laden (letzte 30 Tage)
         events = _load_recent_events(days=30)
+
+        # 1b. Prediction-Feedback als zusätzliche Trainingsbeispiele
+        feedback_events = _load_prediction_feedback_events(days=30)
+        if feedback_events:
+            events.extend(feedback_events)
+            logger.info(f"[LEARNER] Gesamt: {len(events)} Events ({len(events) - len(feedback_events)} kline_metrics + {len(feedback_events)} Feedback)")
+
         if len(events) < 500:
             logger.info(f"[LEARNER] Nur {len(events)} Events, brauche min. 500. Skip.")
+            _log_learner_health('ok', f'Skip: nur {len(events)} Events')
             return
 
         # 2. Timeframe-Daten laden
         events_with_tf = _load_timeframes_for_events(events)
         if len(events_with_tf) < 400:
             logger.info(f"[LEARNER] Nur {len(events_with_tf)} Events mit TF-Daten. Skip.")
+            _log_learner_health('ok', f'Skip: nur {len(events_with_tf)} Events mit TF')
             return
 
         # 3. Neues Modell trainieren
         new_model, new_acc = _train_new_model(events_with_tf)
         if new_model is None:
+            _log_learner_health('ok', 'Training fehlgeschlagen, kein Modell')
             return
 
         # 4. Vergleich mit aktuellem Modell
@@ -2085,10 +2185,12 @@ def run_learning_cycle():
 
             elapsed = (time.time() - t0) / 60
             logger.info(f"[LEARNER] HOT-SWAP: {current_acc:.1f}% → {new_acc:.1f}% (+{new_acc-current_acc:.1f}pp) in {elapsed:.1f}min")
+            _log_learner_health('ok', f'HOT-SWAP {current_acc:.1f}% → {new_acc:.1f}% ({elapsed:.0f}min)')
         else:
             # Kandidat verworfen
             elapsed = (time.time() - t0) / 60
             logger.info(f"[LEARNER] KEIN SWAP: Neues {new_acc:.1f}% ≤ Aktuelles {current_acc:.1f}% ({elapsed:.1f}min)")
+            _log_learner_health('ok', f'KEIN SWAP {new_acc:.1f}% ≤ {current_acc:.1f}% ({elapsed:.0f}min)')
             # Kandidat-Datei aufräumen
             cand = '/opt/coin/database/data/models/cnn_candidate.pth'
             if os.path.exists(cand):
@@ -2097,6 +2199,7 @@ def run_learning_cycle():
     except Exception as e:
         logger.error(f"[LEARNER] Fehler: {e}")
         logger.error(traceback.format_exc())
+        _log_learner_health('error', str(e))
 
 
 class LearnerThread(threading.Thread):
@@ -2386,23 +2489,12 @@ def main(sim_end=None, sim_step=5):
                 user_id = config['user_id']
                 idle = config['idle_seconds'] or 60
 
-                # 0. Daily Optimizer (08:00 + 20:00 Berlin)
-                opt_key = should_run_optimization()
-                if opt_key:
-                    try:
-                        global _last_optimization_run
-                        # Threshold Optimizer: Discovery-basiert, passt Scanner-Thresholds an
-                        try:
-                            run_threshold_optimization(14, 4.0)
-                            logger.info("[OPTIMIZER] Threshold optimization complete")
-                        except Exception as te:
-                            logger.error(f"[OPTIMIZER] Threshold optimization failed: {te}")
-                        # Legacy TP/SL Optimizer danach
-                        run_daily_optimization(user_id, config)
-                        _last_optimization_run = opt_key
-                    except Exception as oe:
-                        logger.error(f"[OPTIMIZER] Error: {oe}")
-                        logger.error(traceback.format_exc())
+                # 0. Daily Optimizer — DEAKTIVIERT
+                # RL-Agent übernimmt Trade-Selection, CNN-Learner lernt aus Prediction-Feedback.
+                # Optimizer würde Config-Werte ändern die mit dem RL-Agent kollidieren.
+                # opt_key = should_run_optimization()
+                # if opt_key:
+                #     ...
 
                 # 1. Aktive Predictions prüfen
                 logger.info(f"[LOOP] Checking active predictions...")

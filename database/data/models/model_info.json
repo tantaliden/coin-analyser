@@ -1,6 +1,6 @@
 {
-  "test_accuracy": 91.48,
-  "trained_at": "2026-02-27T07:26:17.281091+00:00",
-  "events_used": 40741,
-  "previous_accuracy": 91.3
+  "test_accuracy": 94.09,
+  "trained_at": "2026-03-04T23:55:00+01:00",
+  "events_used": 39649,
+  "previous_accuracy": 93.94
 }

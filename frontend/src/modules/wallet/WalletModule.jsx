@@ -6,14 +6,20 @@ import { useSearchStore } from '../../stores/searchStore'
 export default function WalletModule() {
   const { selectEvents, setPrehistoryMinutes } = useSearchStore()
   const [status, setStatus] = useState({ configured: false })
+  const [hlStatus, setHlStatus] = useState({ configured: false })
   const [balance, setBalance] = useState(null)
+  const [hlBalance, setHlBalance] = useState(null)
   const [positions, setPositions] = useState([])
+  const [hlPositions, setHlPositions] = useState([])
   const [orders, setOrders] = useState([])
+  const [hlOrders, setHlOrders] = useState([])
   const [history, setHistory] = useState([])
   const [realizedPnl, setRealizedPnl] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [activeTab, setActiveTab] = useState('positions')
+  const [posSource, setPosSource] = useState('binance')
+  const [ordSource, setOrdSource] = useState('binance')
   const [editingOrder, setEditingOrder] = useState(null)
   const [creatingOrder, setCreatingOrder] = useState(null)
   const [hideWithOrders, setHideWithOrders] = useState(false)
@@ -26,20 +32,46 @@ export default function WalletModule() {
     setLoading(true)
     setError(null)
     try {
-      const statusRes = await api.get('/api/v1/wallet/status')
-      setStatus(statusRes.data)
-      if (!statusRes.data.configured) { setLoading(false); return }
-      const [balRes, posRes, ordRes, histRes, pnlRes] = await Promise.all([
-        api.get('/api/v1/wallet/balance'), api.get('/api/v1/wallet/positions'),
-        api.get('/api/v1/wallet/orders'), api.get('/api/v1/wallet/history?days=7'),
-        api.get('/api/v1/wallet/realized-pnl?days=7')
+      const [statusRes, hlStatusRes] = await Promise.all([
+        api.get('/api/v1/wallet/status'),
+        api.get('/api/v1/wallet/hl/status')
       ])
-      if (balRes.data.error) setError(balRes.data.error)
-      else setBalance(balRes.data)
-      setPositions(posRes.data.positions || [])
-      setOrders(ordRes.data.orders || [])
-      setHistory(histRes.data.trades || [])
-      setRealizedPnl(pnlRes.data)
+      setStatus(statusRes.data)
+      setHlStatus(hlStatusRes.data)
+
+      const promises = []
+      if (statusRes.data.configured) {
+        promises.push(
+          api.get('/api/v1/wallet/balance'), api.get('/api/v1/wallet/positions'),
+          api.get('/api/v1/wallet/orders'), api.get('/api/v1/wallet/history?days=7'),
+          api.get('/api/v1/wallet/realized-pnl?days=7')
+        )
+      } else {
+        promises.push(null, null, null, null, null)
+      }
+      if (hlStatusRes.data.configured) {
+        promises.push(
+          api.get('/api/v1/wallet/hl/balance'), api.get('/api/v1/wallet/hl/positions'),
+          api.get('/api/v1/wallet/hl/orders')
+        )
+      } else {
+        promises.push(null, null, null)
+      }
+
+      const results = await Promise.all(promises.map(p => p || Promise.resolve(null)))
+      const [balRes, posRes, ordRes, histRes, pnlRes, hlBalRes, hlPosRes, hlOrdRes] = results
+
+      if (balRes) {
+        if (balRes.data.error) setError(balRes.data.error)
+        else setBalance(balRes.data)
+      }
+      setPositions(posRes?.data?.positions || [])
+      setOrders(ordRes?.data?.orders || [])
+      setHistory(histRes?.data?.trades || [])
+      setRealizedPnl(pnlRes?.data || null)
+      if (hlBalRes) setHlBalance(hlBalRes.data?.error ? null : hlBalRes.data)
+      setHlPositions(hlPosRes?.data?.positions || [])
+      setHlOrders(hlOrdRes?.data?.orders || [])
     } catch (err) { setError('Fehler beim Laden') }
     finally { setLoading(false) }
   }, [])
@@ -102,7 +134,7 @@ export default function WalletModule() {
   const fPct = (v) => v == null ? '-' : `${v >= 0 ? '+' : ''}${fp(v)}%`
   const fDate = (s) => s ? new Date(s).toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-'
 
-  if (!status.configured && !loading) return (
+  if (!status.configured && !hlStatus.configured && !loading) return (
     <div className="h-full flex flex-col items-center justify-center text-zinc-500 p-4">
       <Wallet className="w-8 h-8 mb-2 opacity-50" />
       <p className="text-xs">Kein API-Key konfiguriert</p>
@@ -117,25 +149,41 @@ export default function WalletModule() {
   )
 
   const totalUPnl = positions.reduce((s, p) => s + (p.unrealized_pnl || 0), 0)
+  const hlUPnl = hlPositions.reduce((s, p) => s + (p.unrealized_pnl || 0), 0)
+  const binanceTotal = balance?.total_portfolio || 0
+  const hlTotal = hlBalance?.account_value || 0
+  const grandTotal = binanceTotal + hlTotal
 
   return (
     <div className="h-full flex flex-col overflow-hidden text-xs">
       {/* Balance Bar */}
-      {balance && (
-        <div className="flex items-center gap-3 px-2 py-1.5 border-b border-zinc-700/50 bg-zinc-800/30 flex-shrink-0">
-          <div><span className="text-zinc-500">USDC</span> <span className="font-mono">${fp(balance.usdt_balance)}</span></div>
-          {balance.usdc_balance > 0 && (
-            <div className="flex items-center gap-1">
-              <span className="text-zinc-500">USDC</span>
-              <span className="font-mono text-blue-300">${fp(balance.usdc_balance)}</span>
-              <button onClick={() => { setConvertDialog(true); setConvertAmount(''); setConvertResult(null) }}
-                className="ml-0.5 p-0.5 rounded hover:bg-zinc-600 text-blue-400" title="USDC → USDC konvertieren">
-                <ArrowRightLeft className="w-3 h-3" />
-              </button>
-            </div>
+      {(balance || hlBalance) && (
+        <div className="flex items-center gap-3 px-2 py-1.5 border-b border-zinc-700/50 bg-zinc-800/30 flex-shrink-0 flex-wrap">
+          {balance && (
+            <>
+              <div><span className="text-yellow-500 font-semibold">BIN</span> <span className="font-mono">${fp(binanceTotal)}</span></div>
+              {balance.usdc_balance > 0 && (
+                <div className="flex items-center gap-1">
+                  <span className="text-zinc-500">USDC</span>
+                  <span className="font-mono text-blue-300">${fp(balance.usdc_balance)}</span>
+                  <button onClick={() => { setConvertDialog(true); setConvertAmount(''); setConvertResult(null) }}
+                    className="ml-0.5 p-0.5 rounded hover:bg-zinc-600 text-blue-400" title="USDC → USDT konvertieren">
+                    <ArrowRightLeft className="w-3 h-3" />
+                  </button>
+                </div>
+              )}
+              <div className={totalUPnl >= 0 ? 'text-green-400' : 'text-red-400'}>{fPnl(totalUPnl)}</div>
+            </>
           )}
-          <div><span className="text-zinc-500">Portfolio</span> <span className="font-mono font-semibold">${fp(balance.total_portfolio)}</span></div>
-          <div className={totalUPnl >= 0 ? 'text-green-400' : 'text-red-400'}>{fPnl(totalUPnl)}</div>
+          {balance && hlBalance && <span className="text-zinc-600">|</span>}
+          {hlBalance && (
+            <>
+              <div><span className="text-emerald-500 font-semibold">HL</span> <span className="font-mono">${fp(hlTotal)}</span></div>
+              {hlUPnl !== 0 && <div className={hlUPnl >= 0 ? 'text-green-400' : 'text-red-400'}>{fPnl(hlUPnl)}</div>}
+            </>
+          )}
+          {balance && hlBalance && <span className="text-zinc-600">|</span>}
+          <div><span className="text-zinc-500">Gesamt</span> <span className="font-mono font-semibold">${fp(grandTotal)}</span></div>
           <div className={(realizedPnl?.realized_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}><span className="text-zinc-500">7d</span> {fPnl(realizedPnl?.realized_pnl)}</div>
           <button onClick={loadData} disabled={loading} className="ml-auto p-0.5 hover:bg-zinc-700 rounded">
             <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />
@@ -146,14 +194,22 @@ export default function WalletModule() {
       {/* Tabs */}
       <div className="flex items-center gap-1 px-2 py-1 border-b border-zinc-700/50 flex-shrink-0">
         {[
-          { id: 'positions', label: `Pos (${hideWithOrders ? positions.filter(p => !getOrderForPosition(p.symbol)).length : positions.length})` },
-          { id: 'orders', label: `Orders (${orders.length})` },
+          { id: 'positions', label: `Pos (${posSource === 'binance' ? (hideWithOrders ? positions.filter(p => !getOrderForPosition(p.symbol)).length : positions.length) : hlPositions.length})` },
+          { id: 'orders', label: `Orders (${ordSource === 'binance' ? orders.length : hlOrders.length})` },
           { id: 'history', label: 'Hist' }
         ].map(t => (
           <button key={t.id} onClick={() => setActiveTab(t.id)}
             className={`px-2 py-0.5 rounded ${activeTab === t.id ? 'bg-blue-600 text-white' : 'text-zinc-400 hover:text-white'}`}>{t.label}</button>
         ))}
-        {activeTab === 'positions' && (
+        {(activeTab === 'positions' || activeTab === 'orders') && hlStatus.configured && (
+          <div className="ml-2 flex items-center gap-0.5 bg-zinc-800 rounded px-0.5">
+            <button onClick={() => activeTab === 'positions' ? setPosSource('binance') : setOrdSource('binance')}
+              className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${(activeTab === 'positions' ? posSource : ordSource) === 'binance' ? 'bg-yellow-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>BIN</button>
+            <button onClick={() => activeTab === 'positions' ? setPosSource('hyperliquid') : setOrdSource('hyperliquid')}
+              className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${(activeTab === 'positions' ? posSource : ordSource) === 'hyperliquid' ? 'bg-emerald-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>HL</button>
+          </div>
+        )}
+        {activeTab === 'positions' && posSource === 'binance' && (
           <button onClick={() => setHideWithOrders(!hideWithOrders)}
             className={`ml-auto p-1 rounded ${hideWithOrders ? 'text-blue-400' : 'text-zinc-500'}`}>
             <Filter className="w-3 h-3" />
@@ -163,7 +219,7 @@ export default function WalletModule() {
 
       {/* Content */}
       <div className="flex-1 overflow-auto">
-        {activeTab === 'positions' && (
+        {activeTab === 'positions' && posSource === 'binance' && (
           <table className="w-full">
             <thead className="sticky top-0 bg-zinc-900">
               <tr className="text-zinc-500 text-left">
@@ -221,7 +277,48 @@ export default function WalletModule() {
           </table>
         )}
 
-        {activeTab === 'orders' && (
+        {activeTab === 'positions' && posSource === 'hyperliquid' && (
+          <table className="w-full">
+            <thead className="sticky top-0 bg-zinc-900">
+              <tr className="text-zinc-500 text-left">
+                <th className="px-2 py-1 font-normal">Coin</th>
+                <th className="px-2 py-1 font-normal text-center">Dir</th>
+                <th className="px-2 py-1 font-normal text-right">Size</th>
+                <th className="px-2 py-1 font-normal text-right">Einstieg</th>
+                <th className="px-2 py-1 font-normal text-right">Wert</th>
+                <th className="px-2 py-1 font-normal text-right">uPnL</th>
+                <th className="px-2 py-1 font-normal text-right">ROE</th>
+                <th className="px-2 py-1 font-normal text-right">Hebel</th>
+                <th className="px-2 py-1 font-normal text-right">Liq.</th>
+              </tr>
+            </thead>
+            <tbody>
+              {hlPositions.length === 0 ? (
+                <tr><td colSpan={9} className="text-center py-4 text-zinc-500">Keine offenen Positionen</td></tr>
+              ) : hlPositions.map((pos, i) => (
+                <tr key={i} className="border-t border-zinc-800 hover:bg-zinc-800/50">
+                  <td className="px-2 py-1 font-mono font-medium">{pos.coin}</td>
+                  <td className={`px-2 py-1 text-center font-semibold ${pos.direction === 'long' ? 'text-green-400' : 'text-red-400'}`}>
+                    {pos.direction === 'long' ? 'L' : 'S'}
+                  </td>
+                  <td className="px-2 py-1 text-right font-mono">{fp(pos.size, 4)}</td>
+                  <td className="px-2 py-1 text-right font-mono">${fp(pos.entry_price, 4)}</td>
+                  <td className="px-2 py-1 text-right font-mono">${fp(pos.position_value)}</td>
+                  <td className={`px-2 py-1 text-right font-mono ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {fPnl(pos.unrealized_pnl)}
+                  </td>
+                  <td className={`px-2 py-1 text-right font-mono ${pos.roe_percent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {fPct(pos.roe_percent)}
+                  </td>
+                  <td className="px-2 py-1 text-right font-mono text-amber-400">{pos.leverage}x</td>
+                  <td className="px-2 py-1 text-right font-mono text-zinc-400">{pos.liquidation_price ? `$${fp(pos.liquidation_price, 2)}` : '-'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+
+        {activeTab === 'orders' && ordSource === 'binance' && (
           <table className="w-full">
             <thead className="sticky top-0 bg-zinc-900">
               <tr className="text-zinc-500 text-left">
@@ -260,6 +357,31 @@ export default function WalletModule() {
                   </tr>
                 )
               })}
+            </tbody>
+          </table>
+        )}
+
+        {activeTab === 'orders' && ordSource === 'hyperliquid' && (
+          <table className="w-full">
+            <thead className="sticky top-0 bg-zinc-900">
+              <tr className="text-zinc-500 text-left">
+                <th className="px-2 py-1 font-normal">Coin</th>
+                <th className="px-2 py-1 font-normal">Side</th>
+                <th className="px-2 py-1 font-normal text-right">Preis</th>
+                <th className="px-2 py-1 font-normal text-right">Size</th>
+              </tr>
+            </thead>
+            <tbody>
+              {hlOrders.length === 0 ? (
+                <tr><td colSpan={4} className="text-center py-4 text-zinc-500">Keine offenen Orders</td></tr>
+              ) : hlOrders.map((o, i) => (
+                <tr key={i} className="border-t border-zinc-800 hover:bg-zinc-800/50">
+                  <td className="px-2 py-1 font-mono font-medium">{o.coin}</td>
+                  <td className={`px-2 py-1 ${o.side === 'BUY' ? 'text-green-400' : 'text-red-400'}`}>{o.side}</td>
+                  <td className="px-2 py-1 text-right font-mono">${fp(o.price, 4)}</td>
+                  <td className="px-2 py-1 text-right font-mono">{fp(o.size, 4)}</td>
+                </tr>
+              ))}
             </tbody>
           </table>
         )}

@@ -13,7 +13,7 @@ import subprocess
 import os
 import time
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import pytz
 import psycopg2
 
@@ -297,6 +297,7 @@ def run_health_check():
     critical_services = [
         'analyser-ingestor', 'kline-metrics-live', 'momentum-scanner',
         'coin-analyser-api', 'trade-tracker', 'event-finder',
+        'sentiment-scanner', 'rl-agent',
     ]
     for svc in critical_services:
         if not check_service(f'{svc}.service'):
@@ -306,7 +307,12 @@ def run_health_check():
     status, msg = check_kline_metrics()
     if status != 'OK':
         problems.append(f"Metrics: {msg}")
-    
+
+    # Learner Check
+    status, msg = check_learner_health()
+    if status == 'CRITICAL':
+        problems.append(f"Learner: {msg}")
+
     # Server Checks
     status, msg = check_cpu()
     if status != 'OK':
@@ -347,9 +353,9 @@ login [pw]
 <b>Nach Login:</b>
 status - System-Status
 health - Health-Check jetzt
+balance - Kontostand (BIN + HL)
 metrics - Metrics Coverage (24h)
 backfill - Backfill auslösen
-logs - Letzte Logs
 logs - Letzte Logs
 restart - Services neustarten
 logout
@@ -363,27 +369,62 @@ def cmd_status():
         output = output[:3500] + "\n..."
     return f"<pre>{output}</pre>"
 
+def check_learner_health() -> tuple:
+    """Prüft ob der Learner in den letzten 26h mindestens 2x gelaufen ist."""
+    health_log = '/opt/coin/logs/learner_health.json'
+    try:
+        if not os.path.exists(health_log):
+            return 'WARNING', 'Kein Health-Log'
+        with open(health_log) as f:
+            entries = json.loads(f.read())
+        if not entries:
+            return 'WARNING', 'Log leer'
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=26)
+        recent = [e for e in entries if datetime.fromisoformat(e['timestamp']) > cutoff]
+        ok_runs = [e for e in recent if e.get('status') == 'ok']
+
+        last = entries[-1]
+        last_time = datetime.fromisoformat(last['timestamp'])
+        age_h = (datetime.now(timezone.utc) - last_time).total_seconds() / 3600
+
+        if len(ok_runs) >= 2:
+            return 'OK', f'{len(ok_runs)}x in 26h (letzter vor {age_h:.0f}h)'
+        elif len(ok_runs) == 1:
+            return 'WARNING', f'Nur 1x in 26h (vor {age_h:.0f}h)'
+        else:
+            return 'CRITICAL', f'0x in 26h (letzter vor {age_h:.0f}h)'
+    except Exception as e:
+        return 'WARNING', f'Fehler: {e}'
+
+
 def cmd_health():
     """Manueller Health-Check"""
     lines = []
-    
+
     # Services
     services = [
         'analyser-ingestor', 'kline-metrics-live', 'momentum-scanner',
         'analyser-telegram-bot', 'mcp-coin', 'heartbeat-watchdog',
         'autosearch-worker', 'coin-info-updater', 'event-finder',
         'trade-tracker', 'coin-analyser-api', 'coin-analyser-frontend',
+        'sentiment-scanner', 'rl-agent',
     ]
     for svc in services:
         ok = check_service(f'{svc}.service')
         emoji = "✅" if ok else "❌"
         lines.append(f"{emoji} {svc}")
-    
+
+    # Learner Health
+    status, msg = check_learner_health()
+    emoji = "✅" if status == 'OK' else "⚠️" if status == 'WARNING' else "❌"
+    lines.append(f"{emoji} Learner: {msg}")
+
     # Metrics
     status, msg = check_kline_metrics()
     emoji = "✅" if status == 'OK' else "⚠️" if status == 'WARNING' else "❌"
     lines.append(f"{emoji} Metrics: {msg}")
-    
+
     # Server
     _, msg = check_cpu()
     lines.append(f"💻 {msg}")
@@ -391,7 +432,7 @@ def cmd_health():
     lines.append(f"💻 {msg}")
     _, msg = check_disk()
     lines.append(f"💻 {msg}")
-    
+
     return "🏥 <b>Health Check</b>\n\n" + "\n".join(lines)
 
 def cmd_metrics():
@@ -466,25 +507,100 @@ def cmd_restart():
     s2 = run_command("systemctl is-active analyser-ingestor.service").strip()
     return f"✅ <b>Restart fertig</b>\n\nmetrics: {s1}\ningestor: {s2}"
 
+def cmd_balance():
+    """Kontostand Binance + Hyperliquid + Gesamt"""
+    import sys
+    sys.path.insert(0, '/opt/coin/backend')
+    lines = []
+    binance_total = 0
+    hl_total = 0
+
+    # Binance
+    try:
+        from auth.auth import decrypt_value
+        with open('/opt/coin/settings.json') as f:
+            app_settings = json.load(f)
+        app_db = app_settings['databases']['app']
+        conn = psycopg2.connect(
+            dbname=app_db['name'], user=app_db['user'], password=app_db['password'],
+            host=app_db['host'], port=app_db['port']
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT binance_api_key_encrypted, binance_api_secret_encrypted, binance_api_valid FROM users WHERE user_id = 1")
+        user = cur.fetchone()
+        if user and user[0] and user[2]:
+            from binance.client import Client as BinanceClient
+            client = BinanceClient(decrypt_value(user[0]), decrypt_value(user[1]))
+            account = client.get_account()
+            usdc_bal = 0
+            pos_val = 0
+            for asset in account.get('balances', []):
+                total = float(asset['free']) + float(asset['locked'])
+                if total > 0:
+                    if asset['asset'] == 'USDC':
+                        usdc_bal = total
+                    else:
+                        try:
+                            ticker = client.get_symbol_ticker(symbol=f"{asset['asset']}USDC")
+                            pos_val += total * float(ticker['price'])
+                        except:
+                            pass
+            binance_total = usdc_bal + pos_val
+            lines.append(f"🟡 <b>Binance:</b> ${binance_total:,.2f}")
+            if pos_val > 0:
+                lines.append(f"   USDC: ${usdc_bal:,.2f} | Pos: ${pos_val:,.2f}")
+        else:
+            lines.append("🟡 <b>Binance:</b> nicht konfiguriert")
+
+        # Hyperliquid
+        cur.execute("SELECT hyperliquid_wallet_address, hyperliquid_api_valid FROM users WHERE user_id = 1")
+        hl_user = cur.fetchone()
+        conn.close()
+
+        if hl_user and hl_user[0] and hl_user[1]:
+            from hyperliquid.info import Info as HLInfo
+            from hyperliquid.utils import constants as hl_constants
+            info = HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True)
+            state = info.user_state(hl_user[0])
+            margin = state.get("marginSummary", {})
+            hl_total = float(margin.get("accountValue", 0))
+            withdrawable = float(state.get("withdrawable", 0))
+            positions = [a for a in state.get("assetPositions", []) if float(a.get("position", {}).get("szi", 0)) != 0]
+            lines.append(f"🟢 <b>Hyperliquid:</b> ${hl_total:,.2f}")
+            if positions:
+                upnl = sum(float(a["position"].get("unrealizedPnl", 0)) for a in positions)
+                lines.append(f"   {len(positions)} Pos | uPnL: ${upnl:+,.2f} | Free: ${withdrawable:,.2f}")
+        else:
+            lines.append("🟢 <b>Hyperliquid:</b> nicht konfiguriert")
+
+    except Exception as e:
+        lines.append(f"❌ Fehler: {e}")
+
+    grand_total = binance_total + hl_total
+    lines.append(f"\n💰 <b>Gesamt: ${grand_total:,.2f}</b>")
+
+    return "📊 <b>Kontostand</b>\n\n" + "\n".join(lines)
+
+
 def handle_message(text, chat_id):
     text = text.strip()
     parts = text.split()
     cmd = parts[0].lower().lstrip('/') if parts else ""
-    
+
     if str(chat_id) != CHAT_ID:
         return None
-    
+
     if cmd in ('help', 'start', 'hilfe'):
         return cmd_help()
-    
+
     if cmd == 'login':
         locked, remaining = is_locked_out()
         if locked:
             return f"🔒 Gesperrt! Noch {remaining} Min."
-        
+
         if len(parts) < 2:
             return "❌ login [passwort]"
-        
+
         if hash_password(parts[1]) == get_password():
             set_authenticated(chat_id)
             clear_lockout()
@@ -495,14 +611,16 @@ def handle_message(text, chat_id):
             if remaining <= 0:
                 return f"❌ Falsch!\n🔒 {LOCKOUT_MINUTES} Min Sperre!"
             return f"❌ Falsch! Noch {remaining} Versuche."
-    
+
     if not is_authenticated(chat_id):
         return "🔒 Erst: login [passwort]"
-    
+
     if cmd == 'status':
         return cmd_status()
     elif cmd == 'health':
         return cmd_health()
+    elif cmd == 'balance':
+        return cmd_balance()
     elif cmd == 'metrics':
         return cmd_metrics()
     elif cmd == 'backfill':

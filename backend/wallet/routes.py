@@ -1,4 +1,4 @@
-"""WALLET ROUTES - Binance Account Integration (vollständig aus altem Analyser)"""
+"""WALLET ROUTES - Binance + Hyperliquid Account Integration"""
 import json
 from pathlib import Path
 from typing import Optional
@@ -6,6 +6,8 @@ from pydantic import BaseModel
 from fastapi import APIRouter, Depends
 from binance.client import Client as BinanceClient
 from binance.exceptions import BinanceAPIException
+from hyperliquid.info import Info as HLInfo
+from hyperliquid.utils import constants as hl_constants
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from shared.database import get_app_db
@@ -351,4 +353,118 @@ async def convert_usdc_to_usdt(request: ConvertRequest, current_user: dict = Dep
         return {"error": f"Binance API Fehler: {e.message}"}
     except Exception as e:
         print(f"[WALLET] Convert error: {e}")
+        return {"error": str(e)}
+
+
+# ========== HYPERLIQUID ==========
+
+def get_user_hl_address(user_id: int):
+    """Haupt-Wallet-Adresse (0x...) aus DB holen. Für Read-Zugriff reicht die Adresse allein."""
+    with get_app_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT hyperliquid_wallet_address, hyperliquid_api_valid FROM users WHERE user_id = %s", (user_id,))
+            user = cur.fetchone()
+    if not user or not user['hyperliquid_wallet_address'] or not user['hyperliquid_api_valid']:
+        return None
+    return user['hyperliquid_wallet_address']
+
+
+def get_hl_info():
+    return HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True)
+
+
+@router.get("/hl/status")
+async def get_hl_status(current_user: dict = Depends(get_current_user)):
+    address = get_user_hl_address(current_user['user_id'])
+    return {"configured": address is not None}
+
+
+@router.get("/hl/balance")
+async def get_hl_balance(current_user: dict = Depends(get_current_user)):
+    address = get_user_hl_address(current_user['user_id'])
+    if not address:
+        return {"error": "Kein gültiger Hyperliquid Key konfiguriert"}
+    try:
+        info = get_hl_info()
+        state = info.user_state(address)
+        margin = state.get("marginSummary", {})
+        account_value = float(margin.get("accountValue", 0))
+        margin_used = float(margin.get("totalMarginUsed", 0))
+        notional_pos = float(margin.get("totalNtlPos", 0))
+        withdrawable = float(state.get("withdrawable", 0))
+        return {
+            "account_value": round(account_value, 2),
+            "margin_used": round(margin_used, 2),
+            "notional_positions": round(notional_pos, 2),
+            "withdrawable": round(withdrawable, 2)
+        }
+    except Exception as e:
+        print(f"[WALLET-HL] Error getting balance: {e}")
+        return {"error": str(e)}
+
+
+@router.get("/hl/positions")
+async def get_hl_positions(current_user: dict = Depends(get_current_user)):
+    address = get_user_hl_address(current_user['user_id'])
+    if not address:
+        return {"error": "Kein gültiger Hyperliquid Key konfiguriert"}
+    try:
+        info = get_hl_info()
+        state = info.user_state(address)
+        positions = []
+        for asset in state.get("assetPositions", []):
+            pos = asset.get("position", {})
+            szi = float(pos.get("szi", 0))
+            if szi == 0:
+                continue
+            entry_px = float(pos.get("entryPx", 0))
+            position_value = float(pos.get("positionValue", 0))
+            unrealized_pnl = float(pos.get("unrealizedPnl", 0))
+            leverage_info = pos.get("leverage", {})
+            leverage = leverage_info.get("value", 1)
+            leverage_type = leverage_info.get("type", "cross")
+            liquidation_px = pos.get("liquidationPx")
+            margin_used = float(pos.get("marginUsed", 0))
+            roe = float(pos.get("returnOnEquity", 0))
+            positions.append({
+                "coin": pos.get("coin", "?"),
+                "direction": "long" if szi > 0 else "short",
+                "size": abs(szi),
+                "entry_price": entry_px,
+                "position_value": round(position_value, 2),
+                "unrealized_pnl": round(unrealized_pnl, 2),
+                "roe_percent": round(roe * 100, 2),
+                "leverage": leverage,
+                "leverage_type": leverage_type,
+                "liquidation_price": float(liquidation_px) if liquidation_px else None,
+                "margin_used": round(margin_used, 2)
+            })
+        positions.sort(key=lambda x: -abs(x['position_value']))
+        return {"positions": positions}
+    except Exception as e:
+        print(f"[WALLET-HL] Error getting positions: {e}")
+        return {"error": str(e)}
+
+
+@router.get("/hl/orders")
+async def get_hl_orders(current_user: dict = Depends(get_current_user)):
+    address = get_user_hl_address(current_user['user_id'])
+    if not address:
+        return {"error": "Kein gültiger Hyperliquid Key konfiguriert"}
+    try:
+        info = get_hl_info()
+        open_orders = info.open_orders(address)
+        orders = []
+        for order in open_orders:
+            orders.append({
+                "order_id": order.get("oid"),
+                "coin": order.get("coin", "?"),
+                "side": "BUY" if order.get("side") == "B" else "SELL",
+                "price": float(order.get("limitPx", 0)),
+                "size": float(order.get("sz", 0)),
+                "timestamp": order.get("timestamp")
+            })
+        return {"orders": orders}
+    except Exception as e:
+        print(f"[WALLET-HL] Error getting orders: {e}")
         return {"error": str(e)}
