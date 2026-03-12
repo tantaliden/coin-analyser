@@ -1904,7 +1904,7 @@ def _normalize_tf_candles(candles, expected_len):
 
 
 def _train_new_model(events_with_tf):
-    """Trainiert ein neues CNN-Modell und gibt (model, test_accuracy) zurück."""
+    """Trainiert ein neues CNN-Modell und gibt (model, test_accuracy, test_loader, test_count) zurück."""
     TF_EXPECTED = {'5m': 144, '1h': 24, '4h': 12, '1d': 14}
 
     # Tensoren vorbereiten
@@ -1923,10 +1923,14 @@ def _train_new_model(events_with_tf):
     X_1d = np.array(X_1d)
     y = np.array(y_all, dtype=np.float32)
 
-    # Zeitlicher Split 70/30
+    # Zeitlicher Split: Letzte 7 Tage = Test-Set, alles davor = Training
     indices = np.argsort([t.timestamp() if hasattr(t, 'timestamp') else 0 for t in times])
     X_5m, X_1h, X_4h, X_1d, y = X_5m[indices], X_1h[indices], X_4h[indices], X_1d[indices], y[indices]
-    s = int(len(y) * 0.7)
+    sorted_times = [t.replace(tzinfo=None) if hasattr(t, 'tzinfo') and t.tzinfo else t for t in (times[i] for i in indices)]
+    cutoff = max(sorted_times) - timedelta(days=7)
+    s = sum(1 for t in sorted_times if t < cutoff)
+    if s < 100:
+        s = int(len(y) * 0.7)  # Fallback wenn zu wenig Trainingsdaten
 
     train_ds = MultiTFDataset(X_5m[:s], X_1h[:s], X_4h[:s], X_1d[:s], y[:s])
     test_ds  = MultiTFDataset(X_5m[s:], X_1h[s:], X_4h[s:], X_1d[s:], y[s:])
@@ -1966,7 +1970,7 @@ def _train_new_model(events_with_tf):
     for epoch in range(1000):
         if not running:
             logger.info("[LEARNER] Scanner stopping, abort training")
-            return None, 0
+            return None, 0, None, 0
 
         # Train
         model.train()
@@ -2015,17 +2019,32 @@ def _train_new_model(events_with_tf):
     # Bestes Modell laden
     model.load_state_dict(torch.load('/opt/coin/database/data/models/cnn_candidate.pth', weights_only=True))
     model.eval()
-    return model, best_acc
+    return model, best_acc, test_loader, len(y) - s
 
 
-def _get_current_model_accuracy():
-    """Liest die Accuracy des aktuellen Modells aus der letzten Trainings-Info."""
-    info_path = '/opt/coin/database/data/models/model_info.json'
-    if os.path.exists(info_path):
-        with open(info_path) as f:
-            info = json.load(f)
-        return info.get('test_accuracy', 0)
-    return 91.3  # Initiale Accuracy vom ersten Training
+def _eval_model_on_testset(model, test_loader):
+    """Evaluiert ein Modell auf einem Test-Set. Gibt (accuracy, long_correct, long_total, short_correct, short_total) zurück."""
+    model.eval()
+    correct = 0
+    total = 0
+    long_correct = 0
+    long_total = 0
+    short_correct = 0
+    short_total = 0
+    with torch.no_grad():
+        for x5, x1, x4, xd, yb in test_loader:
+            out = model(x5, x1, x4, xd)
+            preds = (torch.sigmoid(out) >= 0.5).float()
+            correct += (preds == yb).sum().item()
+            total += len(yb)
+            long_mask = yb == 1.0
+            long_total += long_mask.sum().item()
+            long_correct += ((preds == yb) & long_mask).sum().item()
+            short_mask = yb == 0.0
+            short_total += short_mask.sum().item()
+            short_correct += ((preds == yb) & short_mask).sum().item()
+    acc = correct / max(total, 1) * 100
+    return acc, long_correct, long_total, short_correct, short_total
 
 
 LEARNER_HEALTH_LOG = '/opt/coin/logs/learner_health.json'
@@ -2148,16 +2167,27 @@ def run_learning_cycle():
             return
 
         # 3. Neues Modell trainieren
-        new_model, new_acc = _train_new_model(events_with_tf)
+        new_model, new_acc, test_loader, test_count = _train_new_model(events_with_tf)
         if new_model is None:
             _log_learner_health('ok', 'Training fehlgeschlagen, kein Modell')
             return
 
-        # 4. Vergleich mit aktuellem Modell
-        current_acc = _get_current_model_accuracy()
-        logger.info(f"[LEARNER] Neues Modell: {new_acc:.1f}% vs Aktuelles: {current_acc:.1f}%")
+        # 4. Fairer Vergleich: Beide Modelle auf den GLEICHEN letzten 7 Tagen
+        old_model = get_cnn_model()
+        new_acc2, new_lc, new_lt, new_sc, new_st = _eval_model_on_testset(new_model, test_loader)
 
-        if new_acc > current_acc:
+        if old_model:
+            import copy
+            old_copy = copy.deepcopy(old_model)
+            old_acc, old_lc, old_lt, old_sc, old_st = _eval_model_on_testset(old_copy, test_loader)
+        else:
+            old_acc, old_lc, old_lt, old_sc, old_st = 0, 0, 0, 0, 0
+
+        logger.info(f"[LEARNER] Vergleich auf letzten 7 Tagen ({test_count} Events):")
+        logger.info(f"[LEARNER]   ALT: {old_acc:.1f}% — Long {old_lc}/{old_lt}, Short {old_sc}/{old_st}")
+        logger.info(f"[LEARNER]   NEU: {new_acc2:.1f}% — Long {new_lc}/{new_lt}, Short {new_sc}/{new_st}")
+
+        if new_acc2 > old_acc:
             # Hot-Swap: Neues Modell übernimmt
             global _cnn_model
             model_path = '/opt/coin/database/data/models/best_cnn_v2.pth'
@@ -2177,20 +2207,25 @@ def run_learning_cycle():
             info_path = '/opt/coin/database/data/models/model_info.json'
             with open(info_path, 'w') as f:
                 json.dump({
-                    'test_accuracy': round(new_acc, 2),
+                    'test_accuracy': round(new_acc2, 2),
+                    'old_accuracy': round(old_acc, 2),
                     'trained_at': clock.now().isoformat(),
                     'events_used': len(events_with_tf),
-                    'previous_accuracy': round(current_acc, 2),
+                    'test_events': test_count,
+                    'new_long': f'{new_lc}/{new_lt}',
+                    'new_short': f'{new_sc}/{new_st}',
+                    'old_long': f'{old_lc}/{old_lt}',
+                    'old_short': f'{old_sc}/{old_st}',
                 }, f, indent=2)
 
             elapsed = (time.time() - t0) / 60
-            logger.info(f"[LEARNER] HOT-SWAP: {current_acc:.1f}% → {new_acc:.1f}% (+{new_acc-current_acc:.1f}pp) in {elapsed:.1f}min")
-            _log_learner_health('ok', f'HOT-SWAP {current_acc:.1f}% → {new_acc:.1f}% ({elapsed:.0f}min)')
+            logger.info(f"[LEARNER] HOT-SWAP: Alt {old_acc:.1f}% → Neu {new_acc2:.1f}% (+{new_acc2-old_acc:.1f}pp) in {elapsed:.1f}min")
+            _log_learner_health('ok', f'HOT-SWAP {old_acc:.1f}% → {new_acc2:.1f}% L:{new_lc}/{new_lt} S:{new_sc}/{new_st} ({elapsed:.0f}min)')
         else:
             # Kandidat verworfen
             elapsed = (time.time() - t0) / 60
-            logger.info(f"[LEARNER] KEIN SWAP: Neues {new_acc:.1f}% ≤ Aktuelles {current_acc:.1f}% ({elapsed:.1f}min)")
-            _log_learner_health('ok', f'KEIN SWAP {new_acc:.1f}% ≤ {current_acc:.1f}% ({elapsed:.0f}min)')
+            logger.info(f"[LEARNER] KEIN SWAP: Neu {new_acc2:.1f}% ≤ Alt {old_acc:.1f}% ({elapsed:.1f}min)")
+            _log_learner_health('ok', f'KEIN SWAP Neu {new_acc2:.1f}% ≤ Alt {old_acc:.1f}% L:{old_lc}/{old_lt} S:{old_sc}/{old_st} ({elapsed:.0f}min)')
             # Kandidat-Datei aufräumen
             cand = '/opt/coin/database/data/models/cnn_candidate.pth'
             if os.path.exists(cand):

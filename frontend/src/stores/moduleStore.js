@@ -20,6 +20,7 @@ const AVAILABLE_MODULES = [
   { id: 'wallet', label: 'Wallet' },
   { id: 'bot', label: 'Trading Bot' },
   { id: 'momentum', label: 'Momentum Scanner' },
+  { id: 'rlagent', label: 'RL-Agent' },
 ]
 
 export const useModuleStore = create((set, get) => ({

@@ -426,11 +426,13 @@ async def get_hl_positions(current_user: dict = Depends(get_current_user)):
             liquidation_px = pos.get("liquidationPx")
             margin_used = float(pos.get("marginUsed", 0))
             roe = float(pos.get("returnOnEquity", 0))
+            current_price = position_value / abs(szi) if abs(szi) > 0 else 0
             positions.append({
                 "coin": pos.get("coin", "?"),
                 "direction": "long" if szi > 0 else "short",
                 "size": abs(szi),
                 "entry_price": entry_px,
+                "current_price": round(current_price, 6),
                 "position_value": round(position_value, 2),
                 "unrealized_pnl": round(unrealized_pnl, 2),
                 "roe_percent": round(roe * 100, 2),

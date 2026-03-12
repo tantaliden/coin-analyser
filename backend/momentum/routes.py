@@ -154,7 +154,7 @@ async def get_predictions(
                 where.append("direction = %s")
                 params.append(direction)
             if hide_traded:
-                where.append("traded = false")
+                where.append("prediction_id NOT IN (SELECT prediction_id FROM rl_positions WHERE prediction_id IS NOT NULL)")
             where_sql = " AND ".join(where)
             cur.execute(f"SELECT COUNT(*) as total FROM momentum_predictions WHERE {where_sql}", params)
             total = cur.fetchone()['total']

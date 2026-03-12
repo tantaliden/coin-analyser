@@ -14,17 +14,18 @@ import GroupsModule from '../modules/groups/GroupsModule'
 import WalletModule from '../modules/wallet/WalletModule'
 import BotModule from '../modules/bot/BotModule'
 import MomentumModule from '../modules/MomentumModule'
+import RLAgentModule from '../modules/RLAgentModule'
 
 const ResponsiveGridLayout = WidthProvider(Responsive)
 
 const MODULE_COMPONENTS = {
   search: SearchModule, searchResults: SearchResultsModule, chart: ChartModule,
-  indicators: IndicatorsModule, groups: GroupsModule, wallet: WalletModule, bot: BotModule, momentum: MomentumModule,
+  indicators: IndicatorsModule, groups: GroupsModule, wallet: WalletModule, bot: BotModule, momentum: MomentumModule, rlagent: RLAgentModule,
 }
 
 const MODULE_TITLES = {
   search: 'Suche', searchResults: 'Suchergebnisse', chart: 'Chart',
-  indicators: 'Indikatoren', groups: 'Coin-Gruppen', wallet: 'Wallet', bot: 'Trading Bot', momentum: 'Momentum Scanner',
+  indicators: 'Indikatoren', groups: 'Coin-Gruppen', wallet: 'Wallet', bot: 'Trading Bot', momentum: 'Momentum Scanner', rlagent: 'RL-Agent',
 }
 
 export default function Dashboard() {

@@ -1,0 +1,256 @@
+import { useState, useEffect } from 'react'
+import { Power, RefreshCw, AlertTriangle, TrendingUp, TrendingDown, Trophy, Zap, Flame, Calendar } from 'lucide-react'
+import api from '../utils/api'
+
+export default function RLAgentModule() {
+  const [status, setStatus] = useState(null)
+  const [config, setConfig] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  const [saving, setSaving] = useState(false)
+  const [localMaxPos, setLocalMaxPos] = useState('')
+  const [localMaxLev, setLocalMaxLev] = useState('')
+  const [localTradeSize, setLocalTradeSize] = useState('')
+
+  const load = async () => {
+    try {
+      const [statusRes, configRes] = await Promise.all([
+        api.get('/api/v1/rl-agent/status'),
+        api.get('/api/v1/rl-agent/config'),
+      ])
+      setStatus(statusRes.data)
+      setConfig(configRes.data)
+      setLocalMaxPos(String(configRes.data.max_concurrent_positions || 50))
+      setLocalMaxLev(String(configRes.data.max_leverage || 10))
+      setLocalTradeSize(String(configRes.data.base_trade_size || 15))
+      setError(null)
+    } catch (e) {
+      setError(e.response?.data?.detail || 'Laden fehlgeschlagen')
+    }
+    setLoading(false)
+  }
+
+  useEffect(() => { load() }, [])
+
+  const toggleService = async () => {
+    setSaving(true)
+    try {
+      const action = status?.service_running ? 'stop' : 'start'
+      await api.post(`/api/v1/rl-agent/service/${action}`)
+      await load()
+    } catch (e) {
+      setError(e.response?.data?.detail || 'Service-Steuerung fehlgeschlagen')
+    }
+    setSaving(false)
+  }
+
+  const updateConfig = async (updates) => {
+    setSaving(true)
+    try {
+      const res = await api.put('/api/v1/rl-agent/config', updates)
+      if (res.data.error) setError(res.data.error)
+      else await load()
+    } catch (e) {
+      setError(e.response?.data?.detail || 'Speichern fehlgeschlagen')
+    }
+    setSaving(false)
+  }
+
+  if (loading) return <div className="text-gray-400 p-4">Laden...</div>
+
+  const wr = status?.total_trades > 0
+    ? (status.winners / status.total_trades * 100).toFixed(0)
+    : '-'
+
+  return (
+    <div className="h-full flex flex-col text-xs">
+      {error && (
+        <div className="p-2 text-red-400 text-sm bg-red-900/30 flex items-center gap-2">
+          <AlertTriangle size={14} /> {error}
+        </div>
+      )}
+
+      {/* Header: Service Toggle */}
+      <div className="p-3 border-b border-gray-700">
+        <div className="flex items-center gap-3 mb-3">
+          <button
+            onClick={toggleService}
+            disabled={saving}
+            className={`flex items-center gap-2 px-4 py-2 rounded font-semibold text-sm transition-colors ${
+              status?.service_running
+                ? 'bg-green-600 hover:bg-green-500'
+                : 'bg-gray-700 hover:bg-gray-600'
+            }`}>
+            <Power size={16} />
+            {status?.service_running ? 'Agent AKTIV' : 'Agent AUS'}
+          </button>
+          <button onClick={load} className="p-2 bg-gray-700 hover:bg-gray-600 rounded" title="Aktualisieren">
+            <RefreshCw size={14} />
+          </button>
+          <span className="text-gray-500 ml-auto">PPO-V3</span>
+        </div>
+
+        {/* Punkte + Profit */}
+        <div className="grid grid-cols-2 gap-3">
+          <div className="bg-gray-800 rounded p-2">
+            <div className="text-gray-400 flex items-center gap-1 mb-1"><Trophy size={12} /> Punkte</div>
+            <div className="text-lg font-mono font-semibold text-yellow-400">
+              {(status?.total_points || 0).toLocaleString('de-DE', { maximumFractionDigits: 0 })}
+            </div>
+            <div className="text-gray-500">Bonus: x{status?.point_bonus || 1.0}</div>
+          </div>
+          <div className="bg-gray-800 rounded p-2">
+            <div className="text-gray-400 flex items-center gap-1 mb-1"><Zap size={12} /> Profit</div>
+            <div className={`text-lg font-mono font-semibold ${(status?.total_profit || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+              ${(status?.total_profit || 0).toLocaleString('de-DE', { minimumFractionDigits: 2 })}
+            </div>
+            <div className="text-gray-500">{status?.open_positions || 0} offen</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Serien & Punkte-Details */}
+      <div className="p-3 border-b border-gray-700">
+        <div className="grid grid-cols-2 gap-3">
+          <div className="bg-gray-800 rounded p-2">
+            <div className="text-gray-400 flex items-center gap-1 mb-1"><Calendar size={12} /> Heute</div>
+            <div className={`font-mono font-semibold ${(status?.day_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+              ${(status?.day_pnl || 0).toFixed(2)}
+            </div>
+            {status?.losing_streak_days >= 2 && (
+              <div className="text-red-400 mt-0.5">
+                Verlust-Serie: {status.losing_streak_days}d (-{Math.min(2 ** (status.losing_streak_days - 2), 20)}%)
+              </div>
+            )}
+            {status?.losing_streak_days === 1 && (
+              <div className="text-yellow-500 mt-0.5">1 Minus-Tag</div>
+            )}
+            {(status?.losing_streak_days || 0) === 0 && (
+              <div className="text-gray-500 mt-0.5">Keine Verlust-Serie</div>
+            )}
+          </div>
+          <div className="bg-gray-800 rounded p-2">
+            <div className="text-gray-400 flex items-center gap-1 mb-1"><Flame size={12} /> Woche</div>
+            <div className={`font-mono font-semibold ${(status?.week_points || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+              {(status?.week_points || 0).toFixed(0)} Pkt
+            </div>
+            {status?.winning_streak_weeks > 0 ? (
+              <div className="text-green-400 mt-0.5">
+                Serie: {status.winning_streak_weeks}w (x{status.week_bonus_multiplier})
+              </div>
+            ) : (
+              <div className="text-gray-500 mt-0.5">Keine Wochen-Serie</div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Config */}
+      <div className="p-3 border-b border-gray-700">
+        <div className="grid grid-cols-3 gap-3">
+          <div>
+            <label className="text-gray-400">Max Positionen</label>
+            <input type="number" value={localMaxPos} min="1" step="1"
+              onChange={e => setLocalMaxPos(e.target.value)}
+              onBlur={() => { const v = parseInt(localMaxPos); if (v >= 1) updateConfig({ max_concurrent_positions: v }) }}
+              onKeyDown={e => { if (e.key === 'Enter') e.target.blur() }}
+              className="input w-full text-sm py-1.5 mt-1" />
+          </div>
+          <div>
+            <label className="text-gray-400">Max Hebel</label>
+            <input type="number" value={localMaxLev} min="1" max="10" step="1"
+              onChange={e => setLocalMaxLev(e.target.value)}
+              onBlur={() => { const v = parseInt(localMaxLev); if (v >= 1 && v <= 10) updateConfig({ max_leverage: v }) }}
+              onKeyDown={e => { if (e.key === 'Enter') e.target.blur() }}
+              className="input w-full text-sm py-1.5 mt-1" />
+          </div>
+          <div>
+            <label className="text-gray-400">Trade-Size ($)</label>
+            <input type="number" value={localTradeSize} min="15" step="5"
+              onChange={e => setLocalTradeSize(e.target.value)}
+              onBlur={() => { const v = parseFloat(localTradeSize); if (v >= 15) updateConfig({ base_trade_size: v }) }}
+              onKeyDown={e => { if (e.key === 'Enter') e.target.blur() }}
+              className="input w-full text-sm py-1.5 mt-1" />
+          </div>
+        </div>
+      </div>
+
+      {/* Performance */}
+      <div className="p-3 border-b border-gray-700">
+        <div className="text-gray-400 font-semibold mb-2">Performance</div>
+        <div className="grid grid-cols-4 gap-2 text-center">
+          <div className="bg-gray-800 rounded p-1.5">
+            <div className="text-gray-500">Trades</div>
+            <div className="font-mono">{status?.total_trades || 0}</div>
+          </div>
+          <div className="bg-gray-800 rounded p-1.5">
+            <div className="text-gray-500">WR</div>
+            <div className="font-mono">{wr}%</div>
+          </div>
+          <div className="bg-gray-800 rounded p-1.5">
+            <div className="text-gray-500">PnL</div>
+            <div className={`font-mono ${(status?.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+              ${(status?.total_pnl || 0).toFixed(2)}
+            </div>
+          </div>
+          <div className="bg-gray-800 rounded p-1.5">
+            <div className="text-gray-500">Ø Hebel</div>
+            <div className="font-mono">{status?.avg_leverage || '-'}x</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Letzte Entscheidungen */}
+      <div className="flex-1 overflow-auto">
+        <div className="p-2 text-gray-400 font-semibold border-b border-gray-700">
+          Letzte Entscheidungen
+        </div>
+        {(!status?.recent_decisions || status.recent_decisions.length === 0) ? (
+          <div className="p-4 text-gray-500 text-center">Noch keine Entscheidungen</div>
+        ) : (
+          <div className="divide-y divide-gray-700/50">
+            {status.recent_decisions.map((d, i) => (
+              <div key={i} className="p-2 flex items-center gap-2">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono font-semibold">{d.symbol?.replace('USDC', '')}</span>
+                    {d.direction && (
+                      <span className={`flex items-center gap-0.5 ${d.direction === 'long' ? 'text-green-400' : 'text-red-400'}`}>
+                        {d.direction === 'long' ? <TrendingUp size={12} /> : <TrendingDown size={12} />}
+                        {d.direction} {d.leverage}x
+                      </span>
+                    )}
+                    {d.action === 0 && !d.in_position && (
+                      <span className="text-gray-500">skip</span>
+                    )}
+                    {d.action === 0 && d.in_position && (
+                      <span className="text-blue-400">halten</span>
+                    )}
+                  </div>
+                  <div className="text-gray-500 mt-0.5 flex gap-2">
+                    {d.reward != null && (
+                      <span className={d.reward >= 0 ? 'text-green-400' : 'text-red-400'}>
+                        R: {d.reward > 0 ? '+' : ''}{d.reward}
+                      </span>
+                    )}
+                    {d.unrealized_pnl != null && d.in_position && (
+                      <span className={d.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}>
+                        PnL: {d.unrealized_pnl > 0 ? '+' : ''}{d.unrealized_pnl}%
+                      </span>
+                    )}
+                    {d.exit_reason && <span>{d.exit_reason}</span>}
+                    {d.timestamp && (
+                      <span className="ml-auto">
+                        {new Date(d.timestamp).toLocaleString('de-DE', { hour: '2-digit', minute: '2-digit' })}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}

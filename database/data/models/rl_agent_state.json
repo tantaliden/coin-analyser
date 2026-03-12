@@ -1,0 +1,18 @@
+{
+  "total_points": 103758.72280094492,
+  "last_processed_id": 15450,
+  "updated_at": "2026-03-12T11:12:42.908132+00:00",
+  "total_profit": 2.2695355520450913,
+  "losing_streak_days": 0,
+  "winning_streak_weeks": 0,
+  "current_day": "2026-03-12",
+  "current_week": "2026-W11",
+  "day_pnl": 1.8698609051459658,
+  "week_points": 113.4811734708295,
+  "last_trade_times": {
+    "NOMUSDC": "2026-03-12T08:34:14.063805+00:00",
+    "COMPUSDC": "2026-03-12T10:28:30.288876+00:00",
+    "TAOUSDC": "2026-03-12T10:28:30.288876+00:00",
+    "RESOLVUSDC": "2026-03-12T10:31:59.758237+00:00"
+  }
+}

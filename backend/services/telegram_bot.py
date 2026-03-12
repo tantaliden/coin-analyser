@@ -358,6 +358,10 @@ metrics - Metrics Coverage (24h)
 backfill - Backfill auslösen
 logs - Letzte Logs
 restart - Services neustarten
+agent - RL-Agent Status
+agent on/off - Agent starten/stoppen
+agent max N - Max Positionen
+agent trade N - Trade-Size ($, ab 15)
 logout
 changepw [alt] [neu]
 
@@ -582,6 +586,154 @@ def cmd_balance():
     return "📊 <b>Kontostand</b>\n\n" + "\n".join(lines)
 
 
+def cmd_agent(args):
+    """RL-Agent Status + Konfiguration.
+
+    agent        → Status anzeigen
+    agent max N  → Max gleichzeitige Positionen setzen (1-50)
+    """
+    try:
+        with open('/opt/coin/settings.json') as f:
+            app_settings = json.load(f)
+        app_db = app_settings['databases']['app']
+        conn = psycopg2.connect(
+            dbname=app_db['name'], user=app_db['user'], password=app_db['password'],
+            host=app_db['host'], port=app_db['port']
+        )
+        cur = conn.cursor()
+
+        # Subcommand: on / off
+        if args and args[0] in ('on', 'off'):
+            action = args[0]
+            if action == 'on':
+                cur.execute("UPDATE rl_agent_config SET is_active = true, updated_at = NOW() WHERE user_id = 1")
+                conn.commit()
+                conn.close()
+                os.system('/usr/bin/systemctl start rl-agent')
+                time.sleep(1)
+                svc_ok = check_service('rl-agent.service')
+                if svc_ok:
+                    return "✅ RL-Agent <b>gestartet</b>"
+                return "⚠️ DB aktiviert, aber Service startet nicht. Logs prüfen!"
+            else:
+                cur.execute("UPDATE rl_agent_config SET is_active = false, updated_at = NOW() WHERE user_id = 1")
+                conn.commit()
+                conn.close()
+                os.system('/usr/bin/systemctl stop rl-agent')
+                return "🔴 RL-Agent <b>gestoppt</b>"
+
+        # Subcommand: max N
+        if args and len(args) >= 2 and args[0] == 'max':
+            try:
+                new_max = int(args[1])
+            except ValueError:
+                conn.close()
+                return "❌ Ungültige Zahl. Bsp: agent max 30"
+            if new_max < 1:
+                conn.close()
+                return "❌ Mindestens 1."
+            cur.execute(
+                "UPDATE rl_agent_config SET max_concurrent_positions = %s, updated_at = NOW() WHERE user_id = 1",
+                (new_max,)
+            )
+            conn.commit()
+            conn.close()
+            return f"✅ Max Positionen auf <b>{new_max}</b> gesetzt."
+
+        # Subcommand: trade N
+        if args and len(args) >= 2 and args[0] == 'trade':
+            try:
+                new_size = float(args[1])
+            except ValueError:
+                conn.close()
+                return "❌ Ungültige Zahl. Bsp: agent trade 20"
+            if new_size < 15:
+                conn.close()
+                return "❌ Mindestens $15."
+            cur.execute(
+                "UPDATE rl_agent_config SET base_trade_size = %s, updated_at = NOW() WHERE user_id = 1",
+                (new_size,)
+            )
+            conn.commit()
+            conn.close()
+            return f"✅ Trade-Size auf <b>${new_size:.0f}</b> gesetzt.\n(Gilt bis 1/100 greift ab $1500 Portfolio)"
+
+        # Status anzeigen
+        cur.execute("SELECT is_active, max_concurrent_positions, max_leverage, base_trade_size FROM rl_agent_config WHERE user_id = 1")
+        config = cur.fetchone()
+
+        cur.execute("SELECT COUNT(*) FROM rl_positions WHERE status = 'open'")
+        open_count = cur.fetchone()[0]
+
+        cur.execute("""
+            SELECT COUNT(*) as total,
+                   COUNT(*) FILTER (WHERE pnl_usd > 0) as winners,
+                   COALESCE(SUM(pnl_usd), 0) as total_pnl
+            FROM rl_positions WHERE status = 'closed'
+        """)
+        perf = cur.fetchone()
+        conn.close()
+
+        # State-Datei für Punkte + Portfolio
+        state = {}
+        state_path = '/opt/coin/database/data/models/rl_agent_state.json'
+        try:
+            with open(state_path) as f:
+                state = json.load(f)
+        except:
+            pass
+
+        total_points = state.get('total_points', 0)
+        portfolio = state.get('portfolio', 0)
+
+        if total_points >= 5000:
+            bonus = '2.0x'
+        elif total_points >= 2000:
+            bonus = '1.5x'
+        elif total_points >= 500:
+            bonus = '1.2x'
+        else:
+            bonus = '1.0x'
+
+        is_active = config[0] if config else False
+        max_pos = config[1] if config else 50
+        max_lev = config[2] if config else 10
+        base_size = float(config[3]) if config and config[3] else 15.0
+
+        status_emoji = "🟢" if is_active else "🔴"
+        svc_ok = check_service('rl-agent.service')
+        svc_emoji = "✅" if svc_ok else "❌"
+
+        total_trades = perf[0] if perf else 0
+        winners = perf[1] if perf else 0
+        total_pnl = float(perf[2]) if perf else 0
+        wr = f"{winners/total_trades*100:.0f}%" if total_trades > 0 else "-"
+
+        lines = [
+            f"🤖 <b>RL-Agent V3</b> (PPO)",
+            f"",
+            f"{status_emoji} Agent: {'AKTIV' if is_active else 'INAKTIV'}",
+            f"{svc_emoji} Service: {'läuft' if svc_ok else 'gestoppt'}",
+            f"",
+            f"📊 <b>Positionen:</b> {open_count}/{max_pos} offen",
+            f"⚙️ Max Hebel: {max_lev}x | Trade: ${base_size:.0f}",
+            f"",
+            f"🏆 <b>Punkte:</b> {total_points:,.0f} (Bonus {bonus})",
+            f"💰 Portfolio: ${portfolio:,.2f}",
+            f"",
+            f"📈 <b>Performance:</b>",
+            f"   {total_trades} Trades | WR: {wr}",
+            f"   PnL: ${total_pnl:+,.2f}",
+            f"",
+            f"💡 <code>agent max N</code> — Max Positionen",
+            f"💡 <code>agent trade N</code> — Trade-Size ($)",
+        ]
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"❌ Fehler: {e}"
+
+
 def handle_message(text, chat_id):
     text = text.strip()
     parts = text.split()
@@ -629,6 +781,8 @@ def handle_message(text, chat_id):
         return cmd_logs()
     elif cmd == 'restart':
         return cmd_restart()
+    elif cmd == 'agent':
+        return cmd_agent(parts[1:])
     elif cmd == 'logout':
         try:
             os.remove(SESSION_FILE)

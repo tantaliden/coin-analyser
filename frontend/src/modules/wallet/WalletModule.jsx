@@ -18,8 +18,8 @@ export default function WalletModule() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [activeTab, setActiveTab] = useState('positions')
-  const [posSource, setPosSource] = useState('binance')
-  const [ordSource, setOrdSource] = useState('binance')
+  const [posSource, setPosSource] = useState('hyperliquid')
+  const [ordSource, setOrdSource] = useState('hyperliquid')
   const [editingOrder, setEditingOrder] = useState(null)
   const [creatingOrder, setCreatingOrder] = useState(null)
   const [hideWithOrders, setHideWithOrders] = useState(false)
@@ -179,6 +179,12 @@ export default function WalletModule() {
           {hlBalance && (
             <>
               <div><span className="text-emerald-500 font-semibold">HL</span> <span className="font-mono">${fp(hlTotal)}</span></div>
+              {hlBalance.account_value > 0 && (
+                <div className="flex items-center gap-1">
+                  <span className="text-zinc-500">Frei</span>
+                  <span className="font-mono text-emerald-300">${fp(hlBalance.account_value - (hlBalance.notional_positions || 0))}</span>
+                </div>
+              )}
               {hlUPnl !== 0 && <div className={hlUPnl >= 0 ? 'text-green-400' : 'text-red-400'}>{fPnl(hlUPnl)}</div>}
             </>
           )}
@@ -285,16 +291,15 @@ export default function WalletModule() {
                 <th className="px-2 py-1 font-normal text-center">Dir</th>
                 <th className="px-2 py-1 font-normal text-right">Size</th>
                 <th className="px-2 py-1 font-normal text-right">Einstieg</th>
-                <th className="px-2 py-1 font-normal text-right">Wert</th>
+                <th className="px-2 py-1 font-normal text-right">Aktuell</th>
                 <th className="px-2 py-1 font-normal text-right">uPnL</th>
                 <th className="px-2 py-1 font-normal text-right">ROE</th>
                 <th className="px-2 py-1 font-normal text-right">Hebel</th>
-                <th className="px-2 py-1 font-normal text-right">Liq.</th>
               </tr>
             </thead>
             <tbody>
               {hlPositions.length === 0 ? (
-                <tr><td colSpan={9} className="text-center py-4 text-zinc-500">Keine offenen Positionen</td></tr>
+                <tr><td colSpan={8} className="text-center py-4 text-zinc-500">Keine offenen Positionen</td></tr>
               ) : hlPositions.map((pos, i) => (
                 <tr key={i} className="border-t border-zinc-800 hover:bg-zinc-800/50">
                   <td className="px-2 py-1 font-mono font-medium">{pos.coin}</td>
@@ -303,7 +308,7 @@ export default function WalletModule() {
                   </td>
                   <td className="px-2 py-1 text-right font-mono">{fp(pos.size, 4)}</td>
                   <td className="px-2 py-1 text-right font-mono">${fp(pos.entry_price, 4)}</td>
-                  <td className="px-2 py-1 text-right font-mono">${fp(pos.position_value)}</td>
+                  <td className="px-2 py-1 text-right font-mono">${fp(pos.current_price, 4)}</td>
                   <td className={`px-2 py-1 text-right font-mono ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                     {fPnl(pos.unrealized_pnl)}
                   </td>
@@ -311,7 +316,6 @@ export default function WalletModule() {
                     {fPct(pos.roe_percent)}
                   </td>
                   <td className="px-2 py-1 text-right font-mono text-amber-400">{pos.leverage}x</td>
-                  <td className="px-2 py-1 text-right font-mono text-zinc-400">{pos.liquidation_price ? `$${fp(pos.liquidation_price, 2)}` : '-'}</td>
                 </tr>
               ))}
             </tbody>
