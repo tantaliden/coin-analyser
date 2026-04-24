@@ -60,6 +60,10 @@ class BucketCollector:
         self.last_emitted_slot_end = None
 
     def add_trade(self, symbol: str, price: float, size: float, side: str, time_ms: int) -> None:
+        # Alte Trades ignorieren (HL WS schickt beim Subscribe manchmal Initial-History).
+        import time as _time
+        if _time.time() * 1000 - time_ms > 120_000:
+            return
         bs = compute_bucket_start(time_ms, self.bucket_seconds)
         key = (symbol, bs)
         b = self.open_buckets.get(key)
