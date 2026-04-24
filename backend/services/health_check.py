@@ -117,14 +117,14 @@ def main():
 
             if not crit:
                 if last_alert_key is not None:
-                    label = cfg.get("server_label", "LIVE")
+                    label = cfg["server_label"]
                     send_telegram(s, f"[HL-Health {label}] recovery — alles OK wieder")
                     last_alert_key = None
             else:
                 alert_key = "|".join(sorted(crit))
                 now = time.time()
                 if alert_key != last_alert_key or (now - last_alert_ts) >= cfg["alert_cooldown_seconds"]:
-                    label = cfg.get("server_label", "LIVE")
+                    label = cfg["server_label"]
                     text = f"[HL-Health {label}] CRITICAL\n" + "\n".join(f"- {m}" for m in crit)
                     if warn:
                         text += "\n(warn: " + "; ".join(warn) + ")"

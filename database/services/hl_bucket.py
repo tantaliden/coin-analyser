@@ -82,7 +82,7 @@ class BucketCollector:
         b.add_trade(price, size, side, time_ms)
 
     def drain(self, now: datetime, latest_ctx: dict, subscribed: set,
-              grace_seconds: float = 1.0) -> List[Bucket]:
+              grace_seconds: float) -> List[Bucket]:
         """Liefert fertige Buckets (echte + synthetic fuer Coins ohne Trade im Slot).
         Synthetic Buckets nutzen mark_px aus latest_ctx, volume/trades=0."""
         from datetime import timedelta, timezone
@@ -138,5 +138,5 @@ class BucketCollector:
         return real + synthetic
 
     # Backward-compat Alias (nicht mehr verwendet)
-    def pop_closed(self, now, grace_seconds: float = 1.0):
+    def pop_closed(self, now, grace_seconds: float):
         return self.drain(now, {}, set(), grace_seconds)

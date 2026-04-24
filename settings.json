@@ -101,7 +101,10 @@
     "ctx_insert_debounce_seconds": 1.0,
     "reconnect_backoff_seconds": 5,
     "flush_check_seconds": 0.5,
-    "lean_mode": true
+    "lean_mode": true,
+    "bucket_grace_seconds": 1.0,
+    "ws_ping_interval": 30,
+    "ws_ping_timeout": 20
   },
   "kline_metrics_updater": {
     "interval_seconds": 60,

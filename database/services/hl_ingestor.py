@@ -110,7 +110,7 @@ async def task_ws(cfg: dict, state: HLState):
     while True:
         try:
             log.info("WS connecting to %s (subscribe %d coins)", url, len(state.subscribed))
-            async with websockets.connect(url, ping_interval=30, ping_timeout=20) as ws:
+            async with websockets.connect(url, ping_interval=cfg["ws_ping_interval"], ping_timeout=cfg["ws_ping_timeout"]) as ws:
                 state.ws_conn = ws
                 for coin in sorted(state.subscribed):
                     for t in ("trades", "activeAssetCtx", "l2Book"):
@@ -197,7 +197,7 @@ async def task_flush(cfg: dict, state: HLState):
         try:
             now = datetime.now(timezone.utc)
             closed = state.bucket_collector.drain(
-                now, state.latest_ctx, state.subscribed, grace_seconds=1.0)
+                now, state.latest_ctx, state.subscribed, grace_seconds=cfg["bucket_grace_seconds"])
             klines_rows = []
             for b in closed:
                 last = state.latest_ctx.get(b.symbol, {}) or {}
