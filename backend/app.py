@@ -27,12 +27,12 @@ app.add_middleware(
 
 # Import routers
 from auth import router as auth_router
-from meta import router as meta_router
+from meta import router as meta_router, predictor_settings_router
 from search import router as search_router
 from groups import router as groups_router
 from coins import router as coins_router
 from indicators import router as indicators_router
-from user import router as user_router
+from user import router as user_router, session_router as user_session_router
 from wallet import router as wallet_router
 from bot import router as bot_router
 from momentum import router as momentum_router
@@ -41,11 +41,13 @@ from rl_agent.routes import router as rl_agent_router
 # Include routers
 app.include_router(auth_router)
 app.include_router(meta_router)
+app.include_router(predictor_settings_router)
 app.include_router(search_router)
 app.include_router(groups_router)
 app.include_router(coins_router)
 app.include_router(indicators_router)
 app.include_router(user_router)
+app.include_router(user_session_router)
 app.include_router(wallet_router)
 app.include_router(bot_router)
 app.include_router(momentum_router)

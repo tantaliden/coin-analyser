@@ -6,6 +6,7 @@ Lädt alle Werte aus naming.js und settings.json
 import os
 import json
 import time
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from fastapi import APIRouter, Depends
@@ -39,26 +40,16 @@ async def health():
                 app_ok = True
     except: pass
     
-    # Momentum Scanner Health (Default + 2h)
-    def _check_scanner_heartbeat(hb_path):
-        info = {}
-        ok = False
-        try:
-            if os.path.exists(hb_path):
-                age_seconds = time.time() - os.path.getmtime(hb_path)
-                if age_seconds < 300:
-                    ok = True
-                    with open(hb_path) as f:
-                        info = json.load(f)
-                info['age_seconds'] = round(age_seconds)
-        except Exception:
-            pass
-        return ok, info
+    # RL-Ensemble Service Check
+    ensemble_ok = False
+    try:
+        result = subprocess.run(['/usr/bin/systemctl', 'is-active', 'rl-agent'],
+                                capture_output=True, text=True, timeout=5)
+        ensemble_ok = result.stdout.strip() == 'active'
+    except Exception:
+        pass
 
-    scanner_ok, scanner_info = _check_scanner_heartbeat('/opt/coin/logs/.scanner_heartbeat')
-    scanner_2h_ok, scanner_2h_info = _check_scanner_heartbeat('/opt/coin/logs/.scanner_2h_heartbeat')
-
-    all_ok = coins_ok and app_ok and scanner_ok and scanner_2h_ok
+    all_ok = coins_ok and app_ok and ensemble_ok
     return {
         "status": "ok" if all_ok else ("degraded" if (coins_ok and app_ok) else "critical"),
         "version": SETTINGS['app']['version'],
@@ -66,13 +57,8 @@ async def health():
             "coins": {"connected": coins_ok},
             "app": {"connected": app_ok}
         },
-        "momentum_scanner": {
-            "healthy": scanner_ok,
-            **scanner_info
-        },
-        "momentum_scanner_2h": {
-            "healthy": scanner_2h_ok,
-            **scanner_2h_info
+        "rl_ensemble": {
+            "healthy": ensemble_ok,
         },
         "timestamp": datetime.utcnow().isoformat()
     }

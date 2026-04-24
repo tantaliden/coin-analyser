@@ -1,12 +1,15 @@
 """
 RL-Agent Trader — Order Execution auf Hyperliquid (bevorzugt) mit Binance Fallback.
-Limit Orders, keine Market Orders.
+Entry: IOC (Immediate or Cancel), Close: IOC (reduce_only), TP/SL: GTC/Trigger.
 """
 import json
 import time
+import logging
 from pathlib import Path
 from decimal import Decimal
 import sys
+
+close_logger = logging.getLogger('rl_closes')
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from shared.database import get_app_db
@@ -31,11 +34,22 @@ def get_hl_credentials(user_id: int = 1):
             row = cur.fetchone()
     if not row or not row["hyperliquid_wallet_address"]:
         return None
-    return {
+    creds = {
         "api_wallet": decrypt_value(row["hyperliquid_api_key_encrypted"]),
         "secret_key": decrypt_value(row["hyperliquid_api_secret_encrypted"]),
         "wallet_address": row["hyperliquid_wallet_address"],
+        "vault_address": None,
     }
+    # Sub-Account aus settings.json (falls konfiguriert)
+    try:
+        with open("/opt/coin/settings.json") as f:
+            s = json.load(f)
+        vault = s.get("hyperliquid", {}).get("vault_address")
+        if vault:
+            creds["vault_address"] = vault
+    except Exception:
+        pass
+    return creds
 
 
 def _hl_account(creds: dict):
@@ -53,7 +67,7 @@ def get_hl_exchange(creds):
         wallet=None,
         base_url=hl_constants.MAINNET_API_URL,
         account_address=creds["wallet_address"],
-        vault_address=None,
+        vault_address=creds.get("vault_address"),
     )
 
 
@@ -158,7 +172,7 @@ def refresh_hl_coin_info():
 def place_limit_order_hl(creds: dict, coin: str, is_buy: bool, size_usd: float,
                          price: float, leverage: int = 1) -> dict:
     """
-    Platziert eine Limit Order auf Hyperliquid.
+    Platziert eine Market Order auf Hyperliquid (SDK market_open mit 5% Slippage).
     Returns: {"success": True, "order_id": ..., "status": ...} oder {"success": False, "error": ...}
     """
     try:
@@ -179,26 +193,16 @@ def place_limit_order_hl(creds: dict, coin: str, is_buy: bool, size_usd: float,
             wallet=_hl_account(creds),
             base_url=hl_constants.MAINNET_API_URL,
             account_address=creds["wallet_address"],
+            vault_address=creds.get("vault_address"),
         )
 
-        # Leverage setzen (max aus DB)
+        # Leverage setzen (IMMER, auch bei 1x — HL merkt sich alten Wert)
         max_lev = coin_info.get("max_leverage", 5)
         leverage = min(leverage, max_lev)
-        if leverage > 1:
-            exchange.update_leverage(leverage, coin, is_cross=True)
+        exchange.update_leverage(leverage, coin, is_cross=True)
 
-        # Preis auf HL-Precision runden (aus coin_info)
-        price_dec = coin_info.get("price_decimals", 5)
-        price = round(price, price_dec)
-
-        # Limit Order
-        order_result = exchange.order(
-            coin,
-            is_buy,
-            quantity,
-            price,
-            {"limit": {"tif": "Gtc"}},  # Good till cancelled
-        )
+        # Market Order via SDK (aggressive IOC, max 0.5% Slippage)
+        order_result = exchange.market_open(coin, is_buy, quantity, slippage=0.005)
 
         if order_result.get("status") == "ok":
             statuses = order_result.get("response", {}).get("data", {}).get("statuses", [])
@@ -227,6 +231,7 @@ def cancel_order_hl(creds: dict, coin: str, order_id: int) -> dict:
             wallet=_hl_account(creds),
             base_url=hl_constants.MAINNET_API_URL,
             account_address=creds["wallet_address"],
+            vault_address=creds.get("vault_address"),
         )
         result = exchange.cancel(coin, order_id)
         return {"success": True, "result": result}
@@ -235,52 +240,102 @@ def cancel_order_hl(creds: dict, coin: str, order_id: int) -> dict:
 
 
 def close_position_hl(creds: dict, coin: str, wallet_address: str) -> dict:
-    """Schließt eine offene Position komplett via Market Order."""
-    try:
-        info = get_hl_info()
-        state = info.user_state(wallet_address)
+    """Schließt eine offene Position via market_close (SDK). 3 Versuche, 10s Timeout."""
+    import concurrent.futures
 
-        # Finde die Position
-        position = None
-        for asset in state.get("assetPositions", []):
-            pos = asset.get("position", {})
-            if pos.get("coin") == coin and float(pos.get("szi", 0)) != 0:
-                position = pos
-                break
+    for attempt in range(1, 4):
+        try:
+            close_logger.info(f"HL_CLOSE_TRY {coin} | Versuch {attempt}/3")
 
-        if not position:
-            return {"success": False, "error": f"Keine offene Position für {coin}"}
+            def _do_close():
+                # Prüfen ob Position existiert
+                info = get_hl_info()
+                state = info.user_state(wallet_address)
+                position = None
+                for asset in state.get("assetPositions", []):
+                    pos = asset.get("position", {})
+                    if pos.get("coin") == coin and float(pos.get("szi", 0)) != 0:
+                        position = pos
+                        break
+                if not position:
+                    return {"success": False, "error": f"Keine offene Position für {coin}"}
 
-        szi = float(position["szi"])
-        is_buy = szi < 0  # Short schließen = kaufen, Long schließen = verkaufen
-        quantity = abs(szi)
+                szi = float(position["szi"])
+                exchange = HLExchange(
+                    wallet=_hl_account(creds),
+                    base_url=hl_constants.MAINNET_API_URL,
+                    account_address=creds["wallet_address"],
+                    vault_address=creds.get("vault_address"),
+                )
 
-        exchange = HLExchange(
-            wallet=_hl_account(creds),
-            base_url=hl_constants.MAINNET_API_URL,
-            account_address=creds["wallet_address"],
-        )
+                # SDK market_close — handhabt Tick-Size + Lot-Size korrekt
+                close_logger.info(f"HL_MARKET_CLOSE {coin} | szi={szi} | slippage=0.2%")
+                result = exchange.market_close(coin, slippage=0.002)
+                return {"raw_result": result}
 
-        # Market close via aggressiver Limit Order
-        mid = info.all_mids()
-        current_price = float(mid.get(coin, 0))
-        if current_price == 0:
-            return {"success": False, "error": f"Kein Preis für {coin}"}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_do_close)
+                result = future.result(timeout=10)
 
-        # Slippage-Toleranz: 0.5% über/unter Mid
-        ci = _get_hl_coin_info(coin)
-        pdec = ci["price_decimals"] if ci else 5
-        close_price = round(current_price * (1.005 if is_buy else 0.995), pdec)
+            if "raw_result" not in result:
+                close_logger.warning(f"HL_CLOSE_ERROR {coin} | {result.get('error')}")
+                return result
 
-        result = exchange.order(
-            coin, is_buy, quantity, close_price,
-            {"limit": {"tif": "Ioc"}},  # Immediate or Cancel
-            reduce_only=True,
-        )
-        return {"success": True, "result": result}
+            raw = result["raw_result"]
 
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+            if raw.get("status") == "ok":
+                statuses = raw.get("response", {}).get("data", {}).get("statuses", [])
+                if statuses and "filled" in statuses[0]:
+                    fill = statuses[0]["filled"]
+                    avg_px = float(fill.get("avgPx", 0))
+                    # Bestätigung: Position wirklich weg?
+                    try:
+                        info2 = get_hl_info()
+                        state2 = info2.user_state(wallet_address)
+                        still_open = False
+                        for asset in state2.get("assetPositions", []):
+                            p = asset.get("position", {})
+                            if p.get("coin") == coin and float(p.get("szi", 0)) != 0:
+                                still_open = True
+                                break
+                        if still_open:
+                            close_logger.error(f"HL_FILL_BUT_STILL_OPEN {coin} | avgPx={avg_px} — Position existiert noch!")
+                            if attempt < 3:
+                                time.sleep(1)
+                                continue
+                            return {"success": False, "error": f"Fill gemeldet aber Position noch offen"}
+                        close_logger.info(f"HL_CONFIRMED {coin} | avgPx={avg_px} | Position bestätigt geschlossen")
+                    except Exception as ve:
+                        close_logger.warning(f"HL_VERIFY_FAILED {coin} | {ve} — nehme Fill als bestätigt")
+                    return {"success": True, "avg_price": avg_px}
+                else:
+                    close_logger.warning(f"HL_NOT_FILLED {coin} | statuses={statuses} | Versuch {attempt}")
+                    if attempt < 3:
+                        time.sleep(1)
+                        continue
+                    return {"success": False, "error": f"Nicht gefüllt nach 3 Versuchen: {statuses}"}
+            else:
+                close_logger.error(f"HL_ORDER_FAILED {coin} | result={raw} | Versuch {attempt}")
+                if attempt < 3:
+                    time.sleep(1)
+                    continue
+                return {"success": False, "error": str(raw)}
+
+        except concurrent.futures.TimeoutError:
+            close_logger.error(f"HL_TIMEOUT {coin} | Versuch {attempt}/3 — 10s Timeout")
+            if attempt < 3:
+                time.sleep(1)
+                continue
+            return {"success": False, "error": f"Timeout nach 3 Versuchen"}
+
+        except Exception as e:
+            close_logger.error(f"HL_EXCEPTION {coin} | {e} | Versuch {attempt}/3")
+            if attempt < 3:
+                time.sleep(1)
+                continue
+            return {"success": False, "error": str(e)}
+
+    return {"success": False, "error": "3 Versuche fehlgeschlagen"}
 
 
 def get_current_prices_hl() -> dict:
@@ -306,6 +361,7 @@ def place_tp_sl_hl(creds: dict, coin: str, is_long: bool, quantity,
             wallet=_hl_account(creds),
             base_url=hl_constants.MAINNET_API_URL,
             account_address=creds["wallet_address"],
+            vault_address=creds.get("vault_address"),
         )
 
         results = {"tp": None, "sl": None}
@@ -363,6 +419,7 @@ def cancel_all_orders_for_coin_hl(creds: dict, coin: str) -> dict:
             wallet=_hl_account(creds),
             base_url=hl_constants.MAINNET_API_URL,
             account_address=creds["wallet_address"],
+            vault_address=creds.get("vault_address"),
         )
 
         cancelled = 0

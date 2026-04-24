@@ -1,16 +1,15 @@
 import { useState, useEffect } from 'react'
-import { Power, RefreshCw, AlertTriangle, TrendingUp, TrendingDown, Trophy, Zap, Flame, Calendar } from 'lucide-react'
+import { Power, RefreshCw, AlertTriangle, TrendingUp, TrendingDown, Zap, Calendar, Settings, Save } from 'lucide-react'
 import api from '../utils/api'
 
 export default function RLAgentModule() {
   const [status, setStatus] = useState(null)
   const [config, setConfig] = useState(null)
+  const [editConfig, setEditConfig] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [saving, setSaving] = useState(false)
-  const [localMaxPos, setLocalMaxPos] = useState('')
-  const [localMaxLev, setLocalMaxLev] = useState('')
-  const [localTradeSize, setLocalTradeSize] = useState('')
+  const [editing, setEditing] = useState(false)
 
   const load = async () => {
     try {
@@ -20,9 +19,7 @@ export default function RLAgentModule() {
       ])
       setStatus(statusRes.data)
       setConfig(configRes.data)
-      setLocalMaxPos(String(configRes.data.max_concurrent_positions || 50))
-      setLocalMaxLev(String(configRes.data.max_leverage || 10))
-      setLocalTradeSize(String(configRes.data.base_trade_size || 15))
+      setEditConfig(configRes.data)
       setError(null)
     } catch (e) {
       setError(e.response?.data?.detail || 'Laden fehlgeschlagen')
@@ -44,12 +41,12 @@ export default function RLAgentModule() {
     setSaving(false)
   }
 
-  const updateConfig = async (updates) => {
+  const saveConfig = async () => {
     setSaving(true)
     try {
-      const res = await api.put('/api/v1/rl-agent/config', updates)
-      if (res.data.error) setError(res.data.error)
-      else await load()
+      await api.put('/api/v1/rl-agent/config', editConfig)
+      setEditing(false)
+      await load()
     } catch (e) {
       setError(e.response?.data?.detail || 'Speichern fehlgeschlagen')
     }
@@ -59,7 +56,7 @@ export default function RLAgentModule() {
   if (loading) return <div className="text-gray-400 p-4">Laden...</div>
 
   const wr = status?.total_trades > 0
-    ? (status.winners / status.total_trades * 100).toFixed(0)
+    ? (status.winners / status.total_trades * 100).toFixed(1)
     : '-'
 
   return (
@@ -70,7 +67,7 @@ export default function RLAgentModule() {
         </div>
       )}
 
-      {/* Header: Service Toggle */}
+      {/* Header */}
       <div className="p-3 border-b border-gray-700">
         <div className="flex items-center gap-3 mb-3">
           <button
@@ -82,95 +79,34 @@ export default function RLAgentModule() {
                 : 'bg-gray-700 hover:bg-gray-600'
             }`}>
             <Power size={16} />
-            {status?.service_running ? 'Agent AKTIV' : 'Agent AUS'}
+            {status?.service_running ? 'Signal AKTIV' : 'Signal AUS'}
           </button>
-          <button onClick={load} className="p-2 bg-gray-700 hover:bg-gray-600 rounded" title="Aktualisieren">
-            <RefreshCw size={14} />
+          <span className="text-gray-500">ML Signal + Trailing Stop</span>
+          <button onClick={load} className="ml-auto px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded flex items-center gap-2" title="Aktualisieren">
+            <RefreshCw size={16} /> Refresh
           </button>
-          <span className="text-gray-500 ml-auto">PPO-V3</span>
         </div>
 
-        {/* Punkte + Profit */}
-        <div className="grid grid-cols-2 gap-3">
-          <div className="bg-gray-800 rounded p-2">
-            <div className="text-gray-400 flex items-center gap-1 mb-1"><Trophy size={12} /> Punkte</div>
-            <div className="text-lg font-mono font-semibold text-yellow-400">
-              {(status?.total_points || 0).toLocaleString('de-DE', { maximumFractionDigits: 0 })}
-            </div>
-            <div className="text-gray-500">Bonus: x{status?.point_bonus || 1.0}</div>
-          </div>
+        {/* Profit + Offen */}
+        <div className="grid grid-cols-3 gap-3">
           <div className="bg-gray-800 rounded p-2">
             <div className="text-gray-400 flex items-center gap-1 mb-1"><Zap size={12} /> Profit</div>
-            <div className={`text-lg font-mono font-semibold ${(status?.total_profit || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              ${(status?.total_profit || 0).toLocaleString('de-DE', { minimumFractionDigits: 2 })}
+            <div className={`text-lg font-mono font-semibold ${(status?.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+              ${(status?.total_pnl || 0).toLocaleString('de-DE', { minimumFractionDigits: 2 })}
             </div>
-            <div className="text-gray-500">{status?.open_positions || 0} offen</div>
           </div>
-        </div>
-      </div>
-
-      {/* Serien & Punkte-Details */}
-      <div className="p-3 border-b border-gray-700">
-        <div className="grid grid-cols-2 gap-3">
           <div className="bg-gray-800 rounded p-2">
             <div className="text-gray-400 flex items-center gap-1 mb-1"><Calendar size={12} /> Heute</div>
-            <div className={`font-mono font-semibold ${(status?.day_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+            <div className={`text-lg font-mono font-semibold ${(status?.day_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
               ${(status?.day_pnl || 0).toFixed(2)}
             </div>
-            {status?.losing_streak_days >= 2 && (
-              <div className="text-red-400 mt-0.5">
-                Verlust-Serie: {status.losing_streak_days}d (-{Math.min(2 ** (status.losing_streak_days - 2), 20)}%)
-              </div>
-            )}
-            {status?.losing_streak_days === 1 && (
-              <div className="text-yellow-500 mt-0.5">1 Minus-Tag</div>
-            )}
-            {(status?.losing_streak_days || 0) === 0 && (
-              <div className="text-gray-500 mt-0.5">Keine Verlust-Serie</div>
-            )}
           </div>
           <div className="bg-gray-800 rounded p-2">
-            <div className="text-gray-400 flex items-center gap-1 mb-1"><Flame size={12} /> Woche</div>
-            <div className={`font-mono font-semibold ${(status?.week_points || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              {(status?.week_points || 0).toFixed(0)} Pkt
+            <div className="text-gray-400 flex items-center gap-1 mb-1"><TrendingUp size={12} /> Offen</div>
+            <div className="text-lg font-mono font-semibold text-blue-400">
+              {status?.open_positions || 0}
             </div>
-            {status?.winning_streak_weeks > 0 ? (
-              <div className="text-green-400 mt-0.5">
-                Serie: {status.winning_streak_weeks}w (x{status.week_bonus_multiplier})
-              </div>
-            ) : (
-              <div className="text-gray-500 mt-0.5">Keine Wochen-Serie</div>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* Config */}
-      <div className="p-3 border-b border-gray-700">
-        <div className="grid grid-cols-3 gap-3">
-          <div>
-            <label className="text-gray-400">Max Positionen</label>
-            <input type="number" value={localMaxPos} min="1" step="1"
-              onChange={e => setLocalMaxPos(e.target.value)}
-              onBlur={() => { const v = parseInt(localMaxPos); if (v >= 1) updateConfig({ max_concurrent_positions: v }) }}
-              onKeyDown={e => { if (e.key === 'Enter') e.target.blur() }}
-              className="input w-full text-sm py-1.5 mt-1" />
-          </div>
-          <div>
-            <label className="text-gray-400">Max Hebel</label>
-            <input type="number" value={localMaxLev} min="1" max="10" step="1"
-              onChange={e => setLocalMaxLev(e.target.value)}
-              onBlur={() => { const v = parseInt(localMaxLev); if (v >= 1 && v <= 10) updateConfig({ max_leverage: v }) }}
-              onKeyDown={e => { if (e.key === 'Enter') e.target.blur() }}
-              className="input w-full text-sm py-1.5 mt-1" />
-          </div>
-          <div>
-            <label className="text-gray-400">Trade-Size ($)</label>
-            <input type="number" value={localTradeSize} min="15" step="5"
-              onChange={e => setLocalTradeSize(e.target.value)}
-              onBlur={() => { const v = parseFloat(localTradeSize); if (v >= 15) updateConfig({ base_trade_size: v }) }}
-              onKeyDown={e => { if (e.key === 'Enter') e.target.blur() }}
-              className="input w-full text-sm py-1.5 mt-1" />
+            <div className="text-gray-500">{status?.trades_today || 0} Trades heute</div>
           </div>
         </div>
       </div>
@@ -188,25 +124,177 @@ export default function RLAgentModule() {
             <div className="font-mono">{wr}%</div>
           </div>
           <div className="bg-gray-800 rounded p-1.5">
-            <div className="text-gray-500">PnL</div>
-            <div className={`font-mono ${(status?.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              ${(status?.total_pnl || 0).toFixed(2)}
-            </div>
+            <div className="text-gray-500">Best</div>
+            <div className="font-mono text-green-400">${(status?.best_trade || 0).toFixed(2)}</div>
           </div>
           <div className="bg-gray-800 rounded p-1.5">
-            <div className="text-gray-500">Ø Hebel</div>
-            <div className="font-mono">{status?.avg_leverage || '-'}x</div>
+            <div className="text-gray-500">Worst</div>
+            <div className="font-mono text-red-400">${(status?.worst_trade || 0).toFixed(2)}</div>
           </div>
         </div>
       </div>
 
-      {/* Letzte Entscheidungen */}
+      {/* Config */}
+      <div className="p-3 border-b border-gray-700">
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-gray-400 font-semibold">Einstellungen <span className="text-gray-600 font-normal text-[10px]">(% nach Hebel)</span></div>
+          {!editing ? (
+            <button onClick={() => setEditing(true)} className="p-1 bg-gray-700 hover:bg-gray-600 rounded" title="Bearbeiten">
+              <Settings size={14} />
+            </button>
+          ) : (
+            <button onClick={saveConfig} disabled={saving} className="flex items-center gap-1 px-2 py-1 bg-blue-600 hover:bg-blue-500 rounded text-white text-xs">
+              <Save size={12} /> Speichern
+            </button>
+          )}
+        </div>
+        <div className="grid grid-cols-3 gap-3">
+          <div>
+            <label className="text-gray-500 text-[10px]">Hebel</label>
+            {editing ? (
+              <select
+                value={editConfig?.max_leverage || 5}
+                onChange={e => setEditConfig({...editConfig, max_leverage: parseInt(e.target.value)})}
+                className="w-full bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded border border-gray-600">
+                {[1,2,3,4,5,6,7,8,9,10].map(v => <option key={v} value={v}>{v}x</option>)}
+              </select>
+            ) : (
+              <div className="bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded">
+                {config?.max_leverage || 5}x
+              </div>
+            )}
+          </div>
+          <div>
+            <label className="text-gray-500 text-[10px]">Max Positionen</label>
+            {editing ? (
+              <input type="number" min="1" max="20"
+                value={editConfig?.max_concurrent_positions || 10}
+                onChange={e => setEditConfig({...editConfig, max_concurrent_positions: parseInt(e.target.value)})}
+                className="w-full bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded border border-gray-600" />
+            ) : (
+              <div className="bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded">
+                {config?.max_concurrent_positions || 10}
+              </div>
+            )}
+          </div>
+          <div>
+            <label className="text-gray-500 text-[10px]">Trade-Size ($)</label>
+            {editing ? (
+              <input type="number" min="10" step="5"
+                value={editConfig?.base_trade_size || 20}
+                onChange={e => setEditConfig({...editConfig, base_trade_size: parseFloat(e.target.value)})}
+                className="w-full bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded border border-gray-600" />
+            ) : (
+              <div className="bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded">
+                ${config?.base_trade_size || 20}
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="grid grid-cols-3 gap-3 mt-2">
+          <div>
+            <label className="text-gray-500 text-[10px]">Confidence</label>
+            {editing ? (
+              <input type="number" min="0.3" max="0.99" step="0.05"
+                value={editConfig?.confidence_threshold || 0.6}
+                onChange={e => setEditConfig({...editConfig, confidence_threshold: parseFloat(e.target.value)})}
+                className="w-full bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded border border-gray-600" />
+            ) : (
+              <div className="bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded">
+                {((config?.confidence_threshold || 0.6) * 100).toFixed(0)}%
+              </div>
+            )}
+          </div>
+          <div>
+            <label className="text-gray-500 text-[10px]">Trail-Stop</label>
+            {editing ? (
+              <input type="number" min="0.5" max="10" step="0.5"
+                value={editConfig?.trailing_stop_pct || 2.0}
+                onChange={e => setEditConfig({...editConfig, trailing_stop_pct: parseFloat(e.target.value)})}
+                className="w-full bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded border border-gray-600" />
+            ) : (
+              <div className="bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded">
+                {config?.trailing_stop_pct || 2.0}%
+              </div>
+            )}
+          </div>
+          <div>
+            <label className="text-gray-500 text-[10px]">Stop-Loss</label>
+            {editing ? (
+              <input type="number" min="1" max="20" step="0.5"
+                value={editConfig?.sl_pct || 3.0}
+                onChange={e => setEditConfig({...editConfig, sl_pct: parseFloat(e.target.value)})}
+                className="w-full bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded border border-gray-600" />
+            ) : (
+              <div className="bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded">
+                {config?.sl_pct || 3.0}%
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="grid grid-cols-3 gap-3 mt-2">
+          <div>
+            <label className="text-gray-500 text-[10px]">Take-Profit</label>
+            {editing ? (
+              <input type="number" min="0" max="50" step="1"
+                value={editConfig?.tp_pct || 0}
+                onChange={e => setEditConfig({...editConfig, tp_pct: parseFloat(e.target.value)})}
+                className="w-full bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded border border-gray-600" />
+            ) : (
+              <div className="bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded">
+                {config?.tp_pct ? config.tp_pct + '%' : 'aus'}
+              </div>
+            )}
+          </div>
+          <div>
+            <label className="text-gray-500 text-[10px]">Timeout (Min)</label>
+            {editing ? (
+              <input type="number" min="0" max="1440" step="30"
+                value={editConfig?.timeout_minutes || 0}
+                onChange={e => setEditConfig({...editConfig, timeout_minutes: parseInt(e.target.value)})}
+                className="w-full bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded border border-gray-600" />
+            ) : (
+              <div className="bg-gray-800 text-gray-300 font-mono text-sm py-1.5 px-2 mt-1 rounded">
+                {config?.timeout_minutes ? config.timeout_minutes + 'm' : 'aus'}
+              </div>
+            )}
+          </div>
+        </div>
+        {/* TS Verschärfung */}
+        <div className="flex items-center gap-3 mt-2">
+          {editing ? (
+            <>
+              <label className="flex items-center gap-1.5 text-gray-400 cursor-pointer">
+                <input type="checkbox"
+                  checked={editConfig?.ts_tighten_enabled || false}
+                  onChange={e => setEditConfig({...editConfig, ts_tighten_enabled: e.target.checked})}
+                  className="rounded" />
+                <span className="text-[10px]">TS verschärfen ab</span>
+              </label>
+              <input type="number" min="1" max="30" step="1"
+                value={editConfig?.ts_tighten_threshold || 5}
+                onChange={e => setEditConfig({...editConfig, ts_tighten_threshold: parseFloat(e.target.value)})}
+                disabled={!editConfig?.ts_tighten_enabled}
+                className="w-16 bg-gray-800 text-gray-300 font-mono text-sm py-1 px-2 rounded border border-gray-600 disabled:opacity-40" />
+              <span className="text-gray-500 text-[10px]">% n. Hebel (TS halbiert)</span>
+            </>
+          ) : (
+            config?.ts_tighten_enabled ? (
+              <span className="text-gray-400 text-[10px]">TS verschärft ab {config.ts_tighten_threshold}% n. Hebel</span>
+            ) : (
+              <span className="text-gray-500 text-[10px]">TS Verschärfung: aus</span>
+            )
+          )}
+        </div>
+      </div>
+
+      {/* Letzte Trades */}
       <div className="flex-1 overflow-auto">
         <div className="p-2 text-gray-400 font-semibold border-b border-gray-700">
-          Letzte Entscheidungen
+          Letzte Trades
         </div>
         {(!status?.recent_decisions || status.recent_decisions.length === 0) ? (
-          <div className="p-4 text-gray-500 text-center">Noch keine Entscheidungen</div>
+          <div className="p-4 text-gray-500 text-center">Noch keine Trades</div>
         ) : (
           <div className="divide-y divide-gray-700/50">
             {status.recent_decisions.map((d, i) => (
@@ -220,25 +308,17 @@ export default function RLAgentModule() {
                         {d.direction} {d.leverage}x
                       </span>
                     )}
-                    {d.action === 0 && !d.in_position && (
-                      <span className="text-gray-500">skip</span>
-                    )}
-                    {d.action === 0 && d.in_position && (
-                      <span className="text-blue-400">halten</span>
+                    {d.exit_reason && (
+                      <span className="text-gray-500 text-[10px] bg-gray-800 px-1 rounded">{d.exit_reason}</span>
                     )}
                   </div>
                   <div className="text-gray-500 mt-0.5 flex gap-2">
-                    {d.reward != null && (
-                      <span className={d.reward >= 0 ? 'text-green-400' : 'text-red-400'}>
-                        R: {d.reward > 0 ? '+' : ''}{d.reward}
-                      </span>
-                    )}
-                    {d.unrealized_pnl != null && d.in_position && (
+                    {d.unrealized_pnl != null && (
                       <span className={d.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}>
                         PnL: {d.unrealized_pnl > 0 ? '+' : ''}{d.unrealized_pnl}%
                       </span>
                     )}
-                    {d.exit_reason && <span>{d.exit_reason}</span>}
+                    {d.pos_status && <span className={d.pos_status === 'open' ? 'text-blue-400' : 'text-gray-500'}>{d.pos_status}</span>}
                     {d.timestamp && (
                       <span className="ml-auto">
                         {new Date(d.timestamp).toLocaleString('de-DE', { hour: '2-digit', minute: '2-digit' })}

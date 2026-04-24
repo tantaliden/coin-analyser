@@ -13,10 +13,9 @@ from auth.auth import get_current_user
 
 router = APIRouter(prefix="/api/v1/rl-agent", tags=["rl-agent"])
 
-MODEL_PATH = Path("/opt/coin/database/data/models/rl_ppo_trading_v3.zip")
-STATE_PATH = Path("/opt/coin/database/data/models/rl_agent_state.json")
-RESULTS_PATH = Path("/opt/coin/logs/rl_backtest_v3_results.json")
-TRADES_LOG_PATH = Path("/opt/coin/logs/rl_backtest_v3_trades.json")
+MODEL_PATH = Path("/opt/coin/database/data/models/signal_model_best.pth")
+STATE_PATH = Path("/opt/coin/database/data/models/signal_service_state.json")
+SERVICE_NAME = "signal-service"
 
 
 class RLConfigUpdate(BaseModel):
@@ -24,6 +23,13 @@ class RLConfigUpdate(BaseModel):
     max_leverage: Optional[int] = None
     max_concurrent_positions: Optional[int] = None
     base_trade_size: Optional[float] = None
+    confidence_threshold: Optional[float] = None
+    trailing_stop_pct: Optional[float] = None
+    sl_pct: Optional[float] = None
+    tp_pct: Optional[float] = None
+    timeout_minutes: Optional[int] = None
+    ts_tighten_enabled: Optional[bool] = None
+    ts_tighten_threshold: Optional[float] = None
 
 
 @router.get("/config")
@@ -40,15 +46,29 @@ async def get_rl_config(current_user: dict = Depends(get_current_user)):
                 )
                 conn.commit()
                 return {
-                    "is_active": False, "max_leverage": 10,
-                    "max_concurrent_positions": 50,
-                    "base_trade_size": 15.0,
+                    "is_active": False, "max_leverage": 5,
+                    "max_concurrent_positions": 10,
+                    "base_trade_size": 20.0,
+                    "confidence_threshold": 0.60,
+                    "trailing_stop_pct": 2.0,
+                    "sl_pct": 3.0,
+                    "tp_pct": 0,
+                    "timeout_minutes": 240,
+                    "ts_tighten_enabled": False,
+                    "ts_tighten_threshold": 5.0,
                 }
     return {
         "is_active": config["is_active"],
         "max_leverage": config["max_leverage"],
         "max_concurrent_positions": config["max_concurrent_positions"],
-        "base_trade_size": float(config["base_trade_size"]) if config.get("base_trade_size") else 15.0,
+        "base_trade_size": float(config["base_trade_size"]) if config.get("base_trade_size") else 20.0,
+        "confidence_threshold": float(config.get("confidence_threshold") or 0.60),
+        "trailing_stop_pct": float(config.get("trailing_stop_pct") or 2.0),
+        "sl_pct": float(config.get("sl_pct") or 3.0),
+        "tp_pct": float(config.get("tp_pct") or 0),
+        "timeout_minutes": int(config.get("timeout_minutes") or 240),
+        "ts_tighten_enabled": bool(config.get("ts_tighten_enabled", False)),
+        "ts_tighten_threshold": float(config.get("ts_tighten_threshold") or 5.0),
     }
 
 
@@ -71,10 +91,43 @@ async def update_rl_config(request: RLConfigUpdate, current_user: dict = Depends
         updates.append("max_concurrent_positions = %s")
         values.append(request.max_concurrent_positions)
     if request.base_trade_size is not None:
-        if request.base_trade_size < 15:
-            return {"error": "Mindestens $15"}
+        if request.base_trade_size < 10:
+            return {"error": "Mindestens $10"}
         updates.append("base_trade_size = %s")
         values.append(request.base_trade_size)
+    if request.confidence_threshold is not None:
+        if not 0.3 <= request.confidence_threshold <= 0.99:
+            return {"error": "Confidence zwischen 0.3 und 0.99"}
+        updates.append("confidence_threshold = %s")
+        values.append(request.confidence_threshold)
+    if request.trailing_stop_pct is not None:
+        if not 0.5 <= request.trailing_stop_pct <= 10.0:
+            return {"error": "Trailing Stop zwischen 0.5% und 10%"}
+        updates.append("trailing_stop_pct = %s")
+        values.append(request.trailing_stop_pct)
+    if request.sl_pct is not None:
+        if not 1.0 <= request.sl_pct <= 20.0:
+            return {"error": "Stop-Loss zwischen 1% und 20%"}
+        updates.append("sl_pct = %s")
+        values.append(request.sl_pct)
+    if request.timeout_minutes is not None:
+        if not 0 <= request.timeout_minutes <= 1440:
+            return {"error": "Timeout zwischen 0 und 1440 Min (0 = aus)"}
+        updates.append("timeout_minutes = %s")
+        values.append(request.timeout_minutes)
+    if request.tp_pct is not None:
+        if not 0 <= request.tp_pct <= 50.0:
+            return {"error": "Take-Profit zwischen 0% und 50% (0 = aus)"}
+        updates.append("tp_pct = %s")
+        values.append(request.tp_pct)
+    if request.ts_tighten_enabled is not None:
+        updates.append("ts_tighten_enabled = %s")
+        values.append(request.ts_tighten_enabled)
+    if request.ts_tighten_threshold is not None:
+        if not 1.0 <= request.ts_tighten_threshold <= 30.0:
+            return {"error": "Verschärfungs-Schwelle zwischen 1% und 30%"}
+        updates.append("ts_tighten_threshold = %s")
+        values.append(request.ts_tighten_threshold)
 
     if not updates:
         return {"error": "Keine Änderungen"}
@@ -102,7 +155,7 @@ async def control_service(action: str, current_user: dict = Depends(get_current_
     user_id = current_user["user_id"]
 
     if action == 'start':
-        subprocess.run(['/usr/bin/systemctl', 'start', 'rl-agent'], capture_output=True, timeout=10)
+        subprocess.run(['/usr/bin/systemctl', 'start', SERVICE_NAME], capture_output=True, timeout=10)
         with get_app_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("UPDATE rl_agent_config SET is_active = true, updated_at = NOW() WHERE user_id = %s", (user_id,))
@@ -112,9 +165,9 @@ async def control_service(action: str, current_user: dict = Depends(get_current_
             with conn.cursor() as cur:
                 cur.execute("UPDATE rl_agent_config SET is_active = false, updated_at = NOW() WHERE user_id = %s", (user_id,))
                 conn.commit()
-        subprocess.run(['/usr/bin/systemctl', 'stop', 'rl-agent'], capture_output=True, timeout=10)
+        subprocess.run(['/usr/bin/systemctl', 'stop', SERVICE_NAME], capture_output=True, timeout=10)
 
-    result = subprocess.run(['/usr/bin/systemctl', 'is-active', 'rl-agent'], capture_output=True, text=True, timeout=5)
+    result = subprocess.run(['/usr/bin/systemctl', 'is-active', SERVICE_NAME], capture_output=True, text=True, timeout=5)
     is_running = result.stdout.strip() == 'active'
 
     return {"status": "ok", "service_running": is_running, "is_active": action == 'start'}
@@ -184,7 +237,7 @@ async def get_rl_status(current_user: dict = Depends(get_current_user)):
 
     # Service Status
     try:
-        svc_result = subprocess.run(['/usr/bin/systemctl', 'is-active', 'rl-agent'],
+        svc_result = subprocess.run(['/usr/bin/systemctl', 'is-active', SERVICE_NAME],
                                      capture_output=True, text=True, timeout=5)
         service_running = svc_result.stdout.strip() == 'active'
     except:
@@ -194,7 +247,7 @@ async def get_rl_status(current_user: dict = Depends(get_current_user)):
         "is_active": is_active,
         "service_running": service_running,
         "model_exists": MODEL_PATH.exists(),
-        "model_type": "PPO-V3 Discrete(21)",
+        "model_type": "Signal-ML (Supervised)",
         "open_positions": open_count,
         "total_trades": perf["total"],
         "winners": perf["winners"],
@@ -212,6 +265,15 @@ async def get_rl_status(current_user: dict = Depends(get_current_user)):
         "losing_streak_days": agent_state.get('losing_streak_days', 0),
         "winning_streak_weeks": agent_state.get('winning_streak_weeks', 0),
         "week_bonus_multiplier": round(1.20 + max(agent_state.get('winning_streak_weeks', 0) - 1, 0) * 0.05, 2) if agent_state.get('winning_streak_weeks', 0) > 0 else 0,
+        "trades_today": agent_state.get('trades_today', 0),
+        "max_trades_per_day": 2000,
+        "leader": agent_state.get('leader', '?'),
+        "v10_points": round(agent_state.get('v10_points', 0), 0),
+        "v11_points": round(agent_state.get('v11_points', 0), 0),
+        "v10_trades": agent_state.get('v10_trades', 0),
+        "v11_trades": agent_state.get('v11_trades', 0),
+        "v10_positions": agent_state.get('v10_total_positions', agent_state.get('v10_virtual_positions', 0)),
+        "v11_positions": agent_state.get('v11_total_positions', agent_state.get('v11_virtual_positions', 0)),
         "recent_decisions": [
             {
                 "symbol": r["symbol"],

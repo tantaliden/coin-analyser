@@ -16,6 +16,7 @@ Features:
  40-51:  kline_metrics (12 pct-Werte)
  52-56:  Position State (in_pos, direction, pnl, duration, n_open)
 """
+import time
 import numpy as np
 
 FEATURE_NAMES = [
@@ -346,7 +347,11 @@ def get_kline_metrics_from_db(conn, symbol, before_time):
         row = cur.fetchone()
     if not row:
         return None
-    return {k: float(v) if v is not None else 0.0 for k, v in row.items()}
+    cols = ['pct_30m', 'pct_60m', 'pct_90m', 'pct_120m', 'pct_180m', 'pct_240m',
+            'pct_300m', 'pct_360m', 'pct_420m', 'pct_480m', 'pct_540m', 'pct_600m']
+    if hasattr(row, 'items'):
+        return {k: float(v) if v is not None else 0.0 for k, v in row.items()}
+    return {cols[i]: float(v) if v is not None else 0.0 for i, v in enumerate(row)}
 
 
 def compute_observation_live(coins_conn, symbol, current_time,
@@ -367,6 +372,121 @@ def compute_observation_live(coins_conn, symbol, current_time,
         candles_5m, candles_1h, candles_4h, candles_1d,
         btc_1h, eth_1h,
         current_time.hour, current_time.weekday(),
+        kline_metrics=km,
+        position_state=position_state,
+        n_open_positions=n_open_positions,
+    )
+
+
+# ============================================================
+# Hyperliquid API: Live-Candles → Observation
+# ============================================================
+
+_hl_info = None
+
+def _get_hl_info():
+    """Modul-Level Singleton fuer Hyperliquid Info."""
+    global _hl_info
+    if _hl_info is None:
+        from hyperliquid.info import Info
+        _hl_info = Info(skip_ws=True)
+    return _hl_info
+
+
+def _hl_candles_to_numpy(candles):
+    """Konvertiert HL-Candle-Format in numpy dict (wie DB-Format)."""
+    if not candles:
+        return empty_candles()
+    return {
+        'open': np.array([float(c['o']) for c in candles], dtype=np.float32),
+        'high': np.array([float(c['h']) for c in candles], dtype=np.float32),
+        'low': np.array([float(c['l']) for c in candles], dtype=np.float32),
+        'close': np.array([float(c['c']) for c in candles], dtype=np.float32),
+        'volume': np.array([float(c['v']) for c in candles], dtype=np.float32),
+        'trades': np.array([float(c['n']) for c in candles], dtype=np.float32),
+        'taker': np.array([float(c['v']) * 0.5 for c in candles], dtype=np.float32),
+    }
+
+
+def _fetch_hl_candles(info, coin, interval, start_ms, end_ms):
+    """HL Candles holen mit Fehlerbehandlung + Rate-Limit-Schutz."""
+    import time as _time
+    for attempt in range(3):
+        try:
+            candles = info.candles_snapshot(coin, interval, start_ms, end_ms)
+            return _hl_candles_to_numpy(candles)
+        except Exception as e:
+            if '429' in str(e) and attempt < 2:
+                _time.sleep(2)
+                continue
+            raise ConnectionError(f"HL API Fehler fuer {coin} {interval}: {e}")
+
+
+def fetch_hl_ref_candles():
+    """BTC + ETH 1h Referenz-Candles von HL holen. Einmal pro Scan-Zyklus aufrufen."""
+    info = _get_hl_info()
+    now_ms = int(time.time() * 1000)
+    btc_1h = _fetch_hl_candles(info, "BTC", "1h", now_ms - 25*60*60*1000, now_ms)
+    eth_1h = _fetch_hl_candles(info, "ETH", "1h", now_ms - 25*60*60*1000, now_ms)
+    return btc_1h, eth_1h
+
+
+# Cache fuer 1h/4h/1d Candles (aendern sich kaum in 5 Min)
+_hl_candle_cache = {}
+_hl_cache_time = 0
+_HL_CACHE_TTL = 300  # 5 Min Cache fuer 1h/4h/1d
+
+
+def compute_observation_hl(coins_conn, symbol, position_state=None, n_open_positions=0,
+                           btc_1h_cache=None, eth_1h_cache=None):
+    """
+    Berechnet Observation mit Live-Candles von Hyperliquid API.
+    5m: Immer frisch (1 Call pro Coin)
+    1h/4h/1d: Gecached fuer 5 Min
+    kline_metrics: Aus DB.
+    """
+    global _hl_candle_cache, _hl_cache_time
+    from datetime import datetime, timezone
+
+    info = _get_hl_info()
+    coin = symbol.replace('USDC', '').replace('USDT', '')
+    now_ms = int(time.time() * 1000)
+    now_s = time.time()
+
+    # 5m: Immer frisch
+    candles_5m = _fetch_hl_candles(info, coin, "5m", now_ms - 144*5*60*1000, now_ms)
+
+    # 1h/4h/1d: Cache pro Coin (5 Min TTL)
+    cache_key = coin
+    if now_s - _hl_cache_time > _HL_CACHE_TTL:
+        _hl_candle_cache = {}
+        _hl_cache_time = now_s
+
+    if cache_key not in _hl_candle_cache:
+        candles_1h = _fetch_hl_candles(info, coin, "1h", now_ms - 24*60*60*1000, now_ms)
+        candles_4h = _fetch_hl_candles(info, coin, "4h", now_ms - 48*60*60*1000, now_ms)
+        candles_1d = _fetch_hl_candles(info, coin, "1d", now_ms - 14*24*60*60*1000, now_ms)
+        _hl_candle_cache[cache_key] = (candles_1h, candles_4h, candles_1d)
+    else:
+        candles_1h, candles_4h, candles_1d = _hl_candle_cache[cache_key]
+
+    # BTC + ETH Referenz: Cache nutzen oder frisch holen
+    if btc_1h_cache is not None and eth_1h_cache is not None:
+        btc_1h = btc_1h_cache
+        eth_1h = eth_1h_cache
+    else:
+        btc_1h = _fetch_hl_candles(info, "BTC", "1h", now_ms - 25*60*60*1000, now_ms)
+        eth_1h = _fetch_hl_candles(info, "ETH", "1h", now_ms - 25*60*60*1000, now_ms)
+
+    # kline_metrics aus DB
+    now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+    km = get_kline_metrics_from_db(coins_conn, symbol, now_dt)
+
+    now_utc = datetime.now(timezone.utc)
+    return compute_observation(
+        candles_5m, candles_1h, candles_4h, candles_1d,
+        btc_1h, eth_1h,
+        now_utc.hour, now_utc.weekday(),
         kline_metrics=km,
         position_state=position_state,
         n_open_positions=n_open_positions,

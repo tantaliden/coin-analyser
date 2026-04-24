@@ -48,7 +48,7 @@
       "port": 5432,
       "name": "analyser_app",
       "user": "app_user",
-      "password": "AppUser2025!Secure",
+      "password": "AppUser2025Secure",
       "ssl": false,
       "pool": {
         "min": 2,
@@ -61,7 +61,7 @@
       "port": 5432,
       "name": "learner",
       "user": "app_user",
-      "password": "AppUser2025!Secure",
+      "password": "AppUser2025Secure",
       "ssl": false
     }
   },
@@ -91,5 +91,54 @@
   "logging": {
     "level": "info",
     "apiLog": "/opt/coin/logs/api.log"
+  },
+  "hyperliquid_ingest": {
+    "ws_url": "wss://api.hyperliquid.xyz/ws",
+    "info_url": "https://api.hyperliquid.xyz/info",
+    "bucket_seconds": 10,
+    "l2_throttle_seconds": 1.0,
+    "meta_refresh_seconds": 21600,
+    "ctx_insert_debounce_seconds": 1.0,
+    "reconnect_backoff_seconds": 5,
+    "flush_check_seconds": 0.5,
+    "lean_mode": true
+  },
+  "kline_metrics_updater": {
+    "interval_seconds": 60,
+    "lookback_minutes": 660,
+    "durations_minutes": [
+      30,
+      60,
+      90,
+      120,
+      180,
+      240,
+      300,
+      330,
+      360,
+      420,
+      480,
+      540,
+      600
+    ]
+  },
+  "telegram": {
+    "bot_token": "8430890812:AAFAbxXkc9-hw19FMuaRQwN4d6s0O8rULrM",
+    "chat_id": "2112844328"
+  },
+  "health_check": {
+    "interval_seconds": 60,
+    "klines_max_age_seconds": 45,
+    "ctx_max_age_seconds": null,
+    "agg_1m_max_age_seconds": 90,
+    "min_symbols_last_window": 220,
+    "window_seconds": 60,
+    "required_services": [
+      "hl-ingestor",
+      "kline-metrics-updater"
+    ],
+    "alert_cooldown_seconds": 600,
+    "heartbeat_file": "/opt/coin/logs/.health_heartbeat",
+    "server_label": "TEST"
   }
 }

@@ -115,12 +115,28 @@ def get_conn(db_key):
     )
 
 
-def generate_opportunities(coins_conn):
-    """Synthetische Opportunities: ±5% Moves in 6h-Fenstern."""
+def generate_opportunities(coins_conn, app_conn=None):
+    """Synthetische Opportunities: ±5% Moves in 6h-Fenstern. Nur HL-Coins."""
     print("=" * 70)
-    print("  Synthetische Opportunities generieren")
+    print("  Synthetische Opportunities generieren (nur HL-Coins)")
     print(f"  Zeitraum: {TRAIN_START.date()} → {TRAIN_END.date()}")
     print("=" * 70)
+
+    # HL-tradeable Coins laden
+    hl_symbols = set()
+    if app_conn:
+        with app_conn.cursor() as cur:
+            cur.execute("SELECT symbol FROM coin_info WHERE 'hyperliquid' = ANY(exchanges)")
+            hl_symbols = {r['symbol'] for r in cur.fetchall()}
+        print(f"  {len(hl_symbols)} HL-tradeable Coins geladen")
+    else:
+        # Fallback: eigene Connection
+        _app_conn = get_conn('app')
+        with _app_conn.cursor() as cur:
+            cur.execute("SELECT symbol FROM coin_info WHERE 'hyperliquid' = ANY(exchanges)")
+            hl_symbols = {r['symbol'] for r in cur.fetchall()}
+        _app_conn.close()
+        print(f"  {len(hl_symbols)} HL-tradeable Coins geladen")
 
     print("Lade agg_1h...")
     with coins_conn.cursor() as cur:
@@ -148,7 +164,11 @@ def generate_opportunities(coins_conn):
 
     for s in STABLECOINS:
         coins.pop(s, None)
-    print(f"  {len(coins)} Coins")
+    all_count = len(coins)
+
+    # Nur HL-Coins behalten
+    coins = {sym: rows for sym, rows in coins.items() if sym in hl_symbols}
+    print(f"  {all_count} Coins total, {len(coins)} nach HL-Filter")
 
     opportunities = []
     MOVE = 5.0
@@ -317,8 +337,10 @@ def preload_market_data(coins_conn, symbols, start, end):
 def train():
     t_start = time.time()
     coins_conn = get_conn('coins')
+    app_conn = get_conn('app')
 
-    opps = generate_opportunities(coins_conn)
+    opps = generate_opportunities(coins_conn, app_conn)
+    app_conn.close()
 
     symbols = list(set(o['symbol'] for o in opps))
     if 'BTCUSDC' not in symbols:

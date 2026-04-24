@@ -1,0 +1,1250 @@
+#!/usr/bin/env python3
+"""
+RL Ensemble Trading Service — CNN Pre-Filter + V10/V11 Jury.
+
+Architektur:
+1. CNN scannt alle liquiden HL-Coins (randomisiert, alle 5 Min)
+2. Bei CNN-Signal: Ensemble-Jury (V10 + V11) entscheidet
+3. Consensus (beide gleiche Richtung) = Trade, V11-Hebel
+4. Kein Consensus = Skip, Prediction geschlossen
+5. Position-Management: Nur V11 entscheidet (alle 5 Min)
+6. Experience-Learning: Beide Modelle lernen aus echten Trades
+
+Kein SL, kein Timeout — V11 entscheidet Exit komplett autonom.
+
+Usage:
+    systemctl start rl-ensemble
+"""
+import json
+import time
+import signal
+import sys
+import logging
+import random
+import traceback
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import numpy as np
+import psycopg2
+import psycopg2.extras
+from stable_baselines3 import PPO
+
+# Close-Logger
+close_logger = logging.getLogger('rl_closes')
+close_logger.setLevel(logging.DEBUG)
+_cl_handler = logging.FileHandler('/opt/coin/logs/rl_closes.log')
+_cl_handler.setFormatter(logging.Formatter('%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+close_logger.addHandler(_cl_handler)
+close_logger.propagate = False
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from rl_agent.env_v8 import LEVERAGE_MAP as LEVERAGE_MAP_V10, TradingEnvV6 as TradingEnvV10
+from rl_agent.env_v11 import LEVERAGE_MAP as LEVERAGE_MAP_V11, _reward, TradingEnvV11
+from rl_agent.features import compute_observation_live, compute_observation_hl, fetch_hl_ref_candles, N_FEATURES
+from rl_agent.trader import (
+    get_hl_credentials,
+    get_hl_balance,
+    get_hl_open_positions,
+    get_available_coins_hl,
+    get_current_prices_hl,
+    place_limit_order_hl,
+    close_position_hl,
+    cancel_all_orders_for_coin_hl,
+    refresh_hl_coin_info,
+)
+from momentum.cnn_predict import get_cnn_model, analyze_symbol_cnn
+
+# ============================================
+# KONFIGURATION
+# ============================================
+
+SETTINGS_PATH = "/opt/coin/settings.json"
+V10_MODEL_PATH = "/opt/coin/database/data/models/rl_ppo_trading_v10.zip"
+V11_MODEL_PATH = "/opt/coin/database/data/models/rl_ppo_trading_v11.zip"
+STATE_PATH = "/opt/coin/database/data/models/rl_ensemble_state.json"
+
+POLL_INTERVAL = 30          # Hauptloop-Takt (Sekunden)
+ENTRY_INTERVAL = 300        # CNN-Scan alle 5 Min
+MGMT_INTERVAL = 30          # Position-Management alle 30s
+
+MAX_CONCURRENT = 15
+CNN_CONFIDENCE_THRESHOLD = 55  # Mindest-Confidence fuer CNN-Signal
+
+FEE_RATE = 0.00035          # 0.035% pro Seite (Hyperliquid Taker)
+MAX_TRADES_PER_DAY = 1000
+MIN_24H_VOLUME = 20_000
+LEARN_BATCH_SIZE = 150
+LEARN_STEPS = 2000
+
+BASE_TRADE_SIZE = 20.0
+
+STABLECOINS = {'USDCUSDC', 'USDTUSDC', 'BUSDUSDC', 'DAIUSDC', 'TUSDUSDC', 'FDUSDUSDC'}
+
+# Experience Buffer
+experience_buffer = []
+
+# Skip-Tracker: Offene Skips die auf +/-1% warten
+# Jeder Eintrag: {'symbol': str, 'coin': str, 'entry_price': float, 'time': datetime,
+#                  'dir_v10': str, 'dir_v11': str, 'action_v10': int, 'action_v11': int}
+skip_tracker = []
+
+def check_skip_outcomes():
+    """Prüft offene Skips ob +1% oder -1% erreicht wurde.
+    Nutzt klines High/Low fuer praezise Erkennung.
+    Schreibt Ergebnis in prediction_feedback (learner DB).
+    """
+    if not skip_tracker:
+        return
+
+    # klines High/Low seit Skip-Zeitpunkt aus DB holen
+    try:
+        s = json.load(open(SETTINGS_PATH))
+        db_coins = s['databases']['coins']
+        coins_conn = psycopg2.connect(
+            dbname=db_coins['name'], user=db_coins['user'],
+            password=db_coins['password'], host=db_coins['host'], port=db_coins['port'],
+        )
+    except Exception:
+        return
+
+    resolved = []
+    for i, skip in enumerate(skip_tracker):
+        entry_price = skip['entry_price']
+        symbol = skip['symbol']
+        skip_time = skip['time'].replace(tzinfo=None) if skip['time'].tzinfo else skip['time']
+
+        # High/Low seit Skip aus klines
+        try:
+            cur = coins_conn.cursor()
+            cur.execute("""
+                SELECT MAX(high) as max_high, MIN(low) as min_low
+                FROM klines
+                WHERE symbol = %s AND open_time >= %s
+            """, (symbol, skip_time))
+            row = cur.fetchone()
+            cur.close()
+        except Exception:
+            coins_conn.rollback()
+            continue
+
+        if not row or row[0] is None:
+            continue
+
+        max_high = float(row[0])
+        min_low = float(row[1])
+
+        high_pct = (max_high - entry_price) / entry_price * 100
+        low_pct = (min_low - entry_price) / entry_price * 100
+
+        # Was wurde ZUERST erreicht? High oder Low?
+        if high_pct >= 1.0 and low_pct <= -1.0:
+            # Beide erreicht — pruefen was zuerst kam
+            try:
+                cur = coins_conn.cursor()
+                cur.execute("""
+                    SELECT open_time, high, low FROM klines
+                    WHERE symbol = %s AND open_time >= %s
+                    ORDER BY open_time
+                """, (symbol, skip_time))
+                candles = cur.fetchall()
+                cur.close()
+                correct_direction = None
+                for c in candles:
+                    c_high_pct = (float(c[1]) - entry_price) / entry_price * 100
+                    c_low_pct = (float(c[2]) - entry_price) / entry_price * 100
+                    if c_high_pct >= 1.0:
+                        correct_direction = 'long'
+                        pct_change = c_high_pct
+                        break
+                    if c_low_pct <= -1.0:
+                        correct_direction = 'short'
+                        pct_change = c_low_pct
+                        break
+                if correct_direction is None:
+                    continue
+            except Exception:
+                coins_conn.rollback()
+                continue
+        elif high_pct >= 1.0:
+            correct_direction = 'long'
+            pct_change = high_pct
+        elif low_pct <= -1.0:
+            correct_direction = 'short'
+            pct_change = low_pct
+        else:
+            continue  # Noch nicht erreicht
+
+        # Wer hatte Recht?
+        v10_correct = skip['dir_v10'] == correct_direction
+        v11_correct = skip['dir_v11'] == correct_direction
+
+        duration_min = int((datetime.now(timezone.utc) - skip['time']).total_seconds() / 60)
+
+        # In prediction_feedback schreiben (fuer beide Agenten)
+        try:
+            s = json.load(open(SETTINGS_PATH))
+            db_cfg = s.get('databases', {}).get('learner', s['databases'].get('app', {}))
+            conn = psycopg2.connect(
+                dbname=db_cfg.get('name', 'learner'), user=db_cfg['user'],
+                password=db_cfg['password'], host=db_cfg['host'], port=db_cfg['port'],
+            )
+            cur = conn.cursor()
+
+            # V10 Feedback
+            if skip['dir_v10'] != 'skip':
+                cur.execute("""
+                    INSERT INTO prediction_feedback
+                    (prediction_id, scanner_type, symbol, direction, entry_price,
+                     detected_at, resolved_at, status, was_correct, actual_result_pct,
+                     duration_minutes, time_result, confidence, take_profit_pct, stop_loss_pct)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (0, 'ensemble_v10', skip['symbol'], skip['dir_v10'], entry_price,
+                      skip['time'], 'hit_tp' if v10_correct else 'hit_sl',
+                      v10_correct, round(pct_change, 4), duration_min,
+                      'in_time_tp' if v10_correct else 'in_time_sl',
+                      50, 1.0, 1.0))
+
+            # V11 Feedback
+            if skip['dir_v11'] != 'skip':
+                cur.execute("""
+                    INSERT INTO prediction_feedback
+                    (prediction_id, scanner_type, symbol, direction, entry_price,
+                     detected_at, resolved_at, status, was_correct, actual_result_pct,
+                     duration_minutes, time_result, confidence, take_profit_pct, stop_loss_pct)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (0, 'ensemble_v11', skip['symbol'], skip['dir_v11'], entry_price,
+                      skip['time'], 'hit_tp' if v11_correct else 'hit_sl',
+                      v11_correct, round(pct_change, 4), duration_min,
+                      'in_time_tp' if v11_correct else 'in_time_sl',
+                      50, 1.0, 1.0))
+
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            logger.info(f"[SKIP-FEEDBACK] {skip['symbol']} | {pct_change:+.2f}% in {duration_min}min | "
+                        f"Korrekt: {correct_direction} | "
+                        f"V10={skip['dir_v10']}({'OK' if v10_correct else 'FALSCH'}) "
+                        f"V11={skip['dir_v11']}({'OK' if v11_correct else 'FALSCH'})")
+        except Exception as e:
+            logger.error(f"[SKIP-FEEDBACK] DB-Fehler: {e}")
+
+        resolved.append(i)
+
+    try:
+        coins_conn.close()
+    except:
+        pass
+
+    # Aufgelöste Skips entfernen (von hinten nach vorne)
+    for i in sorted(resolved, reverse=True):
+        skip_tracker.pop(i)
+
+
+# ============================================
+# LOGGING
+# ============================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('/opt/coin/logs/rl_ensemble.log'),
+    ]
+)
+logger = logging.getLogger('rl_ensemble')
+
+# ============================================
+# SIGNAL HANDLER
+# ============================================
+
+running = True
+
+
+def signal_handler(sig, frame):
+    global running
+    logger.info(f"Signal {sig} empfangen, stoppe...")
+    running = False
+
+
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+# ============================================
+# LEVERAGE MAP (V11 fuer Trades)
+# ============================================
+
+LEVERAGE_MAP = LEVERAGE_MAP_V11
+
+
+# ============================================
+# DB CONNECTIONS
+# ============================================
+
+def get_conn(db_key):
+    s = json.load(open(SETTINGS_PATH))
+    db = s['databases'][db_key]
+    return psycopg2.connect(
+        dbname=db['name'], user=db['user'], password=db['password'],
+        host=db['host'], port=db['port'],
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
+
+
+# ============================================
+# STATE PERSISTENCE
+# ============================================
+
+def load_state():
+    if Path(STATE_PATH).exists():
+        try:
+            with open(STATE_PATH) as f:
+                state = json.load(f)
+            state.setdefault('total_points', 2000.0)
+            state.setdefault('total_profit', 0.0)
+            state.setdefault('losing_streak_days', 0)
+            state.setdefault('winning_streak_weeks', 0)
+            state.setdefault('current_day', '')
+            state.setdefault('current_week', '')
+            state.setdefault('day_pnl', 0.0)
+            state.setdefault('week_points', 0.0)
+            state.setdefault('week_points_raw', 0.0)
+            state.setdefault('prev_week_raw_points', 0)
+            state.setdefault('last_trade_times', {})
+            state.setdefault('total_trades', 0)
+            state.setdefault('total_skips', 0)
+            state.setdefault('total_wins', 0)
+            state.setdefault('total_losses', 0)
+            state.setdefault('cnn_scans', 0)
+            state.setdefault('cnn_signals', 0)
+            logger.info(f"State geladen: {state['total_points']:.0f} Punkte, "
+                        f"Profit: ${state['total_profit']:.2f}")
+            return state
+        except Exception as e:
+            logger.error(f"State laden fehlgeschlagen: {e}")
+
+    return {
+        'total_points': 2000.0,
+        'total_profit': 0.0,
+        'losing_streak_days': 0,
+        'winning_streak_weeks': 0,
+        'current_day': '',
+        'current_week': '',
+        'day_pnl': 0.0,
+        'week_points': 0.0,
+        'week_points_raw': 0.0,
+        'prev_week_raw_points': 0,
+        'last_trade_times': {},
+        'total_trades': 0,
+        'total_skips': 0,
+        'total_wins': 0,
+        'total_losses': 0,
+        'cnn_scans': 0,
+        'cnn_signals': 0,
+    }
+
+
+def save_state(state):
+    try:
+        state['updated_at'] = datetime.now(timezone.utc).isoformat()
+        with open(STATE_PATH, 'w') as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        logger.error(f"State speichern fehlgeschlagen: {e}")
+
+
+# ============================================
+# DAY / WEEK ROLLOVER
+# ============================================
+
+def _check_day_rollover(state):
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    if state['current_day'] == today:
+        return
+    state['current_day'] = today
+    state['day_pnl'] = 0.0
+
+
+def _check_week_rollover(state):
+    now = datetime.now(timezone.utc)
+    current_week = f"{now.isocalendar()[0]}-W{now.isocalendar()[1]:02d}"
+    if state['current_week'] == current_week:
+        return
+    state['prev_week_raw_points'] = state.get('week_points_raw', 0)
+    state['current_week'] = current_week
+    state['week_points'] = 0.0
+    state['week_points_raw'] = 0.0
+
+
+# ============================================
+# TRADE SIZE
+# ============================================
+
+def _calc_trade_size(wallet_balance, base_size=BASE_TRADE_SIZE):
+    """Trade-Size: $20 Basis, ab $1000 Wallet 1/50, in 5er Schritten."""
+    if wallet_balance < 1000:
+        return base_size
+    raw = wallet_balance / 50.0
+    stepped = int(raw / 5) * 5  # Abrunden auf 5er Schritte
+    return max(base_size, float(stepped))
+
+
+# ============================================
+# LIQUIDITAETS-FILTER
+# ============================================
+
+def update_liquid_coins(tradeable_coins):
+    try:
+        from hyperliquid.info import Info
+        info = Info(skip_ws=True)
+        metas = info.meta_and_asset_ctxs()
+        assets = metas[0]['universe']
+        ctxs = metas[1]
+
+        volumes = {}
+        for asset, ctx in zip(assets, ctxs):
+            volumes[asset['name']] = float(ctx.get('dayNtlVlm', 0))
+
+        liquid = []
+        blocked = []
+        for symbol in tradeable_coins:
+            coin = symbol.replace('USDC', '').replace('USDT', '')
+            vol = volumes.get(coin, 0)
+            if vol >= MIN_24H_VOLUME:
+                liquid.append(symbol)
+            else:
+                blocked.append((symbol, vol))
+
+        if blocked:
+            logger.info(f"Liquiditaets-Filter: {len(blocked)} Coins gesperrt (< ${MIN_24H_VOLUME:,})")
+        logger.info(f"{len(liquid)} liquide Coins von {len(tradeable_coins)}")
+        return liquid
+    except Exception as e:
+        logger.warning(f"Liquiditaets-Check fehlgeschlagen: {e} — verwende alle Coins")
+        return tradeable_coins
+
+
+# ============================================
+# DB QUERIES
+# ============================================
+
+def get_agent_config(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM rl_agent_config WHERE user_id = 1")
+        row = cur.fetchone()
+    if not row:
+        return {'is_active': False, 'max_concurrent_positions': MAX_CONCURRENT, 'max_leverage': 10}
+    return {
+        'is_active': row['is_active'],
+        'max_concurrent_positions': row['max_concurrent_positions'],
+        'max_leverage': row['max_leverage'],
+        'base_trade_size': float(row['base_trade_size']) if row.get('base_trade_size') else BASE_TRADE_SIZE,
+    }
+
+
+def get_tradeable_coins(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT symbol FROM coin_info WHERE 'hyperliquid' = ANY(exchanges)")
+        coins = [r['symbol'] for r in cur.fetchall()]
+    return [c for c in coins if c not in STABLECOINS]
+
+
+def get_open_positions_db(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, symbol, direction, entry_price, entry_time,
+                   position_size_usd, leverage
+            FROM rl_positions
+            WHERE status = 'open'
+            ORDER BY entry_time ASC
+        """)
+        return cur.fetchall()
+
+
+def log_position_open(conn, symbol, direction, entry_price, size_usd, leverage):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO rl_positions
+            (symbol, direction, entry_price, entry_time, position_size_usd,
+             leverage, status, mode, exchange)
+            VALUES (%s, %s, %s, NOW(), %s, %s, 'open', 'live', 'hyperliquid')
+            RETURNING id
+        """, (symbol, direction, entry_price, size_usd, leverage))
+        pos_id = cur.fetchone()['id']
+        conn.commit()
+        return pos_id
+
+
+def log_position_close(conn, pos_id, exit_price, exit_reason, pnl_pct, pnl_usd, duration_min):
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE rl_positions SET
+                exit_price = %s, exit_time = NOW(), exit_reason = %s,
+                pnl_percent = %s, pnl_usd = %s, duration_minutes = %s,
+                status = 'closed'
+            WHERE id = %s
+        """, (exit_price, exit_reason, round(pnl_pct, 4), round(pnl_usd, 2),
+              duration_min, pos_id))
+        conn.commit()
+
+
+def log_decision(conn, pos_id, symbol, action, reward, in_position, unrealized_pnl):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO rl_decisions
+            (position_id, timestamp, symbol, action, reward, in_position, unrealized_pnl)
+            VALUES (%s, NOW(), %s, %s, %s, %s, %s)
+        """, (pos_id, symbol, action, round(reward, 4) if reward else None,
+              in_position, round(unrealized_pnl, 4) if unrealized_pnl else None))
+        conn.commit()
+
+
+# ============================================
+# ENSEMBLE JURY
+# ============================================
+
+def ensemble_decide(model_v10, model_v11, obs):
+    """
+    Beide Modelle befragen, Consensus pruefen.
+    Beide long -> Trade long (V11-Hebel)
+    Beide short -> Trade short (V11-Hebel)
+    Uneinig/Skip -> Skip
+    """
+    action_v10, _ = model_v10.predict(obs, deterministic=False)
+    action_v11, _ = model_v11.predict(obs, deterministic=False)
+
+    action_v10 = int(action_v10)
+    action_v11 = int(action_v11)
+
+    # Direction extrahieren
+    if 1 <= action_v10 <= 10:
+        dir_v10 = 'long'
+    elif 11 <= action_v10 <= 20:
+        dir_v10 = 'short'
+    else:
+        dir_v10 = 'skip'
+
+    if 1 <= action_v11 <= 10:
+        dir_v11 = 'long'
+    elif 11 <= action_v11 <= 20:
+        dir_v11 = 'short'
+    else:
+        dir_v11 = 'skip'
+
+    # Consensus Check
+    if dir_v10 == dir_v11 and dir_v10 != 'skip':
+        leverage = LEVERAGE_MAP[action_v11]
+        return {
+            'consensus': True,
+            'direction': dir_v10,
+            'leverage': leverage,
+            'action_v10': action_v10,
+            'action_v11': action_v11,
+            'dir_v10': dir_v10,
+            'dir_v11': dir_v11,
+        }
+    else:
+        return {
+            'consensus': False,
+            'direction': None,
+            'action_v10': action_v10,
+            'action_v11': action_v11,
+            'dir_v10': dir_v10,
+            'dir_v11': dir_v11,
+        }
+
+
+# ============================================
+# POSITION MANAGEMENT (nur V11)
+# ============================================
+
+def _finalize_close(app_conn, state, pos, current_price, exit_price, pnl_pct, exit_reason):
+    symbol = pos['symbol']
+    direction = pos['direction']
+    leverage = int(pos['leverage'])
+    position_size = float(pos['position_size_usd'])
+    entry_time = pos['entry_time']
+    pos_id = pos['id']
+    now = datetime.now(timezone.utc)
+    duration_min = int((now - entry_time).total_seconds() / 60) if entry_time else 0
+
+    reward = _reward(pnl_pct, leverage)
+
+    # Wiederholungs-Penalty
+    last_trade_times = state.get('last_trade_times', {})
+    last_time = last_trade_times.get(symbol)
+    if last_time and reward > 0:
+        try:
+            last_dt = datetime.fromisoformat(last_time)
+            if (now - last_dt).total_seconds() < 3600:
+                reward *= 0.8
+        except:
+            pass
+
+    state['total_points'] += reward
+    state['week_points'] += reward
+    state['week_points_raw'] = state.get('week_points_raw', 0) + reward
+
+    pnl_dollar = position_size * pnl_pct / 100
+    fees = position_size * FEE_RATE * 2
+    net_pnl = pnl_dollar - fees
+    state['total_profit'] += net_pnl
+    state['day_pnl'] += net_pnl
+
+    if pnl_pct > 0:
+        state['total_wins'] = state.get('total_wins', 0) + 1
+    else:
+        state['total_losses'] = state.get('total_losses', 0) + 1
+
+    log_position_close(app_conn, pos_id, exit_price or current_price,
+                       exit_reason, pnl_pct, net_pnl, duration_min)
+    log_decision(app_conn, pos_id, symbol, -1, reward, False, pnl_pct)
+
+    lev_v10 = "?"
+    lev_v11 = f"{leverage}x"
+    logger.info(f"[ENSEMBLE] V11_EXIT {symbol} {direction} {lev_v11} | "
+                f"PnL: {pnl_pct:+.2f}% ${net_pnl:+.2f} | "
+                f"Punkte: {state['total_points']:+.0f} (reward: {reward:+.2f}) | "
+                f"Dauer: {duration_min}min")
+
+    # Experience Buffer
+    et = entry_time
+    if hasattr(et, 'tzinfo') and et.tzinfo:
+        et = et.replace(tzinfo=None)
+    experience_buffer.append({
+        'symbol': symbol,
+        'entry_time': et,
+        'exit_time': now.replace(tzinfo=None),
+    })
+
+
+def _set_pending_close(app_conn, state, pos_id):
+    with app_conn.cursor() as cur:
+        cur.execute("UPDATE rl_positions SET status = 'pending_close' WHERE id = %s", (pos_id,))
+        app_conn.commit()
+    state.setdefault('pending_closes', {})[str(pos_id)] = {
+        'requested_at': datetime.now(timezone.utc).isoformat(),
+        'retried': False,
+    }
+
+
+def _set_back_to_open(app_conn, state, pos_id, symbol):
+    with app_conn.cursor() as cur:
+        cur.execute("UPDATE rl_positions SET status = 'open' WHERE id = %s", (pos_id,))
+        app_conn.commit()
+    state.get('pending_closes', {}).pop(str(pos_id), None)
+    logger.info(f"{symbol} zurueck auf OPEN (Close fehlgeschlagen)")
+
+
+def _close_and_log(app_conn, state, creds, pos, current_price, pnl_pct, exit_reason):
+    symbol = pos['symbol']
+    pos_id = pos['id']
+    coin = symbol.replace('USDC', '').replace('USDT', '')
+
+    # Pruefen ob Position auf HL noch existiert
+    try:
+        hl_positions = get_hl_open_positions(creds['wallet_address'])
+        hl_coins_open = {p['coin'] for p in hl_positions}
+        if coin not in hl_coins_open:
+            close_logger.warning(f"ALREADY_CLOSED {symbol} | Position nicht mehr auf HL")
+            _finalize_close(app_conn, state, pos, current_price, current_price, pnl_pct, exit_reason)
+            return
+    except Exception as e:
+        close_logger.error(f"HL_CHECK_FAILED {symbol} | {e}")
+
+    close_logger.info(f"CLOSE_ATTEMPT {symbol} | reason={exit_reason} | price={current_price:.6f} | pnl={pnl_pct:+.2f}%")
+    cancel_all_orders_for_coin_hl(creds, coin)
+    result = close_position_hl(creds, coin, creds['wallet_address'])
+
+    if result.get('success'):
+        exit_price = result.get('avg_price', 0)
+        close_logger.info(f"CLOSE_OK {symbol} | exit_price={exit_price:.6f}")
+        _finalize_close(app_conn, state, pos, current_price, exit_price, pnl_pct, exit_reason)
+    else:
+        close_logger.warning(f"CLOSE_FAILED {symbol} -> pending_close")
+        _set_pending_close(app_conn, state, pos_id)
+        save_state(state)
+
+
+def check_pending_closes(app_conn, state, creds):
+    """Pending-Close Positionen pruefen (jede 30s Iteration)."""
+    with app_conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, symbol, direction, entry_price, entry_time,
+                   position_size_usd, leverage
+            FROM rl_positions
+            WHERE status = 'pending_close'
+            ORDER BY entry_time ASC
+        """)
+        pending = cur.fetchall()
+
+    if not pending:
+        return
+
+    try:
+        hl_pos_list = get_hl_open_positions(creds['wallet_address'])
+        hl_coins_open = {p['coin'] for p in hl_pos_list}
+    except:
+        hl_coins_open = set()
+
+    now = datetime.now(timezone.utc)
+    pending_state = state.get('pending_closes', {})
+
+    for pos in pending:
+        pos_id = pos['id']
+        symbol = pos['symbol']
+        coin = symbol.replace('USDC', '').replace('USDT', '')
+        direction = pos['direction']
+        entry_price = float(pos['entry_price'])
+
+        info = pending_state.get(str(pos_id), {})
+        requested_at_str = info.get('requested_at')
+        retried = info.get('retried', False)
+
+        if requested_at_str:
+            try:
+                requested_at = datetime.fromisoformat(requested_at_str)
+            except:
+                requested_at = now
+        else:
+            requested_at = now
+            pending_state[str(pos_id)] = {'requested_at': now.isoformat(), 'retried': False}
+
+        elapsed = (now - requested_at).total_seconds()
+        coin_on_hl = coin in hl_coins_open
+
+        if not coin_on_hl:
+            try:
+                prices_hl = get_current_prices_hl()
+                current_price = prices_hl.get(coin, 0)
+            except:
+                current_price = 0
+            if current_price <= 0:
+                current_price = entry_price
+            pnl_pct = calc_pnl_pct(direction, entry_price, current_price)
+            close_logger.info(f"PENDING_CONFIRMED {symbol} | Position weg von HL")
+            _finalize_close(app_conn, state, pos, current_price, current_price, pnl_pct, 'agent_exit')
+            pending_state.pop(str(pos_id), None)
+            continue
+
+        if elapsed >= 60:
+            close_logger.warning(f"PENDING_TIMEOUT {symbol} -> zurueck auf OPEN")
+            try:
+                cancel_all_orders_for_coin_hl(creds, coin)
+            except:
+                pass
+            _set_back_to_open(app_conn, state, pos_id, symbol)
+            continue
+
+        if elapsed >= 15 and not retried:
+            close_logger.info(f"PENDING_RETRY {symbol}")
+            try:
+                close_position_hl(creds, coin, creds['wallet_address'])
+            except Exception as e:
+                logger.warning(f"Retry sell {symbol} fehlgeschlagen: {e}")
+            info['retried'] = True
+
+    state['pending_closes'] = pending_state
+    save_state(state)
+
+
+def calc_pnl_pct(direction, entry_price, current_price):
+    if entry_price <= 0 or current_price <= 0:
+        return 0.0
+    if direction == 'long':
+        return (current_price - entry_price) / entry_price * 100
+    else:
+        return (entry_price - current_price) / entry_price * 100
+
+
+def calc_pnl_pct_with_costs(direction, entry_price, current_price, leverage, entry_time):
+    """PnL% mit realen Handelskosten (identisch zu env_v11 Training)."""
+    raw_pnl = calc_pnl_pct(direction, entry_price, current_price)
+    fees = 0.035 * 2
+    hours_held = 0.0
+    if entry_time:
+        now = datetime.now(timezone.utc)
+        hours_held = (now - entry_time).total_seconds() / 3600
+    funding = 0.01 * hours_held * leverage
+    return raw_pnl - fees - funding
+
+
+def manage_positions(model_v11, app_conn, coins_conn, state, creds):
+    """V11 entscheidet ob halten oder schliessen. HL-Live-Daten."""
+    open_positions = get_open_positions_db(app_conn)
+    if not open_positions:
+        return
+
+    try:
+        prices_hl = get_current_prices_hl()
+    except:
+        prices_hl = {}
+
+    try:
+        btc_1h_cache, eth_1h_cache = fetch_hl_ref_candles()
+    except ConnectionError as e:
+        logger.error(f"ALARM: HL API nicht erreichbar! ({e})")
+        return
+
+    now = datetime.now(timezone.utc)
+    n_open = len(open_positions)
+    closed_coins = set()
+
+    for pos in open_positions:
+        symbol = pos['symbol']
+        coin = symbol.replace('USDC', '').replace('USDT', '')
+        direction = pos['direction']
+        entry_price = float(pos['entry_price'])
+        leverage = int(pos['leverage'])
+        entry_time = pos['entry_time']
+        pos_id = pos['id']
+
+        if coin in closed_coins:
+            continue
+
+        current_price = prices_hl.get(coin, 0)
+        if current_price <= 0:
+            continue
+
+        pnl_pct = calc_pnl_pct(direction, entry_price, current_price)
+        pnl_pct_with_costs = calc_pnl_pct_with_costs(direction, entry_price, current_price, leverage, entry_time)
+        duration_min = int((now - entry_time).total_seconds() / 60) if entry_time else 0
+
+        pos_state = {
+            'in_position': True,
+            'direction': 1 if direction == 'long' else -1,
+            'unrealized_pnl': pnl_pct_with_costs,
+            'duration_min': duration_min,
+        }
+
+        try:
+            obs = compute_observation_hl(
+                coins_conn, symbol,
+                position_state=pos_state,
+                n_open_positions=n_open,
+                btc_1h_cache=btc_1h_cache,
+                eth_1h_cache=eth_1h_cache,
+            )
+        except ConnectionError:
+            continue
+        mgmt_action, _ = model_v11.predict(obs, deterministic=False)
+        mgmt_action = int(mgmt_action)
+
+        if mgmt_action != 0:
+            close_logger.info(f"SELL_DECISION {symbol} {direction} {leverage}x | "
+                              f"PnL: {pnl_pct:+.2f}% | Dauer: {duration_min}min | Action: {mgmt_action}")
+            _close_and_log(app_conn, state, creds, pos, current_price, pnl_pct, 'agent_exit')
+            closed_coins.add(coin)
+        else:
+            log_decision(app_conn, pos_id, symbol, 0, None, True, pnl_pct)
+
+    save_state(state)
+
+
+# ============================================
+# CNN SCAN + ENSEMBLE ENTRY
+# ============================================
+
+def cnn_scan_and_ensemble_entry(model_v10, model_v11, app_conn, coins_conn, state, creds, liquid_coins):
+    """
+    1. CNN scannt alle liquiden Coins (randomisiert)
+    2. Bei CNN-Signal: Ensemble-Jury entscheidet
+    3. Consensus = Trade, kein Consensus = Skip
+    """
+    config = get_agent_config(app_conn)
+    open_positions = get_open_positions_db(app_conn)
+    n_open = len(open_positions)
+    open_symbols = {p['symbol'] for p in open_positions}
+    now = datetime.now(timezone.utc)
+
+    try:
+        prices_hl = get_current_prices_hl()
+    except:
+        prices_hl = {}
+
+    # Echte HL-Positionsanzahl als Limit
+    try:
+        hl_positions = get_hl_open_positions(creds['wallet_address'])
+        n_open = max(n_open, len(hl_positions))
+        for p in hl_positions:
+            hl_sym = p.get('coin', '') + 'USDC'
+            open_symbols.add(hl_sym)
+    except:
+        pass
+
+    wallet_balance = get_hl_balance(creds['wallet_address'])
+    trades_opened = 0
+
+    # Tages-Trade-Limit
+    today = now.strftime('%Y-%m-%d')
+    if state.get('trade_day') != today:
+        state['trade_day'] = today
+        state['trades_today'] = 0
+
+    # CNN-Scan: Alle Coins randomisiert
+    shuffled_coins = list(liquid_coins)
+    random.shuffle(shuffled_coins)
+
+    coins_cursor = coins_conn.cursor()
+    cnn_signals_this_scan = 0
+
+    for symbol in shuffled_coins:
+        if n_open >= MAX_CONCURRENT:
+            break
+        if state.get('trades_today', 0) >= MAX_TRADES_PER_DAY:
+            break
+        if symbol in open_symbols:
+            continue
+
+        coin = symbol.replace('USDC', '').replace('USDT', '')
+        current_price = prices_hl.get(coin, 0)
+        if current_price <= 0:
+            continue
+
+        state['cnn_scans'] = state.get('cnn_scans', 0) + 1
+
+        # CNN-Predict
+        try:
+            cnn_result = analyze_symbol_cnn(coins_cursor, symbol, current_price, now)
+        except Exception as e:
+            logger.debug(f"CNN-Fehler {symbol}: {e}")
+            continue
+
+        if cnn_result is None:
+            continue
+
+        if cnn_result['confidence'] < CNN_CONFIDENCE_THRESHOLD:
+            continue
+
+        cnn_signals_this_scan += 1
+        state['cnn_signals'] = state.get('cnn_signals', 0) + 1
+
+        # Ensemble-Jury: Observation bauen, beide Modelle befragen
+        obs = compute_observation_live(
+            coins_conn, symbol, now.replace(tzinfo=None),
+            position_state=None,
+            n_open_positions=n_open,
+        )
+
+        decision = ensemble_decide(model_v10, model_v11, obs)
+
+        lev_v10 = LEVERAGE_MAP_V10.get(decision['action_v10'], 0)
+        lev_v11 = LEVERAGE_MAP_V11.get(decision['action_v11'], 0)
+
+        if not decision['consensus']:
+            # Skip: Kein Consensus
+            state['total_skips'] = state.get('total_skips', 0) + 1
+            logger.info(f"[ENSEMBLE] SKIP {symbol} | CNN: {cnn_result['direction']} {cnn_result['confidence']}% | "
+                        f"V10={decision['dir_v10']}{f' {lev_v10}x' if decision['dir_v10'] != 'skip' else ''} "
+                        f"V11={decision['dir_v11']}{f' {lev_v11}x' if decision['dir_v11'] != 'skip' else ''}")
+
+            # Skip-Tracker: Preis merken fuer spaeteres Feedback
+            if decision['dir_v10'] != 'skip' or decision['dir_v11'] != 'skip':
+                skip_tracker.append({
+                    'symbol': symbol,
+                    'coin': coin,
+                    'entry_price': current_price,
+                    'time': now,
+                    'dir_v10': decision['dir_v10'],
+                    'dir_v11': decision['dir_v11'],
+                    'action_v10': decision['action_v10'],
+                    'action_v11': decision['action_v11'],
+                })
+
+            # Experience Buffer: Auch Skips merken
+            experience_buffer.append({
+                'symbol': symbol,
+                'entry_time': now.replace(tzinfo=None),
+                'exit_time': now.replace(tzinfo=None),
+            })
+            continue
+
+        # CONSENSUS: Trade ausfuehren
+        direction = decision['direction']
+        leverage = decision['leverage']
+
+        if leverage > config['max_leverage']:
+            leverage = config['max_leverage']
+
+        # Drawdown-Modus
+        if state['week_points'] < 0 and leverage > 3:
+            leverage = 3
+
+        position_size = _calc_trade_size(wallet_balance, config.get('base_trade_size', BASE_TRADE_SIZE))
+        margin = position_size / leverage
+
+        if margin > wallet_balance * 0.5:
+            continue
+
+        # Frischer Preis
+        try:
+            fresh_prices = get_current_prices_hl()
+            fresh_price = fresh_prices.get(coin, 0)
+            if fresh_price > 0:
+                current_price = fresh_price
+        except:
+            pass
+
+        is_buy = direction == 'long'
+        limit_price = round(current_price * (0.999 if is_buy else 1.001), 6)
+        result = place_limit_order_hl(creds, coin, is_buy, position_size, limit_price, leverage)
+
+        if not result.get('success'):
+            logger.warning(f"HL Order fehlgeschlagen {symbol}: {result.get('error')}")
+            continue
+
+        entry_price = result.get('avg_price', limit_price)
+
+        # Position in DB loggen
+        pos_id = log_position_open(app_conn, symbol, direction, entry_price, position_size, leverage)
+        log_decision(app_conn, pos_id, symbol, decision['action_v11'], None, True, 0.0)
+
+        # Wiederholungs-Tracking
+        state.setdefault('last_trade_times', {})[symbol] = now.isoformat()
+        state['last_trade_times'] = {
+            s: t for s, t in state['last_trade_times'].items()
+            if (now - datetime.fromisoformat(t)).total_seconds() < 7200
+        }
+
+        n_open += 1
+        open_symbols.add(symbol)
+        trades_opened += 1
+        state['trades_today'] = state.get('trades_today', 0) + 1
+        state['total_trades'] = state.get('total_trades', 0) + 1
+
+        logger.info(f"[ENSEMBLE] CONSENSUS {symbol} {direction} {leverage}x | "
+                    f"CNN: {cnn_result['direction']} {cnn_result['confidence']}% | "
+                    f"V10={decision['dir_v10']} {lev_v10}x V11={decision['dir_v11']} {lev_v11}x | "
+                    f"${position_size:.2f} @{entry_price:.4f} | "
+                    f"Punkte: {state['total_points']:+.0f}")
+
+    coins_cursor.close()
+
+    if cnn_signals_this_scan > 0:
+        logger.info(f"[ENSEMBLE] Scan: {len(shuffled_coins)} Coins, "
+                    f"{cnn_signals_this_scan} CNN-Signale, {trades_opened} Trades")
+
+    if trades_opened > 0:
+        save_state(state)
+
+    return trades_opened
+
+
+# ============================================
+# EXPERIENCE LEARNING
+# ============================================
+
+def experience_learn_ensemble(model_v10, model_v11, experiences):
+    """Beide Modelle lernen aus echten Trade-Erfahrungen."""
+    try:
+        from rl_agent.learner import preload_market_data
+
+        traded_coins = list(set(e['symbol'] for e in experiences))
+        earliest = min(e['entry_time'] for e in experiences)
+        latest = max(e['exit_time'] for e in experiences)
+
+        all_coins = traded_coins[:]
+        for ref in ['BTCUSDC', 'ETHUSDC']:
+            if ref not in all_coins:
+                all_coins.append(ref)
+
+        data_start = earliest - timedelta(hours=12)
+
+        coins_conn = get_conn('coins')
+        market_data = preload_market_data(coins_conn, all_coins, data_start, latest)
+        coins_conn.close()
+
+        span_h = (latest - earliest).total_seconds() / 3600
+
+        # V10 lernt mit seinem Env (TradingEnvV10 = TradingEnvV6 aus env_v8)
+        env_v10 = TradingEnvV10(
+            coins=traded_coins,
+            market_data=market_data,
+            trade_start=earliest,
+            trade_end=latest,
+            train_start=earliest,
+        )
+        model_v10.set_env(env_v10)
+        model_v10.learn(total_timesteps=LEARN_STEPS, reset_num_timesteps=False)
+        model_v10.save(V10_MODEL_PATH)
+        logger.info(f"[ENSEMBLE] V10 gelernt: {LEARN_STEPS} Steps, "
+                    f"{len(traded_coins)} Coins, {span_h:.1f}h | Env-Punkte: {env_v10.total_points:.0f}")
+
+        # V11 lernt mit seinem Env
+        env_v11 = TradingEnvV11(
+            coins=traded_coins,
+            market_data=market_data,
+            trade_start=earliest,
+            trade_end=latest,
+            train_start=earliest,
+        )
+        model_v11.set_env(env_v11)
+        model_v11.learn(total_timesteps=LEARN_STEPS, reset_num_timesteps=False)
+        model_v11.save(V11_MODEL_PATH)
+        logger.info(f"[ENSEMBLE] V11 gelernt: {LEARN_STEPS} Steps, "
+                    f"{len(traded_coins)} Coins, {span_h:.1f}h | Env-Punkte: {env_v11.total_points:.0f}")
+
+        logger.info(f"[ENSEMBLE] EXPERIENCE-LERNEN: {len(experiences)} Erfahrungen verarbeitet")
+
+    except Exception as e:
+        logger.error(f"Experience-Lernen fehlgeschlagen: {e}")
+        traceback.print_exc()
+
+
+# ============================================
+# MAIN LOOP
+# ============================================
+
+def main():
+    global running
+
+    print("=" * 70)
+    print("  RL Ensemble Trading Service — CNN + V10/V11 Jury")
+    print(f"  CNN-Threshold: {CNN_CONFIDENCE_THRESHOLD}% | Max: {MAX_CONCURRENT} Positionen")
+    print(f"  Entry: {ENTRY_INTERVAL}s, Management: {MGMT_INTERVAL}s")
+    print(f"  Lernen: Nach je {LEARN_BATCH_SIZE} Erfahrungen")
+    print(f"  V10: {V10_MODEL_PATH}")
+    print(f"  V11: {V11_MODEL_PATH}")
+    print("=" * 70)
+
+    # Modelle pruefen
+    if not Path(V10_MODEL_PATH).exists():
+        logger.error(f"V10 Modell nicht gefunden: {V10_MODEL_PATH}")
+        return
+    if not Path(V11_MODEL_PATH).exists():
+        logger.error(f"V11 Modell nicht gefunden: {V11_MODEL_PATH}")
+        return
+
+    # CNN laden
+    cnn = get_cnn_model()
+    if cnn is None:
+        logger.error("CNN-Modell konnte nicht geladen werden!")
+        return
+    logger.info("CNN-Modell geladen")
+
+    # RL-Modelle laden
+    model_v10 = PPO.load(V10_MODEL_PATH)
+    logger.info(f"V10 Modell geladen: {V10_MODEL_PATH}")
+
+    model_v11 = PPO.load(V11_MODEL_PATH)
+    logger.info(f"V11 Modell geladen: {V11_MODEL_PATH}")
+
+    state = load_state()
+
+    creds = get_hl_credentials()
+    if not creds:
+        logger.error("Keine Hyperliquid Credentials!")
+        return
+
+    refresh_hl_coin_info()
+
+    # Tradeable Coins + Liquiditaets-Filter
+    app_conn = get_conn('app')
+    tradeable_coins = get_tradeable_coins(app_conn)
+    app_conn.close()
+    liquid_coins = update_liquid_coins(tradeable_coins)
+    last_volume_check = time.time()
+
+    logger.info(f"Punkte: {state['total_points']:.0f} | Profit: ${state['total_profit']:.2f} | "
+                f"Trades: {state.get('total_trades', 0)} | Skips: {state.get('total_skips', 0)}")
+
+    last_scan_time = 0
+    last_mgmt_time = 0
+    iteration = 0
+
+    while running:
+        try:
+            _check_day_rollover(state)
+            _check_week_rollover(state)
+
+            app_conn = get_conn('app')
+
+            config = get_agent_config(app_conn)
+            if not config['is_active']:
+                app_conn.close()
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # 1. Pending-Close Check (jede Iteration, 30s)
+            check_pending_closes(app_conn, state, creds)
+
+            # 1b. Skip-Outcomes pruefen (jede Iteration, via klines High/Low)
+            try:
+                check_skip_outcomes()
+            except:
+                pass
+
+            now_ts = time.time()
+
+            # Liquiditaets-Check 1x taeglich
+            if now_ts - last_volume_check >= 86400:
+                liquid_coins = update_liquid_coins(tradeable_coins)
+                last_volume_check = now_ts
+
+            # 2. Position-Management (alle 5 Min, nur V11)
+            if now_ts - last_mgmt_time >= MGMT_INTERVAL:
+                coins_conn = get_conn('coins')
+                manage_positions(model_v11, app_conn, coins_conn, state, creds)
+                coins_conn.close()
+                last_mgmt_time = now_ts
+
+            # 3. CNN-Scan + Ensemble-Entry (alle 5 Min)
+            if now_ts - last_scan_time >= ENTRY_INTERVAL:
+                coins_conn = get_conn('coins')
+                cnn_scan_and_ensemble_entry(model_v10, model_v11, app_conn, coins_conn,
+                                            state, creds, liquid_coins)
+                coins_conn.close()
+                last_scan_time = now_ts
+
+            # 4. Experience-Lernen
+            if len(experience_buffer) >= LEARN_BATCH_SIZE:
+                logger.info(f"[ENSEMBLE] Experience-Lernen starten: {len(experience_buffer)} Erfahrungen")
+                experience_learn_ensemble(model_v10, model_v11, list(experience_buffer))
+                experience_buffer.clear()
+
+            app_conn.close()
+
+            iteration += 1
+            if iteration % 60 == 0:  # Alle ~30 Min Status
+                n_open = 0
+                try:
+                    app_conn = get_conn('app')
+                    positions = get_open_positions_db(app_conn)
+                    n_open = len(positions)
+                    app_conn.close()
+                except:
+                    pass
+                hl_bal = get_hl_balance(creds['wallet_address'])
+                total_trades = state.get('total_trades', 0)
+                total_skips = state.get('total_skips', 0)
+                total_wins = state.get('total_wins', 0)
+                total_losses = state.get('total_losses', 0)
+                win_rate = total_wins / (total_wins + total_losses) * 100 if (total_wins + total_losses) > 0 else 0
+                logger.info(f"[ENSEMBLE] Status | HL: ${hl_bal:.2f} | "
+                            f"Profit: ${state['total_profit']:.2f} | "
+                            f"Punkte: {state['total_points']:.0f} | "
+                            f"Offen: {n_open} | "
+                            f"Trades: {total_trades} Skips: {total_skips} | "
+                            f"WR: {win_rate:.1f}% ({total_wins}W/{total_losses}L) | "
+                            f"Buffer: {len(experience_buffer)}/{LEARN_BATCH_SIZE} | "
+                            f"CNN-Scans: {state.get('cnn_scans', 0)} Signals: {state.get('cnn_signals', 0)}")
+
+        except Exception as e:
+            logger.error(f"Fehler im Hauptloop: {e}")
+            traceback.print_exc()
+            try:
+                app_conn.close()
+            except:
+                pass
+
+        time.sleep(POLL_INTERVAL)
+
+    save_state(state)
+    logger.info("Ensemble-Service gestoppt, State gespeichert")
+
+
+if __name__ == '__main__':
+    main()

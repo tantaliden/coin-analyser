@@ -1,11 +1,11 @@
 {
-  "test_accuracy": 90.65,
-  "old_accuracy": 88.91,
-  "trained_at": "2026-03-11T18:23:48.975119+00:00",
-  "events_used": 35544,
-  "test_events": 5273,
-  "new_long": "2450/2729",
-  "new_short": "2330/2544",
-  "old_long": "2517/2729",
-  "old_short": "2171/2544"
+  "test_accuracy": 77.54,
+  "old_accuracy": 75.95,
+  "trained_at": "2026-03-22T17:36:59.080153+00:00",
+  "events_used": 39127,
+  "test_events": 9926,
+  "new_long": "3196/3618",
+  "new_short": "4501/6308",
+  "old_long": "3202/3618",
+  "old_short": "4337/6308"
 }

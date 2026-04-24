@@ -130,6 +130,8 @@ async def get_predictions(
     symbol: Optional[str] = Query(None),
     direction: Optional[str] = Query(None),
     hide_traded: Optional[bool] = Query(None),
+    hl_only: Optional[bool] = Query(None),
+    max_age_min: Optional[int] = Query(None),
     scanner_type: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
@@ -155,6 +157,11 @@ async def get_predictions(
                 params.append(direction)
             if hide_traded:
                 where.append("prediction_id NOT IN (SELECT prediction_id FROM rl_positions WHERE prediction_id IS NOT NULL)")
+            if hl_only:
+                where.append("symbol IN (SELECT symbol FROM coin_info WHERE 'hyperliquid' = ANY(exchanges))")
+            if max_age_min:
+                where.append("detected_at >= NOW() - INTERVAL '%s minutes'")
+                params.append(max_age_min)
             where_sql = " AND ".join(where)
             cur.execute(f"SELECT COUNT(*) as total FROM momentum_predictions WHERE {where_sql}", params)
             total = cur.fetchone()['total']

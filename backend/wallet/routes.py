@@ -32,11 +32,8 @@ def get_user_binance_client(user_id: int):
 
 @router.get("/status")
 async def get_wallet_status(current_user: dict = Depends(get_current_user)):
-    with get_app_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT binance_api_valid FROM users WHERE user_id = %s", (current_user['user_id'],))
-            user = cur.fetchone()
-    return {"configured": bool(user and user['binance_api_valid'])}
+    # Binance deaktiviert — nur HL aktiv
+    return {"configured": False}
 
 
 @router.get("/balance")
@@ -237,10 +234,22 @@ async def create_order(request: CreateOrderRequest, current_user: dict = Depends
 
 
 @router.get("/history")
-async def get_trade_history(days: int = 7, current_user: dict = Depends(get_current_user)):
+async def get_trade_history(days: int = 30, limit: int = 500, current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
     with get_app_db() as conn:
         with conn.cursor() as cur:
+            # RL-Agent Positions (closed) als History
+            cur.execute("""
+                SELECT id, symbol, direction, leverage, entry_price, exit_price,
+                       position_size_usd, pnl_percent, pnl_usd, exit_reason,
+                       exchange, entry_time, exit_time, duration_minutes
+                FROM rl_positions
+                WHERE status = 'closed' AND exit_time >= NOW() - INTERVAL '%s days'
+                ORDER BY exit_time DESC LIMIT %s
+            """, (days, limit))
+            rl_trades = cur.fetchall()
+
+            # Alte trade_history (Binance Rocket-Button) dazu
             cur.execute("""
                 SELECT id, symbol, side, price, quantity, quote_amount,
                        is_bot_trade, indicator_set_name, indicator_set_accuracy, executed_at
@@ -248,16 +257,46 @@ async def get_trade_history(days: int = 7, current_user: dict = Depends(get_curr
                 WHERE user_id = %s AND executed_at >= NOW() - INTERVAL '%s days'
                 ORDER BY executed_at DESC LIMIT 100
             """, (user_id, days))
-            trades = cur.fetchall()
-    return {"trades": [{
-        "id": t['id'], "symbol": t['symbol'], "side": t['side'],
-        "price": float(t['price']), "quantity": float(t['quantity']),
-        "quote_amount": float(t['quote_amount']),
-        "is_bot_trade": t['is_bot_trade'],
-        "indicator_set_name": t['indicator_set_name'],
-        "indicator_set_accuracy": float(t['indicator_set_accuracy']) if t['indicator_set_accuracy'] else None,
-        "executed_at": t['executed_at'].isoformat() if t['executed_at'] else None
-    } for t in trades]}
+            old_trades = cur.fetchall()
+
+    trades = []
+    # RL-Positions als Trades formatieren
+    for t in rl_trades:
+        size = float(t['position_size_usd']) if t['position_size_usd'] else 0
+        lev = int(t['leverage'] or 1)
+        pnl = float(t['pnl_usd']) if t['pnl_usd'] else 0
+        trades.append({
+            "id": t['id'], "symbol": t['symbol'],
+            "side": t['direction'],
+            "price": float(t['entry_price']) if t['entry_price'] else 0,
+            "exit_price": float(t['exit_price']) if t['exit_price'] else None,
+            "quantity": 0,
+            "quote_amount": round(size, 2),
+            "sold_for": round(size + pnl, 2),
+            "leverage": t['leverage'],
+            "pnl_percent": round(pnl / size * 100, 2) if size > 0 else 0,
+            "pnl_usd": pnl,
+            "exit_reason": t['exit_reason'],
+            "exchange": t['exchange'] or 'hyperliquid',
+            "is_bot_trade": True,
+            "source": "rl_agent",
+            "executed_at": t['exit_time'].isoformat() if t['exit_time'] else None,
+            "entry_at": t['entry_time'].isoformat() if t['entry_time'] else None,
+            "duration_minutes": t['duration_minutes'],
+        })
+    # Alte Trades
+    for t in old_trades:
+        trades.append({
+            "id": t['id'], "symbol": t['symbol'], "side": t['side'],
+            "price": float(t['price']), "quantity": float(t['quantity']),
+            "quote_amount": float(t['quote_amount']),
+            "is_bot_trade": t['is_bot_trade'],
+            "source": "binance",
+            "executed_at": t['executed_at'].isoformat() if t['executed_at'] else None
+        })
+    # Nach Datum sortieren
+    trades.sort(key=lambda x: x.get('executed_at') or '', reverse=True)
+    return {"trades": trades[:limit]}
 
 
 @router.get("/realized-pnl")
@@ -359,7 +398,15 @@ async def convert_usdc_to_usdt(request: ConvertRequest, current_user: dict = Dep
 # ========== HYPERLIQUID ==========
 
 def get_user_hl_address(user_id: int):
-    """Haupt-Wallet-Adresse (0x...) aus DB holen. Für Read-Zugriff reicht die Adresse allein."""
+    """Wallet-Adresse für Read-Zugriff. Sub-Account (vault_address) hat Vorrang."""
+    try:
+        with open("/opt/coin/settings.json") as f:
+            s = json.load(f)
+        vault = s.get("hyperliquid", {}).get("vault_address")
+        if vault:
+            return vault
+    except Exception:
+        pass
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT hyperliquid_wallet_address, hyperliquid_api_valid FROM users WHERE user_id = %s", (user_id,))
@@ -470,3 +517,56 @@ async def get_hl_orders(current_user: dict = Depends(get_current_user)):
     except Exception as e:
         print(f"[WALLET-HL] Error getting orders: {e}")
         return {"error": str(e)}
+
+
+class HLCloseRequest(BaseModel):
+    coins: list[str]
+
+
+@router.post("/hl/close")
+async def close_hl_positions(request: HLCloseRequest, current_user: dict = Depends(get_current_user)):
+    """Schließt ausgewählte HL-Positionen manuell."""
+    from rl_agent.trader import get_hl_credentials, close_position_hl
+
+    creds = get_hl_credentials()
+    wallet = creds['wallet_address']
+    results = []
+
+    for coin in request.coins:
+        try:
+            result = close_position_hl(creds, coin, wallet)
+            results.append({"coin": coin, "success": result.get("success", False), "price": result.get("avg_price")})
+            # DB-Position auf closed setzen
+            if result.get("success"):
+                exit_price = result.get("avg_price", 0)
+                with get_app_db() as conn:
+                    with conn.cursor() as cur:
+                        # Entry-Preis holen für PnL-Berechnung
+                        cur.execute("""
+                            SELECT id, entry_price, direction, position_size_usd
+                            FROM rl_positions WHERE symbol = %s AND status = 'open'
+                        """, (coin + "USDC",))
+                        pos = cur.fetchone()
+                        pnl_pct = None
+                        pnl_usd = None
+                        duration = None
+                        if pos and exit_price:
+                            ep = float(pos['entry_price'])
+                            if ep > 0:
+                                if pos['direction'] == 'long':
+                                    pnl_pct = (float(exit_price) - ep) / ep * 100
+                                else:
+                                    pnl_pct = (ep - float(exit_price)) / ep * 100
+                                size = float(pos['position_size_usd'] or 20)
+                                pnl_usd = size * pnl_pct / 100
+                        cur.execute("""
+                            UPDATE rl_positions SET status = 'closed', exit_reason = 'manual_close',
+                                   exit_time = NOW(), exit_price = %s, pnl_percent = %s,
+                                   pnl_usd = %s, duration_minutes = EXTRACT(EPOCH FROM (NOW() - entry_time))::int / 60
+                            WHERE symbol = %s AND status = 'open'
+                        """, (exit_price, pnl_pct, pnl_usd, coin + "USDC"))
+                        conn.commit()
+        except Exception as e:
+            results.append({"coin": coin, "success": False, "error": str(e)})
+
+    return {"results": results}

@@ -39,8 +39,8 @@ TEST_START = datetime(2026, 1, 1)
 TEST_END = datetime(2026, 3, 9)
 
 SL_PERCENT = 5.0
-STEP_MINUTES = 5
-FEE_RATE = 0.001  # 0.1% pro Seite
+STEP_MINUTES = 1   # 1-Minuten-Takt (1m-Klines), näher am Live-30s-Verhalten
+FEE_RATE = 0.001   # 0.1% pro Seite
 
 # Budget
 START_BALANCE = 1000.0
@@ -67,13 +67,7 @@ def _calc_trade_size(portfolio):
 
 
 def _point_bonus(total_points):
-    """Bonus-Multiplikator auf Rewards basierend auf Punktestand."""
-    if total_points >= 5000:
-        return 2.0
-    if total_points >= 2000:
-        return 1.5
-    if total_points >= 500:
-        return 1.2
+    """DEAKTIVIERT — kein pauschaler Punkt-Bonus mehr."""
     return 1.0
 
 
@@ -103,28 +97,37 @@ def _check_day_rollover(state, current_time):
 
 
 def _check_week_rollover(state, current_time):
-    """Wochenwechsel: Prüft Wochen-Serie und gibt Bonus auf Wochenpunkte."""
+    """Wochenwechsel: Wochen-Bonus nur wenn Rohpunkte ≥10% über Vorwoche."""
     iso = current_time.isocalendar()
     current_week = f"{iso[0]}-W{iso[1]:02d}"
     if state['current_week'] == current_week:
         return
 
     if state['current_week']:
-        if state['week_points'] > 0:
+        raw_points = state['week_points_raw']
+        prev_raw = state.get('prev_week_raw_points', 0)
+
+        # Wochen-Bonus nur wenn: positiv UND mindestens 10% besser als Vorwoche
+        threshold = prev_raw * 1.10 if prev_raw > 0 else 0
+        if raw_points > 0 and raw_points >= threshold:
             state['winning_streak_weeks'] += 1
             multiplier = 1.20 + (state['winning_streak_weeks'] - 1) * 0.05
-            bonus_points = state['week_points'] * (multiplier - 1.0)
+            bonus_points = raw_points * (multiplier - 1.0)
             state['total_points'] += bonus_points
             print(f"    [WOCHEN-BONUS] Woche {state['winning_streak_weeks']}: "
-                  f"x{multiplier:.2f} auf {state['week_points']:.0f} = "
-                  f"+{bonus_points:.0f} Bonus (neu: {state['total_points']:.0f})")
+                  f"x{multiplier:.2f} auf {raw_points:.0f} Roh = "
+                  f"+{bonus_points:.0f} Bonus (Vorwoche: {prev_raw:.0f}, Schwelle: {threshold:.0f})")
         else:
             if state['winning_streak_weeks'] > 0:
-                print(f"    [WOCHEN-SERIE] Beendet nach {state['winning_streak_weeks']} Wochen")
+                reason = "negativ" if raw_points <= 0 else f"unter Schwelle ({raw_points:.0f} < {threshold:.0f})"
+                print(f"    [WOCHEN-SERIE] Beendet nach {state['winning_streak_weeks']} Wochen ({reason})")
             state['winning_streak_weeks'] = 0
+
+        state['prev_week_raw_points'] = raw_points
 
     state['current_week'] = current_week
     state['week_points'] = 0.0
+    state['week_points_raw'] = 0.0
 
 
 def get_conn(db_key):
@@ -147,11 +150,46 @@ def preload_market_data(coins_conn, symbols, start, end):
     print("=" * 70)
 
     market_data = {
-        'agg_5m': {}, 'agg_1h': {}, 'agg_4h': {}, 'agg_1d': {},
+        'klines_1m': {}, 'agg_5m': {}, 'agg_1h': {}, 'agg_4h': {}, 'agg_1d': {},
     }
 
     load_start = start - timedelta(days=14)
     load_end = end + timedelta(days=1)
+
+    # 1m-Klines laden (für Preis-Checks und SL, nur Backtest-Zeitraum)
+    print(f"  klines_1m...", end='', flush=True)
+    total_1m = 0
+    for symbol in symbols:
+        with coins_conn.cursor() as cur:
+            cur.execute("""
+                SELECT open_time, open, high, low, close, volume,
+                       trades, taker_buy_base
+                FROM klines
+                WHERE symbol = %s AND open_time >= %s AND open_time <= %s
+                ORDER BY open_time ASC
+            """, (symbol, start - timedelta(days=1), load_end))
+            rows = cur.fetchall()
+
+        if rows:
+            timestamps = []
+            for r in rows:
+                ts = r['open_time']
+                if hasattr(ts, 'tzinfo') and ts.tzinfo:
+                    ts = ts.replace(tzinfo=None)
+                timestamps.append(ts)
+
+            market_data['klines_1m'][symbol] = {
+                'timestamps': timestamps,
+                'open': np.array([float(r['open']) for r in rows], dtype=np.float32),
+                'high': np.array([float(r['high']) for r in rows], dtype=np.float32),
+                'low': np.array([float(r['low']) for r in rows], dtype=np.float32),
+                'close': np.array([float(r['close']) for r in rows], dtype=np.float32),
+                'volume': np.array([float(r['volume'] or 0) for r in rows], dtype=np.float32),
+                'trades': np.array([float(r['trades'] or 0) for r in rows], dtype=np.float32),
+                'taker': np.array([float(r['taker_buy_base'] or 0) for r in rows], dtype=np.float32),
+            }
+            total_1m += len(rows)
+    print(f" {total_1m:,} Zeilen, {len(market_data['klines_1m'])} Coins")
 
     for table in ['agg_5m', 'agg_1h', 'agg_4h', 'agg_1d']:
         print(f"  {table}...", end='', flush=True)
@@ -234,7 +272,7 @@ def preload_market_data(coins_conn, symbols, start, end):
     print(f" {total_km:,} Zeilen, {len(km_data)} Coins")
 
     total_bytes = 0
-    for table in ['agg_5m', 'agg_1h', 'agg_4h', 'agg_1d']:
+    for table in ['klines_1m', 'agg_5m', 'agg_1h', 'agg_4h', 'agg_1d']:
         for sym_data in market_data[table].values():
             for arr in sym_data.values():
                 if isinstance(arr, np.ndarray):
@@ -249,7 +287,10 @@ def preload_market_data(coins_conn, symbols, start, end):
 # ============================================================
 
 def _get_close(market_data, symbol, current_time):
-    data = market_data.get('agg_5m', {}).get(symbol)
+    data = market_data.get('klines_1m', {}).get(symbol)
+    if not data:
+        # Fallback auf 5m
+        data = market_data.get('agg_5m', {}).get(symbol)
     if not data:
         return 0.0
     idx = bisect.bisect_right(data['timestamps'], current_time) - 1
@@ -259,7 +300,9 @@ def _get_close(market_data, symbol, current_time):
 
 
 def _check_sl(market_data, symbol, current_time, entry_price, direction):
-    data = market_data.get('agg_5m', {}).get(symbol)
+    data = market_data.get('klines_1m', {}).get(symbol)
+    if not data:
+        data = market_data.get('agg_5m', {}).get(symbol)
     if not data:
         return False
     idx = bisect.bisect_right(data['timestamps'], current_time) - 1
@@ -380,6 +423,16 @@ def run_backtest():
     print(f"  Baseline HR: {baseline_hr:.1f}%")
     print()
 
+    # HL-Filter: Nur Coins die auf Hyperliquid tradebar sind
+    app_conn = get_conn('app')
+    with app_conn.cursor() as cur:
+        cur.execute("SELECT symbol FROM coin_info WHERE 'hyperliquid' = ANY(exchanges)")
+        hl_symbols = {r['symbol'] for r in cur.fetchall()}
+    app_conn.close()
+
+    predictions = [p for p in predictions if p['symbol'] in hl_symbols]
+    print(f"  {len(predictions)} Predictions nach HL-Filter (von {total})")
+
     # Symbole
     symbols = list(set(p['symbol'] for p in predictions))
     if 'BTCUSDC' not in symbols:
@@ -445,6 +498,8 @@ def run_backtest():
         'losing_streak_days': 0,
         'current_week': '',
         'week_points': 0.0,
+        'week_points_raw': 0.0,
+        'prev_week_raw_points': 0,
         'winning_streak_weeks': 0,
         'max_losing_streak': 0,
         'max_winning_streak': 0,
@@ -482,6 +537,7 @@ def run_backtest():
                 reward_with_bonus = reward * bonus
                 state['total_points'] += reward_with_bonus
                 state['week_points'] += reward_with_bonus
+                state['week_points_raw'] += reward
                 fees = pos['margin'] * pos['leverage'] * FEE_RATE * 2
                 portfolio += pos['margin'] - fees
                 total_margin_locked -= pos['margin']
@@ -506,6 +562,7 @@ def run_backtest():
                 reward_with_bonus = reward * bonus
                 state['total_points'] += reward_with_bonus
                 state['week_points'] += reward_with_bonus
+                state['week_points_raw'] += reward
                 pnl_dollar = pos['margin'] * pos['leverage'] * pnl_pct / 100
                 fees = pos['margin'] * pos['leverage'] * FEE_RATE * 2
                 net_pnl = pnl_dollar - fees
@@ -549,6 +606,7 @@ def run_backtest():
                 reward_with_bonus = reward * bonus
                 state['total_points'] += reward_with_bonus
                 state['week_points'] += reward_with_bonus
+                state['week_points_raw'] += reward
                 pnl_dollar = pos['margin'] * pos['leverage'] * pnl_pct / 100
                 fees = pos['margin'] * pos['leverage'] * FEE_RATE * 2
                 net_pnl = pnl_dollar - fees
@@ -575,6 +633,7 @@ def run_backtest():
                 reward_with_bonus = reward * bonus
                 state['total_points'] += reward_with_bonus
                 state['week_points'] += reward_with_bonus
+                state['week_points_raw'] += reward
                 pnl_dollar = pos['margin'] * pos['leverage'] * pnl_pct / 100
                 fees = pos['margin'] * pos['leverage'] * FEE_RATE * 2
                 net_pnl = pnl_dollar - fees
@@ -697,6 +756,7 @@ def run_backtest():
         reward_with_bonus = reward * bonus
         state['total_points'] += reward_with_bonus
         state['week_points'] += reward_with_bonus
+        state['week_points_raw'] += reward
         fees = pos['margin'] * pos['leverage'] * FEE_RATE * 2
         portfolio += pos['margin'] + pnl_dollar - fees
         total_margin_locked -= pos['margin']

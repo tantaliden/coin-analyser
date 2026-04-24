@@ -214,6 +214,38 @@ def check_kline_metrics():
     except Exception as e:
         return 'CRITICAL', f'DB: {e}'
 
+def check_agg_freshness():
+    """Prueft ob agg_5m, agg_1h, agg_4h aktuell sind"""
+    results = []
+    thresholds = {
+        'agg_5m':  (12, 20),
+        'agg_1h':  (125, 180),
+        'agg_4h':  (485, 600),
+    }
+    try:
+        conn = psycopg2.connect(**DB_CONFIG, connect_timeout=10)
+        conn.set_session(autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '10s'")
+            for table, (warn_min, crit_min) in thresholds.items():
+                cur.execute(f"SELECT MAX(bucket) FROM {table}")
+                result = cur.fetchone()
+                if result[0] is None:
+                    results.append(('CRITICAL', f'{table}: Keine Daten!'))
+                    continue
+                last = result[0]
+                if last.tzinfo is None:
+                    last = BERLIN_TZ.localize(last)
+                age = (datetime.now(BERLIN_TZ) - last).total_seconds() / 60
+                if age > crit_min:
+                    results.append(('CRITICAL', f'{table}: {age:.0f} min alt!'))
+                elif age > warn_min:
+                    results.append(('WARNING', f'{table}: {age:.0f} min alt'))
+        conn.close()
+    except Exception as e:
+        results.append(('CRITICAL', f'Agg-Check DB: {e}'))
+    return results
+
 def check_cpu():
     try:
         with open('/proc/loadavg', 'r') as f:
@@ -295,9 +327,9 @@ def run_health_check():
     
     # Service Check - critical services
     critical_services = [
-        'analyser-ingestor', 'kline-metrics-live', 'momentum-scanner',
-        'coin-analyser-api', 'trade-tracker', 'event-finder',
-        'sentiment-scanner', 'rl-agent',
+        'analyser-ingestor', 'agg-refresher',
+        'coin-analyser-api', 'coin-info-updater',
+        'rl-agent',
     ]
     for svc in critical_services:
         if not check_service(f'{svc}.service'):
@@ -307,6 +339,11 @@ def run_health_check():
     status, msg = check_kline_metrics()
     if status != 'OK':
         problems.append(f"Metrics: {msg}")
+
+    # Agg Freshness Check
+    for status, msg in check_agg_freshness():
+        if status != 'OK':
+            problems.append(msg)
 
     # Learner Check
     status, msg = check_learner_health()
@@ -408,11 +445,11 @@ def cmd_health():
 
     # Services
     services = [
-        'analyser-ingestor', 'kline-metrics-live', 'momentum-scanner',
-        'analyser-telegram-bot', 'mcp-coin', 'heartbeat-watchdog',
-        'autosearch-worker', 'coin-info-updater', 'event-finder',
-        'trade-tracker', 'coin-analyser-api', 'coin-analyser-frontend',
-        'sentiment-scanner', 'rl-agent',
+        'analyser-ingestor', 'agg-refresher',
+        'analyser-telegram-bot', 'heartbeat-watchdog',
+        'coin-info-updater',
+        'coin-analyser-api', 'coin-analyser-frontend',
+        'rl-agent',
     ]
     for svc in services:
         ok = check_service(f'{svc}.service')

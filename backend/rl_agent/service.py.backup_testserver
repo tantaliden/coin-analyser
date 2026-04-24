@@ -1,0 +1,1086 @@
+#!/usr/bin/env python3
+"""
+RL-Agent Service V5 — Autonomous, PPO Discrete(21), Live Trading.
+
+Agent scannt alle HL-Coins selbst und entscheidet autonom:
+- Welchen Coin handeln
+- Richtung (long/short) + Hebel (1x-10x)
+- Exit-Timing (alle 5 Min: halten oder schließen)
+
+Kein CNN, keine Predictions. Agent sieht KEIN Geld — nur Marktdaten.
+Portfolio-Management läuft unsichtbar im Hintergrund.
+
+Discrete(21): skip, long 1x-10x, short 1x-10x
+Mehrstufiges Reward-System: Verlust-Penalty, Early-Exit-Penalty, Win-Bonus
+
+Usage:
+    systemctl start rl-agent
+"""
+import json
+import time
+import signal
+import sys
+import logging
+import traceback
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import numpy as np
+import psycopg2
+import psycopg2.extras
+from stable_baselines3 import PPO
+
+# Close-Logger — eigene Datei für alle Verkaufsentscheidungen
+close_logger = logging.getLogger('rl_closes')
+close_logger.setLevel(logging.DEBUG)
+_cl_handler = logging.FileHandler('/opt/coin/logs/rl_closes.log')
+_cl_handler.setFormatter(logging.Formatter('%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+close_logger.addHandler(_cl_handler)
+close_logger.propagate = False
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# === MODELL-KONFIGURATION ===
+# Auskommentieren/einkommentieren je nach Live-Version:
+#
+# --- V10 (env_v8, mit SL + Timeout) ---
+from rl_agent.env_v8 import LEVERAGE_MAP, _reward, TradingEnvV6 as TradingEnvLive
+ACTIVE_VERSION = 'v10'
+#
+# --- V11 (env_v11, kein SL, kein Timeout, 15 Slots) ---
+# from rl_agent.env_v11 import LEVERAGE_MAP, _reward, TradingEnvV11 as TradingEnvLive
+# ACTIVE_VERSION = 'v11'
+#
+from rl_agent.features import compute_observation_live, compute_observation_hl, N_FEATURES
+from rl_agent.trader import (
+    get_hl_credentials,
+    get_hl_balance,
+    get_hl_open_positions,
+    get_available_coins_hl,
+    get_current_prices_hl,
+    place_limit_order_hl,
+    close_position_hl,
+    cancel_all_orders_for_coin_hl,
+    refresh_hl_coin_info,
+)
+
+SETTINGS_PATH = "/opt/coin/settings.json"
+# Modell-Pfade je nach Version
+_MODEL_PATHS = {
+    'v10': "/opt/coin/database/data/models/rl_ppo_trading_v10.zip",
+    'v11': "/opt/coin/database/data/models/rl_ppo_trading_v11.zip",
+}
+MODEL_PATH = _MODEL_PATHS[ACTIVE_VERSION]
+STATE_PATH = "/opt/coin/database/data/models/rl_agent_state.json"
+
+POLL_INTERVAL = 30          # Hauptloop-Takt (Sekunden)
+ENTRY_INTERVAL = 300        # Coin-Scan alle 5 Min
+MGMT_INTERVAL = 300         # Positions-Management alle 5 Min
+
+# Version-abhaengige Konstanten
+_VERSION_CONFIG = {
+    'v10': {'sl_percent': 10.0, 'max_position_age': None, 'max_concurrent': 25},
+    'v11': {'sl_percent': None, 'max_position_age': None, 'max_concurrent': 15},
+}
+_vc = _VERSION_CONFIG[ACTIVE_VERSION]
+SL_PERCENT = _vc['sl_percent']                   # None = kein SL
+MAX_POSITION_AGE = _vc['max_position_age']        # None = kein Timeout
+MAX_CONCURRENT_START = _vc['max_concurrent']
+MAX_CONCURRENT_FULL = _vc['max_concurrent']
+MAX_CONCURRENT_THRESHOLD = 1500.0
+
+FEE_RATE = 0.00035          # 0.035% pro Seite (Hyperliquid Taker)
+MAX_TRADES_PER_DAY = 1000   # Tages-Trade-Limit
+MIN_24H_VOLUME = 20_000     # Mindest-24h-Volume ($) — darunter zu illiquide
+LEARN_BATCH_SIZE = 150      # Nach 150 abgeschlossenen Trades: Lernzyklus
+LEARN_STEPS = 2000          # Steps pro Lernzyklus
+
+# Progressive Trade-Size (identisch zum Backtest)
+BASE_TRADE_SIZE = 15.0
+
+STABLECOINS = {'USDCUSDC', 'USDTUSDC', 'BUSDUSDC', 'DAIUSDC', 'TUSDUSDC', 'FDUSDUSDC'}
+
+# Experience Buffer — sammelt abgeschlossene Trades fuer Lernzyklen
+experience_buffer = []
+
+
+def _calc_trade_size(wallet_balance, base_size=BASE_TRADE_SIZE):
+    """Progressive Trade-Size (Notional)."""
+    if wallet_balance < 1500:
+        return base_size
+    if wallet_balance < 5000:
+        return wallet_balance / 100
+    step = int((wallet_balance - 5000) / 1000)
+    divisor = 110 + step * 10
+    if divisor > 200:
+        divisor = 200
+    return wallet_balance / divisor
+
+
+def _check_day_rollover(state):
+    """Tageswechsel."""
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    if state['current_day'] == today:
+        return
+    state['current_day'] = today
+    state['day_pnl'] = 0.0
+
+
+def _check_week_rollover(state):
+    """Wochenwechsel."""
+    now = datetime.now(timezone.utc)
+    current_week = f"{now.isocalendar()[0]}-W{now.isocalendar()[1]:02d}"
+    if state['current_week'] == current_week:
+        return
+    state['prev_week_raw_points'] = state.get('week_points_raw', 0)
+    state['current_week'] = current_week
+    state['week_points'] = 0.0
+    state['week_points_raw'] = 0.0
+
+
+running = True
+
+
+def signal_handler(sig, frame):
+    global running
+    print(f"\n[RL-AGENT] Signal {sig} empfangen, stoppe...")
+    running = False
+
+
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+
+# ============================================================
+# Liquiditaets-Filter
+# ============================================================
+
+def update_liquid_coins(tradeable_coins):
+    """1x taeglich: Coins unter MIN_24H_VOLUME rausfiltern."""
+    try:
+        from hyperliquid.info import Info
+        info = Info(skip_ws=True)
+        metas = info.meta_and_asset_ctxs()
+        assets = metas[0]['universe']
+        ctxs = metas[1]
+
+        volumes = {}
+        for asset, ctx in zip(assets, ctxs):
+            volumes[asset['name']] = float(ctx.get('dayNtlVlm', 0))
+
+        liquid = []
+        blocked = []
+        for symbol in tradeable_coins:
+            coin = symbol.replace('USDC', '').replace('USDT', '')
+            vol = volumes.get(coin, 0)
+            if vol >= MIN_24H_VOLUME:
+                liquid.append(symbol)
+            else:
+                blocked.append((symbol, vol))
+
+        if blocked:
+            print(f"[RL-AGENT] Liquiditaets-Filter: {len(blocked)} Coins gesperrt (< ${MIN_24H_VOLUME:,} 24h-Vol)")
+            for sym, vol in blocked[:10]:
+                print(f"  {sym}: ${vol:,.0f}")
+            if len(blocked) > 10:
+                print(f"  ... und {len(blocked)-10} weitere")
+
+        print(f"[RL-AGENT] {len(liquid)} liquide Coins von {len(tradeable_coins)}")
+        return liquid
+    except Exception as e:
+        print(f"[RL-AGENT] Liquiditaets-Check fehlgeschlagen: {e} — verwende alle Coins")
+        return tradeable_coins
+
+
+# ============================================================
+# DB Connections
+# ============================================================
+
+def get_conn(db_key):
+    s = json.load(open(SETTINGS_PATH))
+    db = s['databases'][db_key]
+    return psycopg2.connect(
+        dbname=db['name'], user=db['user'], password=db['password'],
+        host=db['host'], port=db['port'],
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
+
+
+# ============================================================
+# Telegram Alarm
+# ============================================================
+
+def _send_telegram_alarm(message):
+    """Alarm ueber Telegram senden (best-effort)."""
+    try:
+        s = json.load(open(SETTINGS_PATH))
+        bot_token = s.get('telegram', {}).get('bot_token')
+        chat_id = s.get('telegram', {}).get('chat_id')
+        if not bot_token or not chat_id:
+            return
+        import urllib.request
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        data = json.dumps({'chat_id': chat_id, 'text': f"⚠️ RL-Agent: {message}"}).encode()
+        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
+
+
+# ============================================================
+# State Persistence
+# ============================================================
+
+def load_state():
+    """Lade persistenten Agent-State."""
+    if Path(STATE_PATH).exists():
+        try:
+            with open(STATE_PATH) as f:
+                state = json.load(f)
+            _start_points = 2000.0 if ACTIVE_VERSION == 'v11' else 500.0
+            state.setdefault('total_points', _start_points)
+            state.setdefault('total_profit', 0.0)
+            state.setdefault('losing_streak_days', 0)
+            state.setdefault('winning_streak_weeks', 0)
+            state.setdefault('current_day', '')
+            state.setdefault('current_week', '')
+            state.setdefault('day_pnl', 0.0)
+            state.setdefault('week_points', 0.0)
+            state.setdefault('week_points_raw', 0.0)
+            state.setdefault('prev_week_raw_points', 0)
+            state.setdefault('last_trade_times', {})
+            # V4-Felder entfernen
+            state.pop('portfolio', None)
+            state.pop('peak_portfolio', None)
+            state.pop('last_processed_id', None)
+            print(f"[RL-AGENT] State geladen: {state['total_points']:.0f} Punkte, "
+                  f"Profit: ${state['total_profit']:.2f}")
+            return state
+        except Exception as e:
+            print(f"[RL-AGENT] State laden fehlgeschlagen: {e}")
+
+    _start_points = 2000.0 if ACTIVE_VERSION == 'v11' else 500.0
+    return {
+        'total_points': _start_points,
+        'total_profit': 0.0,
+        'losing_streak_days': 0,
+        'winning_streak_weeks': 0,
+        'current_day': '',
+        'current_week': '',
+        'day_pnl': 0.0,
+        'week_points': 0.0,
+        'week_points_raw': 0.0,
+        'prev_week_raw_points': 0,
+        'last_trade_times': {},
+    }
+
+
+def save_state(state):
+    """Speichere Agent-State."""
+    try:
+        state['updated_at'] = datetime.now(timezone.utc).isoformat()
+        with open(STATE_PATH, 'w') as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"[RL-AGENT] State speichern fehlgeschlagen: {e}")
+
+
+# ============================================================
+# DB Queries
+# ============================================================
+
+def get_agent_config(conn):
+    """Agent-Konfiguration laden."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM rl_agent_config WHERE user_id = 1")
+        row = cur.fetchone()
+    if not row:
+        return {'is_active': False, 'max_concurrent_positions': MAX_CONCURRENT, 'max_leverage': 10}
+    return {
+        'is_active': row['is_active'],
+        'max_concurrent_positions': row['max_concurrent_positions'],
+        'max_leverage': row['max_leverage'],
+        'base_trade_size': float(row['base_trade_size']) if row.get('base_trade_size') else BASE_TRADE_SIZE,
+    }
+
+
+def get_tradeable_coins(conn):
+    """HL-tradeable Coins aus DB laden."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT symbol FROM coin_info WHERE 'hyperliquid' = ANY(exchanges)")
+        coins = [r['symbol'] for r in cur.fetchall()]
+    return [c for c in coins if c not in STABLECOINS]
+
+
+def get_open_positions_db(conn):
+    """Offene RL-Positionen aus DB laden."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, symbol, direction, entry_price, entry_time,
+                   position_size_usd, leverage
+            FROM rl_positions
+            WHERE status = 'open'
+            ORDER BY entry_time ASC
+        """)
+        return cur.fetchall()
+
+
+def log_position_open(conn, symbol, direction, entry_price, size_usd, leverage):
+    """Neue Position in DB loggen."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO rl_positions
+            (symbol, direction, entry_price, entry_time, position_size_usd,
+             leverage, status, mode, exchange)
+            VALUES (%s, %s, %s, NOW(), %s, %s, 'open', 'live', 'hyperliquid')
+            RETURNING id
+        """, (symbol, direction, entry_price, size_usd, leverage))
+        pos_id = cur.fetchone()['id']
+        conn.commit()
+        return pos_id
+
+
+def log_position_close(conn, pos_id, exit_price, exit_reason, pnl_pct, pnl_usd, duration_min):
+    """Position als geschlossen loggen."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE rl_positions SET
+                exit_price = %s, exit_time = NOW(), exit_reason = %s,
+                pnl_percent = %s, pnl_usd = %s, duration_minutes = %s,
+                status = 'closed'
+            WHERE id = %s
+        """, (exit_price, exit_reason, round(pnl_pct, 4), round(pnl_usd, 2),
+              duration_min, pos_id))
+        conn.commit()
+
+
+def log_decision(conn, pos_id, symbol, action, reward, in_position, unrealized_pnl):
+    """Agent-Entscheidung loggen."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO rl_decisions
+            (position_id, timestamp, symbol, action, reward, in_position, unrealized_pnl)
+            VALUES (%s, NOW(), %s, %s, %s, %s, %s)
+        """, (pos_id, symbol, action, round(reward, 4) if reward else None,
+              in_position, round(unrealized_pnl, 4) if unrealized_pnl else None))
+        conn.commit()
+
+
+# ============================================================
+# Position Management
+# ============================================================
+
+def calc_pnl_pct(direction, entry_price, current_price):
+    """PnL% berechnen."""
+    if entry_price <= 0 or current_price <= 0:
+        return 0.0
+    if direction == 'long':
+        return (current_price - entry_price) / entry_price * 100
+    else:
+        return (entry_price - current_price) / entry_price * 100
+
+
+def check_stop_loss(direction, entry_price, current_price):
+    """SL-Check: Wurde SL erreicht? Gibt False wenn SL deaktiviert."""
+    if SL_PERCENT is None:
+        return False
+    pnl = calc_pnl_pct(direction, entry_price, current_price)
+    return pnl <= -SL_PERCENT
+
+
+def _finalize_close(app_conn, state, pos, current_price, exit_price, pnl_pct, exit_reason):
+    """Close bestätigt: Punkte verbuchen und DB auf closed setzen."""
+    symbol = pos['symbol']
+    direction = pos['direction']
+    leverage = int(pos['leverage'])
+    position_size = float(pos['position_size_usd'])
+    entry_time = pos['entry_time']
+    pos_id = pos['id']
+    now = datetime.now(timezone.utc)
+    duration_min = int((now - entry_time).total_seconds() / 60) if entry_time else 0
+
+    reward = _reward(pnl_pct, leverage)
+
+    # Wiederholungs-Penalty: Gleicher Coin <1h -> Reward x0.8 (nur bei Gewinn)
+    last_trade_times = state.get('last_trade_times', {})
+    last_time = last_trade_times.get(symbol)
+    if last_time and reward > 0:
+        try:
+            last_dt = datetime.fromisoformat(last_time)
+            if (now - last_dt).total_seconds() < 3600:
+                reward *= 0.8
+        except:
+            pass
+
+    state['total_points'] += reward
+    state['week_points'] += reward
+    state['week_points_raw'] = state.get('week_points_raw', 0) + reward
+
+    pnl_dollar = position_size * pnl_pct / 100
+    fees = position_size * FEE_RATE * 2
+    net_pnl = pnl_dollar - fees
+    state['total_profit'] += net_pnl
+    state['day_pnl'] += net_pnl
+
+    log_position_close(app_conn, pos_id, exit_price or current_price,
+                       exit_reason, pnl_pct, net_pnl, duration_min)
+    log_decision(app_conn, pos_id, symbol, -1, reward, False, pnl_pct)
+
+    print(f"[RL-AGENT] {exit_reason.upper()} {symbol} {direction} {leverage}x | "
+          f"PnL: {pnl_pct:+.2f}% ${net_pnl:+.2f} | "
+          f"Punkte: {state['total_points']:+.0f} (reward: {reward:+.2f})")
+
+    # Experience Buffer: Trade-Zeitraum merken fuer Lernzyklus
+    et = entry_time
+    if hasattr(et, 'tzinfo') and et.tzinfo:
+        et = et.replace(tzinfo=None)
+    experience_buffer.append({
+        'symbol': symbol,
+        'entry_time': et,
+        'exit_time': now.replace(tzinfo=None),
+    })
+
+
+def _set_pending_close(app_conn, state, pos_id):
+    """Position auf pending_close setzen."""
+    with app_conn.cursor() as cur:
+        cur.execute("UPDATE rl_positions SET status = 'pending_close' WHERE id = %s", (pos_id,))
+        app_conn.commit()
+    state.setdefault('pending_closes', {})[str(pos_id)] = {
+        'requested_at': datetime.now(timezone.utc).isoformat(),
+        'retried': False,
+    }
+
+
+def _set_back_to_open(app_conn, state, pos_id, symbol):
+    """Pending_close zurueck auf open setzen (Close fehlgeschlagen)."""
+    with app_conn.cursor() as cur:
+        cur.execute("UPDATE rl_positions SET status = 'open' WHERE id = %s", (pos_id,))
+        app_conn.commit()
+    state.get('pending_closes', {}).pop(str(pos_id), None)
+    print(f"[RL-AGENT] {symbol} zurueck auf OPEN (Close fehlgeschlagen, Agent versucht erneut)")
+
+
+def _close_and_log(app_conn, state, creds, pos, current_price, pnl_pct, exit_reason):
+    """Position schliessen — bei Erfolg sofort closed, bei Fehler pending_close."""
+    symbol = pos['symbol']
+    pos_id = pos['id']
+    coin = symbol.replace('USDC', '').replace('USDT', '')
+
+    # VOR dem Close: pruefen ob Position auf HL ueberhaupt noch existiert
+    try:
+        hl_positions = get_hl_open_positions(creds['wallet_address'])
+        hl_coins_open = {p['coin'] for p in hl_positions}
+        if coin not in hl_coins_open:
+            close_logger.warning(f"ALREADY_CLOSED {symbol} | Position nicht mehr auf HL")
+            _finalize_close(app_conn, state, pos, current_price, current_price, pnl_pct, exit_reason)
+            return
+    except Exception as e:
+        close_logger.error(f"HL_CHECK_FAILED {symbol} | {e}")
+
+    close_logger.info(f"CLOSE_ATTEMPT {symbol} | reason={exit_reason} | price={current_price:.6f} | pnl={pnl_pct:+.2f}%")
+    cancel_all_orders_for_coin_hl(creds, coin)
+    result = close_position_hl(creds, coin, creds['wallet_address'])
+
+    if result.get('success'):
+        exit_price = result.get('avg_price', 0)
+        close_logger.info(f"CLOSE_OK {symbol} | exit_price={exit_price:.6f} | reason={exit_reason}")
+        _finalize_close(app_conn, state, pos, current_price, exit_price, pnl_pct, exit_reason)
+    else:
+        close_logger.warning(f"CLOSE_FAILED {symbol} | reason={exit_reason} -> pending_close")
+        print(f"[RL-AGENT] Close fehlgeschlagen fuer {symbol} -> pending_close")
+        _set_pending_close(app_conn, state, pos_id)
+        save_state(state)
+
+
+def check_pending_closes(app_conn, state, creds):
+    """Pending-Close Positionen pruefen (jede 30s Iteration)."""
+    with app_conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, symbol, direction, entry_price, entry_time,
+                   position_size_usd, leverage
+            FROM rl_positions
+            WHERE status = 'pending_close'
+            ORDER BY entry_time ASC
+        """)
+        pending = cur.fetchall()
+
+    if not pending:
+        return
+
+    try:
+        hl_pos_list = get_hl_open_positions(creds['wallet_address'])
+        hl_coins_open = {p['coin'] for p in hl_pos_list}
+    except:
+        hl_coins_open = set()
+
+    now = datetime.now(timezone.utc)
+    pending_state = state.get('pending_closes', {})
+
+    for pos in pending:
+        pos_id = pos['id']
+        symbol = pos['symbol']
+        coin = symbol.replace('USDC', '').replace('USDT', '')
+        direction = pos['direction']
+        entry_price = float(pos['entry_price'])
+
+        info = pending_state.get(str(pos_id), {})
+        requested_at_str = info.get('requested_at')
+        retried = info.get('retried', False)
+
+        if requested_at_str:
+            try:
+                requested_at = datetime.fromisoformat(requested_at_str)
+            except:
+                requested_at = now
+        else:
+            requested_at = now
+            pending_state[str(pos_id)] = {'requested_at': now.isoformat(), 'retried': False}
+
+        elapsed = (now - requested_at).total_seconds()
+        coin_on_hl = coin in hl_coins_open
+
+        if not coin_on_hl:
+            # Position weg von HL -> Close bestaetigt
+            try:
+                prices_hl = get_current_prices_hl()
+                current_price = prices_hl.get(coin, 0)
+            except:
+                current_price = 0
+            if current_price <= 0:
+                current_price = entry_price
+
+            pnl_pct = calc_pnl_pct(direction, entry_price, current_price)
+            close_logger.info(f"PENDING_CONFIRMED {symbol} | Position weg von HL | pnl={pnl_pct:+.2f}%")
+            _finalize_close(app_conn, state, pos, current_price, current_price, pnl_pct, 'agent_exit')
+            pending_state.pop(str(pos_id), None)
+            print(f"[RL-AGENT] Pending {symbol} bestaetigt: Position nicht mehr auf HL")
+            continue
+
+        if elapsed >= 60:
+            # 60s vergangen -> Cancel, zurueck auf open
+            close_logger.warning(f"PENDING_TIMEOUT {symbol} | {elapsed:.0f}s -> zurueck auf OPEN")
+            try:
+                cancel_all_orders_for_coin_hl(creds, coin)
+            except:
+                pass
+            _set_back_to_open(app_conn, state, pos_id, symbol)
+            continue
+
+        if elapsed >= 15 and not retried:
+            # 15s vergangen -> Retry sell
+            close_logger.info(f"PENDING_RETRY {symbol} | {elapsed:.0f}s -> Retry sell")
+            print(f"[RL-AGENT] Pending {symbol}: Retry sell nach {elapsed:.0f}s")
+            try:
+                close_position_hl(creds, coin, creds['wallet_address'])
+            except Exception as e:
+                print(f"[RL-AGENT] Retry sell {symbol} fehlgeschlagen: {e}")
+            info['retried'] = True
+
+    state['pending_closes'] = pending_state
+    save_state(state)
+
+
+def check_sl_and_timeout(app_conn, state, creds):
+    """SL + Timeout Check — laeuft alle 30s im Hauptloop mit Live-Preisen."""
+    # V11: Kein SL und kein Timeout — Agent entscheidet komplett selbst
+    if SL_PERCENT is None and MAX_POSITION_AGE is None:
+        return
+
+    open_positions = get_open_positions_db(app_conn)
+    if not open_positions:
+        return
+
+    try:
+        prices_hl = get_current_prices_hl()
+    except:
+        prices_hl = {}
+
+    now = datetime.now(timezone.utc)
+    closed_coins = set()
+
+    for pos in open_positions:
+        symbol = pos['symbol']
+        coin = symbol.replace('USDC', '').replace('USDT', '')
+        direction = pos['direction']
+        entry_price = float(pos['entry_price'])
+        entry_time = pos['entry_time']
+        leverage = int(pos['leverage'])
+
+        if coin in closed_coins:
+            close_logger.warning(f"SKIP_DOUBLE_CLOSE {symbol} | bereits geschlossen")
+            continue
+
+        current_price = prices_hl.get(coin, 0)
+        if current_price <= 0:
+            continue
+
+        pnl_pct = calc_pnl_pct(direction, entry_price, current_price)
+        duration_min = int((now - entry_time).total_seconds() / 60) if entry_time else 0
+
+        # SL Check (nur wenn SL aktiv)
+        if SL_PERCENT is not None and check_stop_loss(direction, entry_price, current_price):
+            close_logger.info(f"SL_TRIGGER {symbol} {direction} {leverage}x | PnL: {pnl_pct:+.2f}% | Dauer: {duration_min}min")
+            _close_and_log(app_conn, state, creds, pos, current_price, -SL_PERCENT, 'sl')
+            closed_coins.add(coin)
+            continue
+
+        # Timeout Check (nur wenn Timeout aktiv)
+        if MAX_POSITION_AGE is not None and duration_min >= MAX_POSITION_AGE:
+            close_logger.info(f"TIMEOUT_TRIGGER {symbol} {direction} {leverage}x | PnL: {pnl_pct:+.2f}% | Dauer: {duration_min}min")
+            _close_and_log(app_conn, state, creds, pos, current_price, pnl_pct, 'timeout')
+            closed_coins.add(coin)
+
+    save_state(state)
+
+
+def manage_positions(model, app_conn, coins_conn, state, creds):
+    """Agent-Entscheidung alle 5 Min: halten oder schliessen."""
+    open_positions = get_open_positions_db(app_conn)
+    if not open_positions:
+        return
+
+    try:
+        prices_hl = get_current_prices_hl()
+    except:
+        prices_hl = {}
+
+    now = datetime.now(timezone.utc)
+    n_open = len(open_positions)
+    closed_coins = set()
+
+    for pos in open_positions:
+        symbol = pos['symbol']
+        coin = symbol.replace('USDC', '').replace('USDT', '')
+        direction = pos['direction']
+        entry_price = float(pos['entry_price'])
+        leverage = int(pos['leverage'])
+        entry_time = pos['entry_time']
+        pos_id = pos['id']
+
+        if coin in closed_coins:
+            close_logger.warning(f"SKIP_DOUBLE_CLOSE {symbol} | bereits geschlossen")
+            continue
+
+        current_price = prices_hl.get(coin, 0)
+        if current_price <= 0:
+            continue
+
+        pnl_pct = calc_pnl_pct(direction, entry_price, current_price)
+        duration_min = int((now - entry_time).total_seconds() / 60) if entry_time else 0
+
+        pos_state = {
+            'in_position': True,
+            'direction': 1 if direction == 'long' else -1,
+            'unrealized_pnl': pnl_pct,
+            'duration_min': duration_min,
+        }
+
+        try:
+            obs = compute_observation_hl(
+                coins_conn, symbol,
+                position_state=pos_state,
+                n_open_positions=n_open,
+            )
+        except ConnectionError as e:
+            print(f"[RL-AGENT] ALARM: HL API nicht erreichbar! Kein Trading. ({e})")
+            _send_telegram_alarm("HL API nicht erreichbar! Kein Position-Management.")
+            return
+        mgmt_action, _ = model.predict(obs, deterministic=False)
+        mgmt_action = int(mgmt_action)
+
+        if mgmt_action != 0:
+            close_logger.info(f"SELL_DECISION {symbol} {direction} {leverage}x | PnL: {pnl_pct:+.2f}% | Dauer: {duration_min}min | Action: {mgmt_action}")
+            _close_and_log(app_conn, state, creds, pos, current_price, pnl_pct, 'agent_exit')
+            closed_coins.add(coin)
+        else:
+            log_decision(app_conn, pos_id, symbol, 0, None, True, pnl_pct)
+
+    save_state(state)
+
+
+# ============================================================
+# Autonomer Coin-Scan (ersetzt process_predictions)
+# ============================================================
+
+def scan_all_coins(model, app_conn, coins_conn, state, creds, tradeable_coins):
+    """
+    Alle HL-Coins durchgehen, Agent entscheidet autonom.
+    Kein CNN, keine Predictions — Agent sieht Marktdaten und entscheidet selbst.
+    """
+    config = get_agent_config(app_conn)
+    open_positions = get_open_positions_db(app_conn)
+    n_open = len(open_positions)
+    open_symbols = {p['symbol'] for p in open_positions}
+    now = datetime.now(timezone.utc)
+
+    try:
+        prices_hl = get_current_prices_hl()
+    except:
+        prices_hl = {}
+
+    wallet_balance = get_hl_balance(creds['wallet_address'])
+    max_concurrent = MAX_CONCURRENT_FULL if wallet_balance >= MAX_CONCURRENT_THRESHOLD else MAX_CONCURRENT_START
+    trades_opened = 0
+
+    # Tages-Trade-Limit
+    today = now.strftime('%Y-%m-%d')
+    if state.get('trade_day') != today:
+        state['trade_day'] = today
+        state['trades_today'] = 0
+
+    for symbol in tradeable_coins:
+        if n_open >= max_concurrent:
+            break
+        if state['trades_today'] >= MAX_TRADES_PER_DAY:
+            break
+
+        if symbol in open_symbols:
+            continue
+
+        coin = symbol.replace('USDC', '').replace('USDT', '')
+        current_price = prices_hl.get(coin, 0)
+        if current_price <= 0:
+            continue
+
+        # Observation bauen (ohne Position — Entry-Entscheidung)
+        try:
+            obs = compute_observation_hl(
+                coins_conn, symbol,
+                position_state=None,
+                n_open_positions=n_open,
+            )
+        except ConnectionError as e:
+            print(f"[RL-AGENT] ALARM: HL API nicht erreichbar! Kein Trading. ({e})")
+            _send_telegram_alarm("HL API nicht erreichbar! Kein Coin-Scan.")
+            return 0
+        action, _ = model.predict(obs, deterministic=False)
+        action = int(action)
+
+        if action == 0:
+            continue
+
+        # Agent will traden
+        agent_direction = 'long' if action <= 10 else 'short'
+        leverage = LEVERAGE_MAP[action]
+
+        if leverage > config['max_leverage']:
+            leverage = config['max_leverage']
+
+        # Drawdown-Modus: Bei Minus-Woche max 3x (wie im Training)
+        if state['week_points'] < 0 and leverage > 3:
+            leverage = 3
+
+        # Trade-Size
+        position_size = _calc_trade_size(wallet_balance, config['base_trade_size'])
+        margin = position_size / leverage
+
+        if margin > wallet_balance * 0.5:
+            continue
+
+        # === TRADE AUSFUEHREN ===
+        # Frischen Preis direkt vor Order holen
+        try:
+            fresh_prices = get_current_prices_hl()
+            fresh_price = fresh_prices.get(coin, 0)
+            if fresh_price > 0:
+                current_price = fresh_price
+        except:
+            pass
+
+        is_buy = agent_direction == 'long'
+        limit_price = round(current_price * (0.999 if is_buy else 1.001), 6)
+        result = place_limit_order_hl(creds, coin, is_buy, position_size,
+                                      limit_price, leverage)
+
+        if not result.get('success'):
+            print(f"[RL-AGENT] HL Order fehlgeschlagen {symbol}: {result.get('error')}")
+            continue
+
+        entry_price = result.get('avg_price', limit_price)
+
+        # Position in DB loggen
+        pos_id = log_position_open(
+            app_conn, symbol, agent_direction, entry_price,
+            position_size, leverage,
+        )
+        log_decision(app_conn, pos_id, symbol, action, None, True, 0.0)
+
+        # Wiederholungs-Tracking
+        state.setdefault('last_trade_times', {})[symbol] = now.isoformat()
+        state['last_trade_times'] = {
+            s: t for s, t in state['last_trade_times'].items()
+            if (now - datetime.fromisoformat(t)).total_seconds() < 7200
+        }
+
+        n_open += 1
+        open_symbols.add(symbol)
+        trades_opened += 1
+        state['trades_today'] = state.get('trades_today', 0) + 1
+
+        print(f"[RL-AGENT] TRADE {symbol} {agent_direction} {leverage}x | "
+              f"${position_size:.2f} (Margin ${margin:.2f}) @{entry_price:.4f} | "
+              f"Wallet: ${wallet_balance:.2f} | "
+              f"Punkte: {state['total_points']:+.0f} | "
+              f"Trades heute: {state['trades_today']}/{MAX_TRADES_PER_DAY}")
+
+    if trades_opened > 0:
+        save_state(state)
+
+    return trades_opened
+
+
+# ============================================================
+# Live-Lernen
+# ============================================================
+
+def experience_learn(model, experiences):
+    """
+    Lernen aus echten Trade-Erfahrungen.
+    Agent trainiert auf den Coins und Zeitraeumen wo er tatsaechlich gehandelt hat.
+    Kein Unterschied zwischen Training und Live.
+    """
+    try:
+        from rl_agent.learner import preload_market_data
+
+        # Zeitraum und Coins aus echten Trades
+        traded_coins = list(set(e['symbol'] for e in experiences))
+        earliest = min(e['entry_time'] for e in experiences)
+        latest = max(e['exit_time'] for e in experiences)
+
+        # BTC + ETH immer dabei (Referenz-Features)
+        all_coins = traded_coins[:]
+        for ref in ['BTCUSDC', 'ETHUSDC']:
+            if ref not in all_coins:
+                all_coins.append(ref)
+
+        data_start = earliest - timedelta(hours=12)  # Vorlauf fuer Features
+
+        coins_conn = get_conn('coins')
+        market_data = preload_market_data(coins_conn, all_coins, data_start, latest)
+        coins_conn.close()
+
+        env = TradingEnvLive(
+            coins=traded_coins,
+            market_data=market_data,
+            trade_start=earliest,
+            trade_end=latest,
+            train_start=earliest,
+        )
+
+        model.set_env(env)
+        model.learn(total_timesteps=LEARN_STEPS, reset_num_timesteps=False)
+        model.save(str(MODEL_PATH))
+
+        span_h = (latest - earliest).total_seconds() / 3600
+        print(f"[RL-AGENT] EXPERIENCE-LERNEN: {LEARN_STEPS} Steps | "
+              f"{len(experiences)} Trades | {len(traded_coins)} Coins | "
+              f"{span_h:.1f}h Zeitraum | Env-Punkte: {env.total_points:.0f}")
+
+    except Exception as e:
+        print(f"[RL-AGENT] Experience-Lernen fehlgeschlagen: {e}")
+        traceback.print_exc()
+
+
+def initial_learn(model):
+    """
+    Initial-Lernen beim Start: Letzte 48h echte Trades als Grundlage.
+    Agent durchlebt die Marktbedingungen seiner juengsten Trades.
+    """
+    try:
+        from rl_agent.learner import preload_market_data
+
+        app_conn = get_conn('app')
+        with app_conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT symbol FROM rl_positions
+                WHERE status = 'closed' AND exit_time >= NOW() - INTERVAL '48 hours'
+            """)
+            traded_coins = [r['symbol'] for r in cur.fetchall()]
+            cur.execute("""
+                SELECT MIN(entry_time) as first_entry, MAX(exit_time) as last_exit,
+                       COUNT(*) as trade_count
+                FROM rl_positions
+                WHERE status = 'closed' AND exit_time >= NOW() - INTERVAL '48 hours'
+            """)
+            info = cur.fetchone()
+        app_conn.close()
+
+        if not traded_coins or not info['first_entry']:
+            print("[RL-AGENT] Keine Trades in letzten 48h — kein Initial-Lernen")
+            return
+
+        earliest = info['first_entry'].replace(tzinfo=None)
+        latest = info['last_exit'].replace(tzinfo=None)
+        trade_count = info['trade_count']
+
+        for ref in ['BTCUSDC', 'ETHUSDC']:
+            if ref not in traded_coins:
+                traded_coins.append(ref)
+
+        data_start = earliest - timedelta(hours=12)
+
+        print(f"[RL-AGENT] INITIAL-LERNEN: {trade_count} Trades, "
+              f"{len(traded_coins)} Coins, letzte 48h")
+
+        coins_conn = get_conn('coins')
+        market_data = preload_market_data(coins_conn, traded_coins, data_start, latest)
+        coins_conn.close()
+
+        env = TradingEnvLive(
+            coins=traded_coins,
+            market_data=market_data,
+            trade_start=earliest,
+            trade_end=latest,
+            train_start=earliest,
+        )
+
+        # Mehr Steps fuer initiales Lernen (proportional zur Trade-Anzahl)
+        init_steps = min(trade_count * 50, 10000)
+
+        model.set_env(env)
+        model.learn(total_timesteps=init_steps, reset_num_timesteps=False)
+        model.save(str(MODEL_PATH))
+
+        print(f"[RL-AGENT] INITIAL-LERNEN fertig: {init_steps} Steps | "
+              f"Env-Punkte: {env.total_points:.0f}")
+
+    except Exception as e:
+        print(f"[RL-AGENT] Initial-Lernen fehlgeschlagen: {e}")
+        traceback.print_exc()
+
+
+# ============================================================
+# Main Loop
+# ============================================================
+
+def main():
+    global running
+
+    sl_info = f"SL: {SL_PERCENT}%" if SL_PERCENT else "Kein SL"
+    to_info = f"Timeout: {MAX_POSITION_AGE}min" if MAX_POSITION_AGE else "Kein Timeout"
+    print("=" * 70)
+    print(f"  RL-Agent Service — {ACTIVE_VERSION.upper()}, Experience-Learning")
+    print(f"  {sl_info} | {to_info} | Max {MAX_CONCURRENT_START} Positionen")
+    print(f"  Entry: {ENTRY_INTERVAL}s, Management: {MGMT_INTERVAL}s")
+    print(f"  Lernen: Nach je {LEARN_BATCH_SIZE} Trades aus echten Erfahrungen")
+    print(f"  Modell: {MODEL_PATH}")
+    print("=" * 70)
+
+    if not Path(MODEL_PATH).exists():
+        print(f"[RL-AGENT] FEHLER: Modell nicht gefunden: {MODEL_PATH}")
+        return
+
+    model = PPO.load(MODEL_PATH)
+    print(f"[RL-AGENT] PPO {ACTIVE_VERSION.upper()} Modell geladen: {MODEL_PATH}")
+
+    state = load_state()
+
+    creds = get_hl_credentials()
+    if not creds:
+        print("[RL-AGENT] FEHLER: Keine Hyperliquid Credentials!")
+        return
+
+    refresh_hl_coin_info()
+
+    # Initial-Lernen: Letzte 48h echte Trades durchleben
+    initial_learn(model)
+
+    # Tradeable Coins laden + Liquiditaets-Filter
+    app_conn = get_conn('app')
+    tradeable_coins = get_tradeable_coins(app_conn)
+    app_conn.close()
+    liquid_coins = update_liquid_coins(tradeable_coins)
+    last_volume_check = time.time()
+
+    print(f"[RL-AGENT] Punkte: {state['total_points']:.0f} | "
+          f"Profit: ${state['total_profit']:.2f} | "
+          f"Verlust-Serie: {state['losing_streak_days']}d | "
+          f"Wochen-Serie: {state['winning_streak_weeks']}w")
+    print()
+
+    last_scan_time = 0
+    last_mgmt_time = 0
+    iteration = 0
+
+    while running:
+        try:
+            _check_day_rollover(state)
+            _check_week_rollover(state)
+
+            app_conn = get_conn('app')
+
+            config = get_agent_config(app_conn)
+            if not config['is_active']:
+                app_conn.close()
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # 1. SL + Timeout Check (jede Iteration, 30s)
+            check_sl_and_timeout(app_conn, state, creds)
+
+            # 2. Pending-Close Check (jede Iteration, 30s)
+            check_pending_closes(app_conn, state, creds)
+
+            now_ts = time.time()
+
+            # Liquiditaets-Check 1x taeglich (alle 24h)
+            if now_ts - last_volume_check >= 86400:
+                liquid_coins = update_liquid_coins(tradeable_coins)
+                last_volume_check = now_ts
+
+            # 3. Jede 1 Min: Agent-Entscheidung offene Positionen (V6: 1-Min-Management)
+            if now_ts - last_mgmt_time >= MGMT_INTERVAL:
+                coins_conn = get_conn('coins')
+                manage_positions(model, app_conn, coins_conn, state, creds)
+                coins_conn.close()
+                last_mgmt_time = now_ts
+
+            # 4. Alle 5 Min: Coin-Scan fuer neue Trades
+            if now_ts - last_scan_time >= ENTRY_INTERVAL:
+                coins_conn = get_conn('coins')
+                scan_all_coins(model, app_conn, coins_conn, state, creds, liquid_coins)
+                coins_conn.close()
+                last_scan_time = now_ts
+
+            # 5. Experience-Lernen: DEAKTIVIERT (RAM-Problem auf 24GB Server)
+            # if len(experience_buffer) >= LEARN_BATCH_SIZE:
+            #     experience_learn(model, list(experience_buffer))
+            #     experience_buffer.clear()
+
+            app_conn.close()
+
+            iteration += 1
+            if iteration % 60 == 0:  # Alle ~30 Min Status
+                n_open = 0
+                try:
+                    app_conn = get_conn('app')
+                    positions = get_open_positions_db(app_conn)
+                    n_open = len(positions)
+                    app_conn.close()
+                except:
+                    pass
+                hl_bal = get_hl_balance(creds['wallet_address'])
+                print(f"[RL-AGENT] Status | HL: ${hl_bal:.2f} | "
+                      f"Profit: ${state['total_profit']:.2f} | "
+                      f"Punkte: {state['total_points']:.0f} | "
+                      f"Offen: {n_open} | "
+                      f"Buffer: {len(experience_buffer)}/{LEARN_BATCH_SIZE} | "
+                      f"Verlust: {state['losing_streak_days']}d Wochen: {state['winning_streak_weeks']}w")
+
+        except Exception as e:
+            print(f"[RL-AGENT] Fehler im Hauptloop: {e}")
+            traceback.print_exc()
+            try:
+                app_conn.close()
+            except:
+                pass
+
+        time.sleep(POLL_INTERVAL)
+
+    save_state(state)
+    print("[RL-AGENT] Service gestoppt, State gespeichert")
+
+
+if __name__ == '__main__':
+    main()

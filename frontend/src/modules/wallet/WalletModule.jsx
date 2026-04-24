@@ -27,6 +27,9 @@ export default function WalletModule() {
   const [convertAmount, setConvertAmount] = useState('')
   const [convertLoading, setConvertLoading] = useState(false)
   const [convertResult, setConvertResult] = useState(null)
+  const [selectedCoins, setSelectedCoins] = useState(new Set())
+  const [closing, setClosing] = useState(false)
+  const [histSort, setHistSort] = useState({ col: 'executed_at', asc: false })
 
   const loadData = useCallback(async () => {
     setLoading(true)
@@ -43,12 +46,16 @@ export default function WalletModule() {
       if (statusRes.data.configured) {
         promises.push(
           api.get('/api/v1/wallet/balance'), api.get('/api/v1/wallet/positions'),
-          api.get('/api/v1/wallet/orders'), api.get('/api/v1/wallet/history?days=7'),
-          api.get('/api/v1/wallet/realized-pnl?days=7')
+          api.get('/api/v1/wallet/orders')
         )
       } else {
-        promises.push(null, null, null, null, null)
+        promises.push(null, null, null)
       }
+      // History + PnL immer laden (enthält RL-Trades, nicht nur Binance)
+      promises.push(
+        api.get('/api/v1/wallet/history?days=30&limit=500'),
+        api.get('/api/v1/wallet/realized-pnl?days=7')
+      )
       if (hlStatusRes.data.configured) {
         promises.push(
           api.get('/api/v1/wallet/hl/balance'), api.get('/api/v1/wallet/hl/positions'),
@@ -76,7 +83,7 @@ export default function WalletModule() {
     finally { setLoading(false) }
   }, [])
 
-  useEffect(() => { loadData(); const i = setInterval(loadData, 30000); return () => clearInterval(i) }, [loadData])
+  useEffect(() => { loadData(); const i = setInterval(loadData, 5000); return () => clearInterval(i) }, [loadData])
 
   const cancelOrder = async (symbol, orderId) => {
     if (!confirm(`Order ${orderId} stornieren?`)) return
@@ -102,6 +109,40 @@ export default function WalletModule() {
     const base = posSymbol.replace(/USD[TC]$/, '')
     return orders.find(o => o.symbol.replace(/USD[TC]$/, '') === base && o.side === 'SELL')
   }
+
+  const toggleCoin = (coin) => {
+    setSelectedCoins(prev => {
+      const next = new Set(prev)
+      next.has(coin) ? next.delete(coin) : next.add(coin)
+      return next
+    })
+  }
+
+  const closeSelected = async () => {
+    if (selectedCoins.size === 0) return
+    if (!confirm(`${selectedCoins.size} Position(en) schließen?`)) return
+    setClosing(true)
+    try {
+      const r = await api.post('/api/v1/wallet/hl/close', { coins: [...selectedCoins] })
+      const failed = (r.data.results || []).filter(x => !x.success)
+      if (failed.length > 0) alert('Fehler: ' + failed.map(f => f.coin + ': ' + (f.error || '?')).join(', '))
+      setSelectedCoins(new Set())
+    } catch (e) { alert('Close fehlgeschlagen') }
+    setClosing(false)
+  }
+
+  const toggleHistSort = (col) => {
+    setHistSort(prev => prev.col === col ? { col, asc: !prev.asc } : { col, asc: false })
+  }
+  const sortedHistory = [...history].sort((a, b) => {
+    const { col, asc } = histSort
+    let va = a[col], vb = b[col]
+    if (va == null) va = ''
+    if (vb == null) vb = ''
+    if (typeof va === 'string') return asc ? va.localeCompare(vb) : vb.localeCompare(va)
+    return asc ? va - vb : vb - va
+  })
+  const sortIcon = (col) => histSort.col === col ? (histSort.asc ? ' \u25B2' : ' \u25BC') : ''
 
   const showPositionChart = (pos) => {
     const now = new Date()
@@ -191,9 +232,10 @@ export default function WalletModule() {
           {balance && hlBalance && <span className="text-zinc-600">|</span>}
           <div><span className="text-zinc-500">Gesamt</span> <span className="font-mono font-semibold">${fp(grandTotal)}</span></div>
           <div className={(realizedPnl?.realized_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}><span className="text-zinc-500">7d</span> {fPnl(realizedPnl?.realized_pnl)}</div>
-          <button onClick={loadData} disabled={loading} className="ml-auto p-0.5 hover:bg-zinc-700 rounded">
-            <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />
-          </button>
+          <span className="ml-auto flex items-center gap-1 text-[10px] text-zinc-500">
+            <span className={`w-1.5 h-1.5 rounded-full ${loading ? 'bg-yellow-400 animate-pulse' : 'bg-green-400'}`}></span>
+            live
+          </span>
         </div>
       )}
 
@@ -283,7 +325,7 @@ export default function WalletModule() {
           </table>
         )}
 
-        {activeTab === 'positions' && posSource === 'hyperliquid' && (
+        {activeTab === 'positions' && posSource === 'hyperliquid' && (<>
           <table className="w-full">
             <thead className="sticky top-0 bg-zinc-900">
               <tr className="text-zinc-500 text-left">
@@ -293,13 +335,14 @@ export default function WalletModule() {
                 <th className="px-2 py-1 font-normal text-right">Einstieg</th>
                 <th className="px-2 py-1 font-normal text-right">Aktuell</th>
                 <th className="px-2 py-1 font-normal text-right">uPnL</th>
-                <th className="px-2 py-1 font-normal text-right">ROE</th>
+                <th className="px-2 py-1 font-normal text-right">%</th>
+                <th className="px-2 py-1 font-normal text-center w-8"></th>
                 <th className="px-2 py-1 font-normal text-right">Hebel</th>
               </tr>
             </thead>
             <tbody>
               {hlPositions.length === 0 ? (
-                <tr><td colSpan={8} className="text-center py-4 text-zinc-500">Keine offenen Positionen</td></tr>
+                <tr><td colSpan={9} className="text-center py-4 text-zinc-500">Keine offenen Positionen</td></tr>
               ) : hlPositions.map((pos, i) => (
                 <tr key={i} className="border-t border-zinc-800 hover:bg-zinc-800/50">
                   <td className="px-2 py-1 font-mono font-medium">{pos.coin}</td>
@@ -312,15 +355,27 @@ export default function WalletModule() {
                   <td className={`px-2 py-1 text-right font-mono ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                     {fPnl(pos.unrealized_pnl)}
                   </td>
-                  <td className={`px-2 py-1 text-right font-mono ${pos.roe_percent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                    {fPct(pos.roe_percent)}
+                  <td className={`px-2 py-1 text-right font-mono ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {fPct(pos.position_value ? (pos.unrealized_pnl / pos.position_value * 100) : 0)}
+                  </td>
+                  <td className="px-2 py-1 text-center">
+                    <input type="checkbox" checked={selectedCoins.has(pos.coin)}
+                      onChange={() => toggleCoin(pos.coin)} className="rounded" />
                   </td>
                   <td className="px-2 py-1 text-right font-mono text-amber-400">{pos.leverage}x</td>
                 </tr>
               ))}
             </tbody>
           </table>
-        )}
+          {hlPositions.length > 0 && selectedCoins.size > 0 && (
+            <div className="px-2 py-2 border-t border-zinc-800 flex justify-end">
+              <button onClick={closeSelected} disabled={closing}
+                className="px-3 py-1.5 bg-red-600 hover:bg-red-500 rounded text-xs font-semibold disabled:opacity-50">
+                {closing ? 'Schließe...' : `Close Selected (${selectedCoins.size})`}
+              </button>
+            </div>
+          )}
+        </>)}
 
         {activeTab === 'orders' && ordSource === 'binance' && (
           <table className="w-full">
@@ -405,26 +460,34 @@ export default function WalletModule() {
           <table className="w-full">
             <thead className="sticky top-0 bg-zinc-900">
               <tr className="text-zinc-500 text-left">
-                <th className="px-2 py-1 font-normal">Symbol</th>
-                <th className="px-2 py-1 font-normal">Side</th>
-                <th className="px-2 py-1 font-normal text-right">Preis</th>
-                <th className="px-2 py-1 font-normal text-right">Menge</th>
-                <th className="px-2 py-1 font-normal text-right">Wert</th>
-                <th className="px-2 py-1 font-normal text-right">Datum</th>
+                <th className="px-2 py-1 font-normal cursor-pointer hover:text-zinc-300" onClick={() => toggleHistSort('symbol')}>Symbol{sortIcon('symbol')}</th>
+                <th className="px-2 py-1 font-normal cursor-pointer hover:text-zinc-300" onClick={() => toggleHistSort('side')}>Dir{sortIcon('side')}</th>
+                <th className="px-2 py-1 font-normal text-right cursor-pointer hover:text-zinc-300" onClick={() => toggleHistSort('leverage')}>Lev{sortIcon('leverage')}</th>
+                <th className="px-2 py-1 font-normal text-right cursor-pointer hover:text-zinc-300" onClick={() => toggleHistSort('quote_amount')}>Invest{sortIcon('quote_amount')}</th>
+                <th className="px-2 py-1 font-normal text-right cursor-pointer hover:text-zinc-300" onClick={() => toggleHistSort('sold_for')}>Zurück{sortIcon('sold_for')}</th>
+                <th className="px-2 py-1 font-normal text-right cursor-pointer hover:text-zinc-300" onClick={() => toggleHistSort('pnl_percent')}>PnL{sortIcon('pnl_percent')}</th>
+                <th className="px-2 py-1 font-normal cursor-pointer hover:text-zinc-300" onClick={() => toggleHistSort('exit_reason')}>Exit{sortIcon('exit_reason')}</th>
+                <th className="px-2 py-1 font-normal text-right cursor-pointer hover:text-zinc-300" onClick={() => toggleHistSort('executed_at')}>Datum{sortIcon('executed_at')}</th>
               </tr>
             </thead>
             <tbody>
-              {history.length === 0 ? (
-                <tr><td colSpan={6} className="text-center py-4 text-zinc-500">Keine Trades (7d)</td></tr>
-              ) : history.map((t, i) => (
+              {sortedHistory.length === 0 ? (
+                <tr><td colSpan={8} className="text-center py-4 text-zinc-500">Keine Trades (30d)</td></tr>
+              ) : sortedHistory.map((t, i) => (
                 <tr key={i} className="border-t border-zinc-800 hover:bg-zinc-800/50">
                   <td className="px-2 py-1 font-mono font-medium">
-                    {t.symbol?.replace('USDC','')} {t.is_bot_trade && <Bot className="w-3 h-3 text-blue-400 inline ml-1" />}
+                    {t.symbol?.replace('USDC','')}
                   </td>
-                  <td className={`px-2 py-1 ${t.side === 'buy' ? 'text-green-400' : 'text-red-400'}`}>{t.side?.toUpperCase()}</td>
-                  <td className="px-2 py-1 text-right font-mono">${fp(t.price, 4)}</td>
-                  <td className="px-2 py-1 text-right font-mono">{fp(t.quantity, 4)}</td>
+                  <td className={`px-2 py-1 ${t.side === 'long' ? 'text-green-400' : t.side === 'short' ? 'text-red-400' : t.side === 'buy' ? 'text-green-400' : 'text-red-400'}`}>
+                    {t.side === 'long' ? 'L' : t.side === 'short' ? 'S' : t.side?.toUpperCase()}
+                  </td>
+                  <td className="px-2 py-1 text-right font-mono text-zinc-400">{t.leverage ? `${t.leverage}x` : '-'}</td>
                   <td className="px-2 py-1 text-right font-mono">${fp(t.quote_amount)}</td>
+                  <td className={`px-2 py-1 text-right font-mono ${t.sold_for > t.quote_amount ? 'text-green-400' : t.sold_for < t.quote_amount ? 'text-red-400' : 'text-zinc-400'}`}>{t.sold_for ? `$${fp(t.sold_for)}` : '-'}</td>
+                  <td className={`px-2 py-1 text-right font-mono ${t.pnl_percent > 0 ? 'text-green-400' : t.pnl_percent < 0 ? 'text-red-400' : 'text-zinc-400'}`}>
+                    {t.pnl_percent != null ? `${t.pnl_percent > 0 ? '+' : ''}${fp(t.pnl_percent, 2)}%` : '-'}
+                  </td>
+                  <td className="px-2 py-1 text-zinc-400 text-xs">{t.exit_reason || '-'}</td>
                   <td className="px-2 py-1 text-right text-zinc-400">{fDate(t.executed_at)}</td>
                 </tr>
               ))}

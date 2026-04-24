@@ -38,6 +38,7 @@ export default function MomentumModule() {
   const [statusFilter, setStatusFilter] = useState('active')
   const [hideShort, setHideShort] = useState(false)
   const [hideTradedFilter, setHideTradedFilter] = useState(true)
+  const [hlOnly, setHlOnly] = useState(true)
   const [showSettings, setShowSettings] = useState(false)
   const [editConfig, setEditConfig] = useState({})
   const [groups, setGroups] = useState([])
@@ -95,12 +96,13 @@ export default function MomentumModule() {
       if (statusFilter) params.status = statusFilter
       if (hideShort) params.direction = 'long'
       if (hideTradedFilter) params.hide_traded = true
+      if (hlOnly) params.hl_only = true
       const res = await api.get('/api/v1/momentum/predictions', { params })
       setPredictions(res.data.predictions || [])
       setTotalPredictions(res.data.total || 0)
       setLastUpdate(new Date())
     } catch (err) { console.error('Predictions load failed:', err) }
-  }, [statusFilter, hideShort, hideTradedFilter])
+  }, [statusFilter, hideShort, hideTradedFilter, hlOnly])
 
   const loadPredictions2h = useCallback(async () => {
     try {
@@ -108,11 +110,12 @@ export default function MomentumModule() {
       if (statusFilter) params.status = statusFilter
       if (hideShort) params.direction = 'long'
       if (hideTradedFilter) params.hide_traded = true
+      if (hlOnly) params.hl_only = true
       const res = await api.get('/api/v1/momentum/predictions', { params })
       setPredictions2h(res.data.predictions || [])
       setTotalPredictions2h(res.data.total || 0)
     } catch (err) { console.error('Predictions 2h load failed:', err) }
-  }, [statusFilter, hideShort, hideTradedFilter])
+  }, [statusFilter, hideShort, hideTradedFilter, hlOnly])
 
   const loadStats = useCallback(async () => {
     try {
@@ -173,7 +176,7 @@ export default function MomentumModule() {
     return () => clearInterval(interval)
   }, [loadConfig, loadConfig2h, loadPredictions, loadPredictions2h, loadStats, loadStats2h, loadStatsAll, loadGroups])
 
-  useEffect(() => { loadPredictions(); loadPredictions2h() }, [statusFilter, hideShort, hideTradedFilter])
+  useEffect(() => { loadPredictions(); loadPredictions2h() }, [statusFilter, hideShort, hideTradedFilter, hlOnly])
 
   useEffect(() => { if (tab === 'stats') loadResolvedPreds() }, [tab, loadResolvedPreds])
 
@@ -425,6 +428,10 @@ export default function MomentumModule() {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
           {lastUpdate && <span style={{ fontSize: '0.5625rem', color: 'var(--color-muted)' }}>{lastUpdate.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>}
+          <button onClick={() => setHlOnly(!hlOnly)} title={hlOnly ? 'Alle Coins anzeigen' : 'Nur HL-tradeable'}
+            style={{ ...s.btn, background: hlOnly ? '#8b5cf6' : 'var(--color-bg)', color: hlOnly ? '#fff' : 'var(--color-text)' }}>
+            <span style={{ fontSize: '0.5625rem', fontWeight: 600 }}>HL</span>
+          </button>
           <button onClick={() => setHideShort(!hideShort)} title={hideShort ? 'Short anzeigen' : 'Short ausblenden'}
             style={{ ...s.btn, background: hideShort ? '#f59e0b' : 'var(--color-bg)', color: hideShort ? '#fff' : 'var(--color-text)' }}>
             {hideShort ? <Eye size={12} /> : <EyeOff size={12} />}

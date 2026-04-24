@@ -77,29 +77,26 @@ def _reward(pnl_pct, leverage):
             depth_mult = 1.75
         return base * lev_penalty * depth_mult
 
-    elif pnl_pct < 3.5:
-        if pnl_pct < 0.5:
-            mult = 0.50
-        elif pnl_pct < 1.0:
-            mult = 0.55
-        elif pnl_pct < 1.5:
-            mult = 0.60
-        elif pnl_pct < 2.0:
-            mult = 0.65
-        elif pnl_pct < 2.5:
-            mult = 0.70
-        elif pnl_pct < 3.0:
-            mult = 0.75
-        else:
-            mult = 0.80
-        return base * mult
-
-    elif pnl_pct >= 4.0:
-        bonus = WIN_BONUS.get(leverage, 1.1)
-        return base * bonus
+    elif base < 0.5:
+        # Unter 0.5% gehebelt: Strafe — zu wenig Gewinn, Fees fressen das auf
+        return -abs(base)
 
     else:
-        return base
+        # Ab 0.5%: Gewinn-Stufen + hebelabhängiger Bonus
+        if pnl_pct < 1.0:
+            mult = 0.50
+        elif pnl_pct < 2.0:
+            mult = 1.00
+        elif pnl_pct < 3.0:
+            mult = 1.10
+        elif pnl_pct < 5.0:
+            mult = 1.20
+        elif pnl_pct < 10.0:
+            mult = 1.25
+        else:
+            mult = 1.60
+        bonus = WIN_BONUS.get(leverage, 1.1)
+        return base * mult * bonus
 
 
 class TradingEnvV4(gym.Env):
@@ -152,6 +149,8 @@ class TradingEnvV4(gym.Env):
         self.losing_streak_days = 0
         self.current_week = ''
         self.week_points = 0.0
+        self.week_points_raw = 0.0
+        self.prev_week_raw_points = 0
         self.winning_streak_weeks = 0
 
         # V4: Wiederholungs-Tracking (symbol → letzte Trade-Time)
@@ -200,7 +199,7 @@ class TradingEnvV4(gym.Env):
         self.day_pnl = 0.0
 
     def _check_week_rollover(self):
-        """Wochenwechsel prüfen und Wochen-Bonus vergeben."""
+        """Wochenwechsel: Wochen-Bonus nur wenn Rohpunkte ≥10% über Vorwoche."""
         if self.current_time is None:
             return
         iso = self.current_time.isocalendar()
@@ -209,16 +208,23 @@ class TradingEnvV4(gym.Env):
             return
 
         if self.current_week:
-            if self.week_points > 0:
+            raw_points = self.week_points_raw
+            prev_raw = self.prev_week_raw_points
+
+            threshold = prev_raw * 1.10 if prev_raw > 0 and self.winning_streak_weeks > 0 else 0
+            if raw_points > 0 and raw_points >= threshold:
                 self.winning_streak_weeks += 1
                 multiplier = 1.20 + (self.winning_streak_weeks - 1) * 0.05
-                bonus_points = self.week_points * (multiplier - 1.0)
+                bonus_points = raw_points * (multiplier - 1.0)
                 self.total_points += bonus_points
             else:
                 self.winning_streak_weeks = 0
 
+            self.prev_week_raw_points = raw_points
+
         self.current_week = current_week
         self.week_points = 0.0
+        self.week_points_raw = 0.0
 
     def _is_phase2(self):
         if self.current_time is None:
@@ -326,6 +332,7 @@ class TradingEnvV4(gym.Env):
                 # Punkte-Tracking
                 self.total_points += reward
                 self.week_points += reward
+                self.week_points_raw += reward
                 if pnl_pct < 0:
                     self.day_pnl += pnl_pct
                 else:
@@ -360,6 +367,7 @@ class TradingEnvV4(gym.Env):
                     reward *= 0.8
                 self.total_points += reward
                 self.week_points += reward
+                self.week_points_raw += reward
                 self.day_pnl += pnl_pct
                 lev = self.position_leverage
                 self.leverage_stats[lev]['total_points'] += reward
@@ -373,7 +381,23 @@ class TradingEnvV4(gym.Env):
                         reward *= 0.8
                     self.total_points += reward
                     self.week_points += reward
+                    self.week_points_raw += reward
                     self.day_pnl += -SL_PERCENT
+                    lev = self.position_leverage
+                    self.leverage_stats[lev]['total_points'] += reward
+                    self.leverage_stats[lev]['trades'] += 1
+                    self._close()
+                    terminated = True
+                elif self.entry_time and (self.current_time - self.entry_time).total_seconds() >= 3600:
+                    # 60min Timeout — Zwangsschließung
+                    pnl_pct = self._unrealized_pnl()
+                    reward = _reward(pnl_pct, self.position_leverage)
+                    if hasattr(self, '_is_repeat') and self._is_repeat and reward > 0:
+                        reward *= 0.8
+                    self.total_points += reward
+                    self.week_points += reward
+                    self.week_points_raw += reward
+                    self.day_pnl += pnl_pct
                     lev = self.position_leverage
                     self.leverage_stats[lev]['total_points'] += reward
                     self.leverage_stats[lev]['trades'] += 1

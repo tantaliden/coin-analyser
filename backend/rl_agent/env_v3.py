@@ -93,32 +93,26 @@ def _reward(pnl_pct, leverage):
             depth_mult = 1.75    # Zu lang gewartet
         return base * lev_penalty * depth_mult
 
-    elif pnl_pct < 3.5:
-        # Gewinn unter 3.5%: Early-Exit-Penalty (feinere Staffelung)
-        if pnl_pct < 0.5:
-            mult = 0.50
-        elif pnl_pct < 1.0:
-            mult = 0.55
-        elif pnl_pct < 1.5:
-            mult = 0.60
-        elif pnl_pct < 2.0:
-            mult = 0.65
-        elif pnl_pct < 2.5:
-            mult = 0.70
-        elif pnl_pct < 3.0:
-            mult = 0.75
-        else:
-            mult = 0.80
-        return base * mult
-
-    elif pnl_pct >= 4.0:
-        # Großer Gewinn: Bonus
-        bonus = WIN_BONUS.get(leverage, 1.1)
-        return base * bonus
+    elif base < 0.5:
+        # Unter 0.5% gehebelt: Strafe — zu wenig Gewinn, Fees fressen das auf
+        return -abs(base)
 
     else:
-        # 2.5-4%: normaler Reward
-        return base
+        # Ab 0.5%: Gewinn-Stufen + hebelabhängiger Bonus
+        if pnl_pct < 1.0:
+            mult = 0.50
+        elif pnl_pct < 2.0:
+            mult = 1.00
+        elif pnl_pct < 3.0:
+            mult = 1.10
+        elif pnl_pct < 5.0:
+            mult = 1.20
+        elif pnl_pct < 10.0:
+            mult = 1.25
+        else:
+            mult = 1.60
+        bonus = WIN_BONUS.get(leverage, 1.1)
+        return base * mult * bonus
 
 
 class TradingEnvV3(gym.Env):

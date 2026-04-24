@@ -1576,10 +1576,13 @@ def run_daily_optimization(user_id, config):
 def get_symbols_for_config(config):
     """Holt Symbole basierend auf Scan-Config (Coingruppe oder alle)"""
     if config['scan_all_symbols']:
-        with coins_db() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT DISTINCT symbol FROM agg_1h ORDER BY symbol")
-            return [r['symbol'] for r in cur.fetchall()]
+        with app_db() as aconn, coins_db() as cconn:
+            acur = aconn.cursor()
+            acur.execute("SELECT symbol FROM coin_info WHERE 'hyperliquid' = ANY(exchanges)")
+            hl_symbols = {r['symbol'] for r in acur.fetchall()}
+            ccur = cconn.cursor()
+            ccur.execute("SELECT DISTINCT symbol FROM agg_1h ORDER BY symbol")
+            return [r['symbol'] for r in ccur.fetchall() if r['symbol'] in hl_symbols]
     elif config['coin_group_id']:
         with app_db() as conn:
             cur = conn.cursor()
@@ -2296,25 +2299,13 @@ def scan_symbols(config, symbols):
         ccur = cconn.cursor()
         acur = aconn.cursor()
 
-        # Aktive Predictions holen (kein Doppel-Signal pro Symbol)
-        acur.execute("""
-            SELECT symbol FROM momentum_predictions
-            WHERE user_id = %s AND status = 'active' AND (scanner_type = 'default' OR scanner_type IS NULL)
-        """, (user_id,))
-        active_symbols = {r['symbol'] for r in acur.fetchall()}
-
-        # Cooldown: Symbole die in den letzten 60 Min resolved wurden nicht nochmal scannen
+        # Cooldown: Symbole die in den letzten 60 Min predicted wurden nicht nochmal scannen
         acur.execute("""
             SELECT DISTINCT symbol FROM momentum_predictions
-            WHERE user_id = %s AND status != 'active' AND (scanner_type = 'default' OR scanner_type IS NULL)
-              AND resolved_at >= %s - INTERVAL '60 minutes'
+            WHERE user_id = %s AND (scanner_type = 'default' OR scanner_type IS NULL)
+              AND detected_at >= %s - INTERVAL '60 minutes'
         """, (user_id, clock.now()))
-        cooldown_symbols = {r['symbol'] for r in acur.fetchall()}
-        active_symbols = active_symbols | cooldown_symbols
-
-        # Hyperliquid-Coins laden (Short nur für diese)
-        acur.execute("SELECT symbol FROM coin_info WHERE 'hyperliquid' = ANY(exchanges)")
-        hl_symbols = {r['symbol'] for r in acur.fetchall()}
+        active_symbols = {r['symbol'] for r in acur.fetchall()}
 
         # Marktkontext einmal pro Loop holen (alle USDC-Symbole aus kline_metrics)
         market_context = get_market_context(ccur)
@@ -2348,42 +2339,6 @@ def scan_symbols(config, symbols):
                 signal = analyze_symbol_cnn(ccur, symbol, current_price, market_context=market_context, scan_config=config)
 
                 if signal and signal['confidence'] >= dir_config[signal['direction']]['min_conf']:
-                    # Short nur für Hyperliquid-Coins
-                    if signal['direction'] == 'short' and symbol not in hl_symbols:
-                        continue
-
-                    # Filter: erwartete Bewegung muss min_target_pct überschreiten
-                    if signal['expected_move_pct'] < (config['min_target_pct'] or 5.0):
-                        continue
-
-                    # Momentum-Check: pct_30m muss in Signal-Richtung laufen
-                    ccur.execute("""
-                        SELECT pct_30m, pct_60m FROM kline_metrics
-                        WHERE symbol = %s AND open_time <= %s
-                        ORDER BY open_time DESC LIMIT 1
-                    """, (symbol, clock.now()))
-                    metrics_row = ccur.fetchone()
-                    if metrics_row and metrics_row['pct_30m'] is not None:
-                        pct_30m = float(metrics_row['pct_30m'])
-                        long_pct_min = float(config.get('long_pct_30m_min') or 2.5)
-                        short_pct_min = float(config.get('short_pct_30m_min') or 1.0)
-                        if signal['direction'] == 'long' and pct_30m < long_pct_min:
-                            continue  # Kein Long ohne ausreichend Momentum
-                        if signal['direction'] == 'short' and pct_30m > -short_pct_min:
-                            continue  # Kein Short ohne ausreichend Momentum
-
-                        # Short-Blocker: Move schon zu weit gelaufen → Bounce wahrscheinlich
-                        if signal['direction'] == 'short':
-                            pct_60m = float(metrics_row.get('pct_60m') or 0) if metrics_row.get('pct_60m') is not None else 0
-                            if pct_60m < -3.0:
-                                logger.debug(f"[LATE_SHORT] {symbol} skipped — pct_60m={pct_60m:.2f}% (move already ran)")
-                                continue
-
-                    # Batch-Limit: Nicht mehr als 15 Shorts pro Scan-Zyklus
-                    if signal['direction'] == 'short' and cycle_short_count >= 15:
-                        logger.info(f"[BATCH_LIMIT] {symbol} short skipped — already {cycle_short_count} shorts this cycle")
-                        continue
-
                     # TP/SL aus User-Config berechnen (direction-spezifisch)
                     entry = signal['entry_price']
                     d_cfg = dir_config[signal['direction']]

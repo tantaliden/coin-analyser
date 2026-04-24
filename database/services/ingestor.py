@@ -467,12 +467,10 @@ def live_sync_symbol(conn, symbol, lookback_hours):
     return total_inserted
 
 def live_sync_all(symbols, lookback_hours):
-    """Einmaliger Sync aller Symbole"""
+    """Einmaliger Sync aller Symbole — kein Sleep zwischen Coins"""
     conn = db()
     total = 0
-    
-    print(f"[LIVE] Starting sync for {len(symbols)} symbols (lookback: {lookback_hours}h)")
-    
+
     for i, symbol in enumerate(symbols, 1):
         try:
             added = live_sync_symbol(conn, symbol, lookback_hours)
@@ -482,24 +480,26 @@ def live_sync_all(symbols, lookback_hours):
         except Exception as e:
             print(f"[LIVE] {symbol} ERROR: {e}")
             conn.rollback()
-        
-        time.sleep(0.1)
-    
+
     conn.close()
     return total
 
 def live_loop(symbols):
-    """Endlos-Loop für Live-Updates (Berlin-Zeit)"""
+    """Endlos-Loop für Live-Updates (Berlin-Zeit).
+    Nach jedem Durchlauf: Warten bis naechste volle Minute + 15s,
+    dann pruefen ob neue Daten da sind. Kein unnuetiges Idle.
+    """
     print(f"[LIVE] Starting live sync loop (Berlin-Zeit)")
     print(f"[LIVE] Initial Lookback: {INITIAL_LOOKBACK_HOURS} hours (2000 min)")
     print(f"[LIVE] Normal Lookback: {LIVE_LOOKBACK_HOURS} hours")
-    print(f"[LIVE] Interval: {LIVE_INTERVAL_SEC} seconds")
+    print(f"[LIVE] Mode: Continuous (warte auf naechste Minute)")
     print(f"[LIVE] Symbol refresh: every {SYMBOL_REFRESH_HOURS} hours")
-    
+
     first_run = True
     last_symbol_refresh = now_berlin()
     current_symbols = symbols
-    
+    last_cycle_minute = None
+
     while True:
         try:
             hours_since_refresh = (now_berlin() - last_symbol_refresh).total_seconds() / 3600
@@ -511,20 +511,38 @@ def live_loop(symbols):
                 if new_count != old_count:
                     print(f"[LIVE] Symbols changed: {old_count} -> {new_count}")
                 last_symbol_refresh = now_berlin()
-            
+
             if first_run:
-                lookback = INITIAL_LOOKBACK_HOURS  # 34h = 2000 min
+                lookback = INITIAL_LOOKBACK_HOURS
                 first_run = False
             else:
                 lookback = 1
-            
+
+                # Warte auf naechste volle Minute + 15 Sekunden
+                now = now_berlin()
+                current_minute = now.minute
+
+                if current_minute == last_cycle_minute:
+                    # Gleiche Minute wie letzter Durchlauf — warten
+                    secs_until_next = 60 - now.second + 15
+                    if secs_until_next > 75:
+                        secs_until_next = 15
+                    time.sleep(secs_until_next)
+
+                    # Pruefen ob Binance neue Daten hat (alle 5s, max 30s)
+                    for _ in range(6):
+                        check_now = now_berlin()
+                        if check_now.minute != current_minute:
+                            break
+                        time.sleep(5)
+
             start_time = now_berlin()
             total = live_sync_all(current_symbols, lookback)
             duration = (now_berlin() - start_time).total_seconds()
-            
+            last_cycle_minute = now_berlin().minute
+
             print(f"[LIVE] Cycle complete: +{total} candles in {duration:.1f}s")
-            
-            
+
         except KeyboardInterrupt:
             print("\n[LIVE] Stopped by user")
             break
