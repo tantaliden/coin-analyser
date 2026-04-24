@@ -21,6 +21,14 @@ class Bucket:
     taker_buy_base: float = 0.0      # side='A' (aggressor buy)
     taker_buy_quote: float = 0.0
     first_time_ms: int = None
+    # BBO/L2-Snapshot am Bucket-Close-Zeitpunkt (last-known)
+    bbo_bid_px: float = None
+    bbo_ask_px: float = None
+    bbo_bid_sz: float = None
+    bbo_ask_sz: float = None
+    spread_bps: float = None
+    book_imbalance_5: float = None
+    book_depth_5: float = None
 
     def add_trade(self, price: float, size: float, side: str, time_ms: int) -> None:
         notional = price * size
@@ -61,6 +69,7 @@ class BucketCollector:
 
     def add_trade(self, symbol: str, price: float, size: float, side: str, time_ms: int) -> None:
         # Alte Trades ignorieren (HL WS schickt beim Subscribe manchmal Initial-History).
+        # Cutoff: alles > 2 min in der Vergangenheit.
         import time as _time
         if _time.time() * 1000 - time_ms > 120_000:
             return

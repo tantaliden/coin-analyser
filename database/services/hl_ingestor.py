@@ -34,8 +34,9 @@ class HLState:
     """Shared State zwischen Tasks."""
     def __init__(self):
         self.latest_ctx: dict = {}     # symbol -> dict der letzten ctx-Werte (fuer klines-Snapshot)
-        self.subscribed: set = set()   # welche coins subscriben sind
-        self.last_l2_ts: dict = {}     # symbol -> monotonic ts fuer L2-Throttling
+        self.latest_l2: dict = {}      # symbol -> {bids, asks} letzter L2-Snapshot
+        self.subscribed: set = set()
+        self.last_l2_ts: dict = {}
         self.bucket_collector: BucketCollector = None
         self.pending_ctx_rows: list = []
         self.pending_l2_rows: list = []
@@ -163,18 +164,21 @@ async def handle_msg(raw: str, state: HLState, cfg: dict, db_cfg: dict):
     elif ch == "l2Book":
         ts_ms = int(data.get("time", time.time() * 1000))
         coin = data["coin"]
-        # L2-Throttling: max 1 Snapshot pro Coin alle l2_throttle_seconds
+        levels = data.get("levels") or [[], []]
+        bids = levels[0] if len(levels) > 0 else []
+        asks = levels[1] if len(levels) > 1 else []
+        # Immer latest_l2 aktualisieren (fuer BBO-Features beim Bucket-Close)
+        state.latest_l2[coin] = {"bids": bids, "asks": asks}
+        # Throttle fuer DB-Insert der Full-Snapshots (hl_l2_snapshot)
         last = state.last_l2_ts.get(coin, 0)
         now = time.time()
         if now - last < cfg["l2_throttle_seconds"]:
             return
         state.last_l2_ts[coin] = now
-        levels = data.get("levels") or [[], []]
         state.pending_l2_rows.append({
             "symbol": coin,
             "ts": datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc),
-            "bids": levels[0] if len(levels) > 0 else [],
-            "asks": levels[1] if len(levels) > 1 else [],
+            "bids": bids, "asks": asks,
         })
 
 
@@ -197,6 +201,7 @@ async def task_flush(cfg: dict, state: HLState):
             klines_rows = []
             for b in closed:
                 last = state.latest_ctx.get(b.symbol, {}) or {}
+                bbo = compute_bbo(state.latest_l2.get(b.symbol))
                 klines_rows.append({
                     "symbol": b.symbol,
                     "interval": "10s",
@@ -213,6 +218,13 @@ async def task_flush(cfg: dict, state: HLState):
                     "oracle_px": last.get("oracle_px"),
                     "mark_px": last.get("mark_px"),
                     "mid_px": last.get("mid_px"),
+                    "bbo_bid_px": bbo["bbo_bid_px"],
+                    "bbo_ask_px": bbo["bbo_ask_px"],
+                    "bbo_bid_sz": bbo["bbo_bid_sz"],
+                    "bbo_ask_sz": bbo["bbo_ask_sz"],
+                    "spread_bps": bbo["spread_bps"],
+                    "book_imbalance_5": bbo["book_imbalance_5"],
+                    "book_depth_5": bbo["book_depth_5"],
                 })
             now_mono = time.time()
             flush_ctx = (now_mono - state.ctx_last_flush) >= ctx_debounce and state.pending_ctx_rows
@@ -243,6 +255,35 @@ async def task_flush(cfg: dict, state: HLState):
 def _td(seconds: int):
     from datetime import timedelta
     return timedelta(seconds=seconds)
+
+
+def compute_bbo(l2: dict) -> dict:
+    """Berechnet BBO/Book-Imbalance/Spread aus L2-Snapshot. None wenn L2 fehlt."""
+    empty = {k: None for k in ("bbo_bid_px", "bbo_ask_px", "bbo_bid_sz", "bbo_ask_sz",
+                               "spread_bps", "book_imbalance_5", "book_depth_5")}
+    if not l2:
+        return empty
+    bids = l2.get("bids") or []
+    asks = l2.get("asks") or []
+    if not bids or not asks:
+        return empty
+    bid_px = float(bids[0]["px"])
+    ask_px = float(asks[0]["px"])
+    bid_sz = float(bids[0]["sz"])
+    ask_sz = float(asks[0]["sz"])
+    mid = (bid_px + ask_px) / 2.0
+    spread_bps = (ask_px - bid_px) / mid * 10000.0 if mid > 0 else None
+    top5_bid = sum(float(b["sz"]) for b in bids[:5])
+    top5_ask = sum(float(a["sz"]) for a in asks[:5])
+    depth5 = top5_bid + top5_ask
+    imbalance5 = (top5_bid - top5_ask) / depth5 if depth5 > 0 else 0.0
+    return {
+        "bbo_bid_px": bid_px, "bbo_ask_px": ask_px,
+        "bbo_bid_sz": bid_sz, "bbo_ask_sz": ask_sz,
+        "spread_bps": spread_bps,
+        "book_imbalance_5": imbalance5,
+        "book_depth_5": depth5,
+    }
 
 
 async def main():
