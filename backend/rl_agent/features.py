@@ -1,0 +1,493 @@
+"""
+RL-Agent Feature Computation.
+
+Eine Funktion für Training UND Live.
+Input: Candle-Arrays (NumPy), egal ob aus RAM oder DB.
+Output: 57-Feature Observation-Vektor für PPO.
+
+Features:
+  0-13:  agg_5m  (144 Candles, 12h)
+ 14-21:  agg_1h  (24 Candles, 24h)
+ 22-25:  agg_4h  (12 Candles, 48h)
+ 26-29:  agg_1d  (14 Candles, 14d)
+ 30-33:  BTC Referenz (agg_1h, 25 Candles)
+ 34-37:  ETH Referenz (agg_1h, 25 Candles)
+ 38-39:  Zeitkontext (Stunde, Wochentag)
+ 40-51:  kline_metrics (12 pct-Werte)
+ 52-56:  Position State (in_pos, direction, pnl, duration, n_open)
+"""
+import time
+import numpy as np
+
+FEATURE_NAMES = [
+    # === agg_5m: 14 Features (0-13) ===
+    'a5m_return_15m', 'a5m_return_1h', 'a5m_return_3h', 'a5m_return_6h', 'a5m_return_12h',
+    'a5m_volatility', 'a5m_volume_trend', 'a5m_taker_ratio', 'a5m_trades_trend',
+    'a5m_range_avg', 'a5m_trend_consistency',
+    'a5m_body_ratio', 'a5m_upper_wick', 'a5m_lower_wick',
+    # === agg_1h: 8 Features (14-21) ===
+    'a1h_return_6h', 'a1h_return_12h', 'a1h_return_24h',
+    'a1h_volatility', 'a1h_volume_trend', 'a1h_taker_ratio',
+    'a1h_range_avg', 'a1h_trend_consistency',
+    # === agg_4h: 4 Features (22-25) ===
+    'a4h_return_24h', 'a4h_return_48h', 'a4h_volatility', 'a4h_trend_consistency',
+    # === agg_1d: 4 Features (26-29) ===
+    'a1d_return_7d', 'a1d_return_14d', 'a1d_volatility', 'a1d_volume_trend',
+    # === BTC Referenz: 4 Features (30-33) ===
+    'btc_return_1h', 'btc_return_6h', 'btc_return_24h', 'btc_volatility',
+    # === ETH Referenz: 4 Features (34-37) ===
+    'eth_return_1h', 'eth_return_6h', 'eth_return_24h', 'eth_volatility',
+    # === Zeit: 2 Features (38-39) ===
+    'hour', 'weekday',
+    # === kline_metrics: 12 Features (40-51) ===
+    'km_pct_30m', 'km_pct_60m', 'km_pct_90m', 'km_pct_120m',
+    'km_pct_180m', 'km_pct_240m', 'km_pct_300m',
+    'km_pct_360m', 'km_pct_420m', 'km_pct_480m', 'km_pct_540m', 'km_pct_600m',
+    # === Position State: 5 Features (52-56) ===
+    'in_position', 'position_direction', 'unrealized_pnl', 'position_duration', 'n_open_positions',
+]
+
+N_FEATURES = len(FEATURE_NAMES)  # 57
+
+_KM_COLS = [
+    'pct_30m', 'pct_60m', 'pct_90m', 'pct_120m',
+    'pct_180m', 'pct_240m', 'pct_300m',
+    'pct_360m', 'pct_420m', 'pct_480m', 'pct_540m', 'pct_600m',
+]
+
+
+def compute_observation(candles_5m, candles_1h, candles_4h, candles_1d,
+                        btc_1h, eth_1h, hour, weekday,
+                        kline_metrics=None, position_state=None,
+                        n_open_positions=0):
+    """
+    Berechnet den Observation-Vektor für den PPO Agent.
+
+    Args:
+        candles_5m:  dict mit 'open','high','low','close','volume','trades','taker'
+                     je np.ndarray, letzte 144 Candles (12h)
+        candles_1h:  gleich, letzte 24 Candles
+        candles_4h:  gleich, letzte 12 Candles
+        candles_1d:  gleich, letzte 14 Candles
+        btc_1h:      gleich, letzte 25 Candles (BTC agg_1h)
+        eth_1h:      gleich, letzte 25 Candles (ETH agg_1h)
+        hour:        int 0-23
+        weekday:     int 0-6
+        kline_metrics: dict mit pct_30m...pct_600m oder None
+        position_state: dict mit in_position, direction, unrealized_pnl, duration_min
+        n_open_positions: int
+
+    Returns:
+        np.ndarray shape (N_FEATURES,) float32
+    """
+    obs = np.zeros(N_FEATURES, dtype=np.float32)
+
+    # === agg_5m (0-13) ===
+    a5 = _agg_features(candles_5m, [3, 12, 36, 72, 144])
+    obs[0:5] = a5['returns']
+    obs[5] = a5['volatility']
+    obs[6] = a5['volume_trend']
+    obs[7] = a5['taker_ratio']
+    obs[8] = a5['trades_trend']
+    obs[9] = a5['range_avg']
+    obs[10] = a5['trend_consistency']
+    obs[11] = a5['body_ratio']
+    obs[12] = a5['upper_wick']
+    obs[13] = a5['lower_wick']
+
+    # === agg_1h (14-21) ===
+    a1h = _agg_features(candles_1h, [6, 12, 24])
+    obs[14:17] = a1h['returns']
+    obs[17] = a1h['volatility']
+    obs[18] = a1h['volume_trend']
+    obs[19] = a1h['taker_ratio']
+    obs[20] = a1h['range_avg']
+    obs[21] = a1h['trend_consistency']
+
+    # === agg_4h (22-25) ===
+    a4h = _agg_features(candles_4h, [6, 12])
+    obs[22:24] = a4h['returns']
+    obs[24] = a4h['volatility']
+    obs[25] = a4h['trend_consistency']
+
+    # === agg_1d (26-29) ===
+    a1d = _agg_features(candles_1d, [7, 14])
+    obs[26:28] = a1d['returns']
+    obs[28] = a1d['volatility']
+    obs[29] = a1d['volume_trend']
+
+    # === BTC/ETH Referenz (30-37) ===
+    btc = _ref_features(btc_1h)
+    obs[30] = btc['return_1h']
+    obs[31] = btc['return_6h']
+    obs[32] = btc['return_24h']
+    obs[33] = btc['volatility']
+
+    eth = _ref_features(eth_1h)
+    obs[34] = eth['return_1h']
+    obs[35] = eth['return_6h']
+    obs[36] = eth['return_24h']
+    obs[37] = eth['volatility']
+
+    # === Zeit (38-39) ===
+    obs[38] = hour / 23.0          # Normalisiert 0-1
+    obs[39] = weekday / 6.0        # Normalisiert 0-1
+
+    # === kline_metrics (40-51) ===
+    if kline_metrics:
+        for i, col in enumerate(_KM_COLS):
+            obs[40 + i] = kline_metrics.get(col, 0.0)
+
+    # === Position State (52-56) ===
+    if position_state:
+        obs[52] = 1.0 if position_state.get('in_position') else 0.0
+        obs[53] = float(position_state.get('direction', 0.0))
+        obs[54] = position_state.get('unrealized_pnl', 0.0)
+        obs[55] = position_state.get('duration_min', 0.0) / 1440.0
+    obs[56] = n_open_positions / 20.0
+
+    return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+# ============================================================
+# Candle-Feature Berechnung
+# ============================================================
+
+def _agg_features(candles, return_periods):
+    """
+    Features aus Candle-Daten.
+
+    Args:
+        candles: dict mit 'open','high','low','close','volume','trades','taker'
+        return_periods: list[int] — Lookback in Candle-Einheiten
+
+    Returns:
+        dict mit returns, volatility, volume_trend, taker_ratio,
+        trades_trend, range_avg, trend_consistency, body/wick ratios
+    """
+    n_ret = len(return_periods)
+    default = {
+        'returns': [0.0] * n_ret,
+        'volatility': 0.0, 'volume_trend': 1.0, 'taker_ratio': 0.5,
+        'trades_trend': 1.0, 'range_avg': 0.0, 'trend_consistency': 0.0,
+        'body_ratio': 0.0, 'upper_wick': 0.0, 'lower_wick': 0.0,
+    }
+
+    closes = candles.get('close')
+    if closes is None or len(closes) < 3:
+        return default
+
+    n = len(closes)
+    highs = candles['high']
+    lows = candles['low']
+    opens = candles['open']
+    volumes = candles['volume']
+    trades = candles['trades']
+    taker = candles['taker']
+
+    if closes[-1] == 0 or closes[0] == 0:
+        return default
+
+    # Returns
+    returns = []
+    for period in return_periods:
+        idx = max(0, n - period)
+        if closes[idx] > 0:
+            ret = (closes[-1] - closes[idx]) / closes[idx] * 100
+        else:
+            ret = 0.0
+        returns.append(float(ret))
+
+    # Volatility
+    pct_changes = np.diff(closes) / np.maximum(closes[:-1], 1e-10) * 100
+    pct_changes = np.nan_to_num(pct_changes, 0)
+    volatility = float(np.std(pct_changes)) if len(pct_changes) > 1 else 0.0
+
+    # Volume Trend
+    quarter = max(1, n // 4)
+    avg_vol = np.mean(volumes)
+    recent_vol = np.mean(volumes[-quarter:])
+    volume_trend = float(recent_vol / avg_vol) if avg_vol > 0 else 1.0
+
+    # Taker Ratio
+    total_vol = np.sum(volumes)
+    total_taker = np.sum(taker)
+    taker_ratio = float(total_taker / total_vol) if total_vol > 0 else 0.5
+
+    # Trades Trend
+    avg_trades = np.mean(trades)
+    recent_trades = np.mean(trades[-quarter:])
+    trades_trend = float(recent_trades / avg_trades) if avg_trades > 0 else 1.0
+
+    # Range
+    ranges = (highs - lows) / np.maximum(closes, 1e-10) * 100
+    range_avg = float(np.mean(ranges))
+
+    # Trend Consistency
+    if len(pct_changes) > 0:
+        trend_consistency = float((np.sum(pct_changes > 0) / len(pct_changes)) * 2 - 1)
+    else:
+        trend_consistency = 0.0
+
+    # Candle Pattern (letzte Kerze)
+    o = float(opens[-1])
+    h = float(highs[-1])
+    l = float(lows[-1])
+    c = float(closes[-1])
+    total_range = h - l
+    if total_range > 0:
+        body_ratio = abs(c - o) / total_range
+        upper_wick = (h - max(o, c)) / total_range
+        lower_wick = (min(o, c) - l) / total_range
+    else:
+        body_ratio = upper_wick = lower_wick = 0.0
+
+    return {
+        'returns': returns,
+        'volatility': volatility,
+        'volume_trend': volume_trend,
+        'taker_ratio': taker_ratio,
+        'trades_trend': trades_trend,
+        'range_avg': range_avg,
+        'trend_consistency': trend_consistency,
+        'body_ratio': body_ratio,
+        'upper_wick': upper_wick,
+        'lower_wick': lower_wick,
+    }
+
+
+def _ref_features(candles_1h):
+    """Returns + Volatility aus agg_1h (BTC oder ETH)."""
+    closes = candles_1h.get('close')
+    if closes is None or len(closes) < 2:
+        return {'return_1h': 0.0, 'return_6h': 0.0, 'return_24h': 0.0, 'volatility': 0.0}
+
+    n = len(closes)
+    current = closes[-1]
+    if current <= 0:
+        return {'return_1h': 0.0, 'return_6h': 0.0, 'return_24h': 0.0, 'volatility': 0.0}
+
+    def _ret(idx):
+        p = closes[max(0, n - idx)]
+        return float((current - p) / p * 100) if p > 0 else 0.0
+
+    rets = np.diff(closes) / np.maximum(closes[:-1], 1e-10) * 100
+    volatility = float(np.std(rets)) if len(rets) > 1 else 0.0
+
+    return {
+        'return_1h': _ret(2),
+        'return_6h': _ret(7),
+        'return_24h': _ret(25),
+        'volatility': volatility,
+    }
+
+
+# ============================================================
+# Hilfsfunktionen
+# ============================================================
+
+def empty_candles():
+    """Leere Candle-Daten."""
+    return {
+        'open': np.array([], dtype=np.float32),
+        'high': np.array([], dtype=np.float32),
+        'low': np.array([], dtype=np.float32),
+        'close': np.array([], dtype=np.float32),
+        'volume': np.array([], dtype=np.float32),
+        'trades': np.array([], dtype=np.float32),
+        'taker': np.array([], dtype=np.float32),
+    }
+
+
+# ============================================================
+# Live-Service: DB → Candle-Arrays → Observation
+# ============================================================
+
+def get_candles_from_db(conn, table, symbol, before_time, n_candles):
+    """
+    Holt Candle-Daten aus der DB im gleichen Format wie preloaded data.
+    Für den Live-Service.
+    """
+    col_time = 'open_time' if table == 'kline_metrics' else 'bucket'
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT open, high, low, close, volume, trades,
+                   taker_buy_base
+            FROM {table}
+            WHERE symbol = %s AND {col_time} <= %s
+            ORDER BY {col_time} DESC LIMIT %s
+        """, (symbol, before_time, n_candles))
+        rows = cur.fetchall()
+
+    if not rows:
+        return empty_candles()
+
+    rows = list(reversed(rows))
+    return {
+        'open': np.array([float(r['open']) for r in rows], dtype=np.float32),
+        'high': np.array([float(r['high']) for r in rows], dtype=np.float32),
+        'low': np.array([float(r['low']) for r in rows], dtype=np.float32),
+        'close': np.array([float(r['close']) for r in rows], dtype=np.float32),
+        'volume': np.array([float(r['volume'] or 0) for r in rows], dtype=np.float32),
+        'trades': np.array([float(r['trades'] or 0) for r in rows], dtype=np.float32),
+        'taker': np.array([float(r['taker_buy_base'] or 0) for r in rows], dtype=np.float32),
+    }
+
+
+def get_kline_metrics_from_db(conn, symbol, before_time):
+    """kline_metrics nächste Zeile VOR before_time."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT pct_30m, pct_60m, pct_90m, pct_120m, pct_180m, pct_240m,
+                   pct_300m, pct_360m, pct_420m, pct_480m, pct_540m, pct_600m
+            FROM kline_metrics
+            WHERE symbol = %s AND open_time <= %s
+            ORDER BY open_time DESC LIMIT 1
+        """, (symbol, before_time))
+        row = cur.fetchone()
+    if not row:
+        return None
+    cols = ['pct_30m', 'pct_60m', 'pct_90m', 'pct_120m', 'pct_180m', 'pct_240m',
+            'pct_300m', 'pct_360m', 'pct_420m', 'pct_480m', 'pct_540m', 'pct_600m']
+    if hasattr(row, 'items'):
+        return {k: float(v) if v is not None else 0.0 for k, v in row.items()}
+    return {cols[i]: float(v) if v is not None else 0.0 for i, v in enumerate(row)}
+
+
+def compute_observation_live(coins_conn, symbol, current_time,
+                             position_state=None, n_open_positions=0):
+    """
+    Berechnet Observation für den Live-Service direkt aus DB.
+    Gleiche Funktion wie im Training, nur andere Datenquelle.
+    """
+    candles_5m = get_candles_from_db(coins_conn, 'agg_5m', symbol, current_time, 144)
+    candles_1h = get_candles_from_db(coins_conn, 'agg_1h', symbol, current_time, 24)
+    candles_4h = get_candles_from_db(coins_conn, 'agg_4h', symbol, current_time, 12)
+    candles_1d = get_candles_from_db(coins_conn, 'agg_1d', symbol, current_time, 14)
+    btc_1h = get_candles_from_db(coins_conn, 'agg_1h', 'BTCUSDC', current_time, 25)
+    eth_1h = get_candles_from_db(coins_conn, 'agg_1h', 'ETHUSDC', current_time, 25)
+    km = get_kline_metrics_from_db(coins_conn, symbol, current_time)
+
+    return compute_observation(
+        candles_5m, candles_1h, candles_4h, candles_1d,
+        btc_1h, eth_1h,
+        current_time.hour, current_time.weekday(),
+        kline_metrics=km,
+        position_state=position_state,
+        n_open_positions=n_open_positions,
+    )
+
+
+# ============================================================
+# Hyperliquid API: Live-Candles → Observation
+# ============================================================
+
+_hl_info = None
+
+def _get_hl_info():
+    """Modul-Level Singleton fuer Hyperliquid Info."""
+    global _hl_info
+    if _hl_info is None:
+        from hyperliquid.info import Info
+        _hl_info = Info(skip_ws=True)
+    return _hl_info
+
+
+def _hl_candles_to_numpy(candles):
+    """Konvertiert HL-Candle-Format in numpy dict (wie DB-Format)."""
+    if not candles:
+        return empty_candles()
+    return {
+        'open': np.array([float(c['o']) for c in candles], dtype=np.float32),
+        'high': np.array([float(c['h']) for c in candles], dtype=np.float32),
+        'low': np.array([float(c['l']) for c in candles], dtype=np.float32),
+        'close': np.array([float(c['c']) for c in candles], dtype=np.float32),
+        'volume': np.array([float(c['v']) for c in candles], dtype=np.float32),
+        'trades': np.array([float(c['n']) for c in candles], dtype=np.float32),
+        'taker': np.array([float(c['v']) * 0.5 for c in candles], dtype=np.float32),
+    }
+
+
+def _fetch_hl_candles(info, coin, interval, start_ms, end_ms):
+    """HL Candles holen mit Fehlerbehandlung + Rate-Limit-Schutz."""
+    import time as _time
+    for attempt in range(3):
+        try:
+            candles = info.candles_snapshot(coin, interval, start_ms, end_ms)
+            return _hl_candles_to_numpy(candles)
+        except Exception as e:
+            if '429' in str(e) and attempt < 2:
+                _time.sleep(2)
+                continue
+            raise ConnectionError(f"HL API Fehler fuer {coin} {interval}: {e}")
+
+
+def fetch_hl_ref_candles():
+    """BTC + ETH 1h Referenz-Candles von HL holen. Einmal pro Scan-Zyklus aufrufen."""
+    info = _get_hl_info()
+    now_ms = int(time.time() * 1000)
+    btc_1h = _fetch_hl_candles(info, "BTC", "1h", now_ms - 25*60*60*1000, now_ms)
+    eth_1h = _fetch_hl_candles(info, "ETH", "1h", now_ms - 25*60*60*1000, now_ms)
+    return btc_1h, eth_1h
+
+
+# Cache fuer 1h/4h/1d Candles (aendern sich kaum in 5 Min)
+_hl_candle_cache = {}
+_hl_cache_time = 0
+_HL_CACHE_TTL = 300  # 5 Min Cache fuer 1h/4h/1d
+
+
+def compute_observation_hl(coins_conn, symbol, position_state=None, n_open_positions=0,
+                           btc_1h_cache=None, eth_1h_cache=None):
+    """
+    Berechnet Observation mit Live-Candles von Hyperliquid API.
+    5m: Immer frisch (1 Call pro Coin)
+    1h/4h/1d: Gecached fuer 5 Min
+    kline_metrics: Aus DB.
+    """
+    global _hl_candle_cache, _hl_cache_time
+    from datetime import datetime, timezone
+
+    info = _get_hl_info()
+    coin = symbol.replace('USDC', '').replace('USDT', '')
+    now_ms = int(time.time() * 1000)
+    now_s = time.time()
+
+    # 5m: Immer frisch
+    candles_5m = _fetch_hl_candles(info, coin, "5m", now_ms - 144*5*60*1000, now_ms)
+
+    # 1h/4h/1d: Cache pro Coin (5 Min TTL)
+    cache_key = coin
+    if now_s - _hl_cache_time > _HL_CACHE_TTL:
+        _hl_candle_cache = {}
+        _hl_cache_time = now_s
+
+    if cache_key not in _hl_candle_cache:
+        candles_1h = _fetch_hl_candles(info, coin, "1h", now_ms - 24*60*60*1000, now_ms)
+        candles_4h = _fetch_hl_candles(info, coin, "4h", now_ms - 48*60*60*1000, now_ms)
+        candles_1d = _fetch_hl_candles(info, coin, "1d", now_ms - 14*24*60*60*1000, now_ms)
+        _hl_candle_cache[cache_key] = (candles_1h, candles_4h, candles_1d)
+    else:
+        candles_1h, candles_4h, candles_1d = _hl_candle_cache[cache_key]
+
+    # BTC + ETH Referenz: Cache nutzen oder frisch holen
+    if btc_1h_cache is not None and eth_1h_cache is not None:
+        btc_1h = btc_1h_cache
+        eth_1h = eth_1h_cache
+    else:
+        btc_1h = _fetch_hl_candles(info, "BTC", "1h", now_ms - 25*60*60*1000, now_ms)
+        eth_1h = _fetch_hl_candles(info, "ETH", "1h", now_ms - 25*60*60*1000, now_ms)
+
+    # kline_metrics aus DB
+    now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+    km = get_kline_metrics_from_db(coins_conn, symbol, now_dt)
+
+    now_utc = datetime.now(timezone.utc)
+    return compute_observation(
+        candles_5m, candles_1h, candles_4h, candles_1d,
+        btc_1h, eth_1h,
+        now_utc.hour, now_utc.weekday(),
+        kline_metrics=km,
+        position_state=position_state,
+        n_open_positions=n_open_positions,
+    )

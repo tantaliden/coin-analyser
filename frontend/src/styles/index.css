@@ -1,0 +1,177 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-bg: #0f1419;
+  --color-surface: #1a1f2e;
+  --color-border: #2d3748;
+  --color-hover: #374151;
+  --color-text: #e5e7eb;
+  --color-muted: #9ca3af;
+  --color-accent-blue: #3b82f6;
+  --color-accent-green: #22c55e;
+  --color-accent-red: #ef4444;
+  --color-accent-yellow: #eab308;
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+input, select, button {
+  font-family: inherit;
+}
+
+input:focus, select:focus, button:focus {
+  outline: none;
+}
+
+.module-container {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 0.25rem;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+}
+
+/* Unsichtbare Drag-Zone: 6px oben, beim Hover minimal sichtbar */
+.module-header {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 6px;
+  cursor: move;
+  z-index: 15;
+  background: transparent;
+  transition: background 0.1s;
+}
+.module-container:hover .module-header {
+  background: rgba(59, 130, 246, 0.15);
+}
+.module-container.react-grid-item--dragging .module-header,
+.module-header:active {
+  background: rgba(59, 130, 246, 0.4);
+}
+
+
+.module-content {
+  flex: 1;
+  overflow: auto;
+  padding: 2px;
+  padding-top: 8px; /* Platz fuer Drag-Zone */
+}
+
+.btn {
+  padding: 0.5rem 1rem;
+  border-radius: 0.375rem;
+  border: none;
+  cursor: pointer;
+  font-weight: 500;
+  transition: background 0.15s;
+}
+
+.btn-primary {
+  background: var(--color-accent-blue);
+  color: white;
+}
+
+.btn-primary:hover {
+  background: #2563eb;
+}
+
+.input {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 0.375rem;
+  padding: 0.5rem 0.75rem;
+  color: var(--color-text);
+}
+
+.input:focus {
+  border-color: var(--color-accent-blue);
+}
+
+
+/* === Resize Handles - alle Kanten voll nutzbar === */
+
+/* Basis: alle Handles unsichtbar aber voll funktional */
+.react-grid-item > .react-resizable-handle {
+  position: absolute !important;
+  z-index: 10;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+/* Beim Hover über das Grid-Item: Handles sichtbar */
+.react-grid-item:hover > .react-resizable-handle {
+  opacity: 1;
+}
+
+/* SVG-Icon entfernen */
+.react-grid-item > .react-resizable-handle::after {
+  content: none !important;
+  display: none !important;
+}
+
+/* Kanten: schmale Streifen über gesamte Länge */
+.react-grid-item > .react-resizable-handle-n {
+  top: 0 !important; left: 0 !important; right: 0 !important;
+  width: 100% !important; height: 6px !important;
+  margin: 0 !important; transform: none !important;
+  cursor: n-resize !important;
+}
+.react-grid-item > .react-resizable-handle-s {
+  bottom: 0 !important; left: 0 !important; right: 0 !important;
+  width: 100% !important; height: 6px !important;
+  margin: 0 !important; transform: none !important;
+  cursor: s-resize !important;
+}
+.react-grid-item > .react-resizable-handle-e {
+  top: 0 !important; right: 0 !important; bottom: 0 !important;
+  width: 6px !important; height: 100% !important;
+  margin: 0 !important; transform: none !important;
+  cursor: e-resize !important;
+}
+.react-grid-item > .react-resizable-handle-w {
+  top: 0 !important; left: 0 !important; bottom: 0 !important;
+  width: 6px !important; height: 100% !important;
+  margin: 0 !important; transform: none !important;
+  cursor: w-resize !important;
+}
+
+/* Ecken: kleine Quadrate */
+.react-grid-item > .react-resizable-handle-se {
+  bottom: 0 !important; right: 0 !important;
+  width: 12px !important; height: 12px !important;
+  transform: none !important; cursor: se-resize !important;
+}
+.react-grid-item > .react-resizable-handle-sw {
+  bottom: 0 !important; left: 0 !important;
+  width: 12px !important; height: 12px !important;
+  transform: none !important; cursor: sw-resize !important;
+}
+.react-grid-item > .react-resizable-handle-ne {
+  top: 0 !important; right: 0 !important;
+  width: 12px !important; height: 12px !important;
+  transform: none !important; cursor: ne-resize !important;
+}
+.react-grid-item > .react-resizable-handle-nw {
+  top: 0 !important; left: 0 !important;
+  width: 12px !important; height: 12px !important;
+  transform: none !important; cursor: nw-resize !important;
+}
+
+/* Hover-Highlight auf Handles */
+.react-grid-item > .react-resizable-handle:hover {
+  background: rgba(59, 130, 246, 0.25) !important;
+}
