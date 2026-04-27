@@ -24,7 +24,9 @@ def insert_klines_10s(conn, rows):
                quote_asset_volume, taker_buy_base, taker_buy_quote,
                funding, open_interest, premium, oracle_px, mark_px, mid_px,
                bbo_bid_px, bbo_ask_px, bbo_bid_sz, bbo_ask_sz,
-               spread_bps, book_imbalance_5, book_depth_5)
+               spread_bps, book_imbalance_5, book_depth_5,
+               book_imbalance_10, book_depth_10,
+               book_imbalance_20, book_depth_20)
             VALUES %s
             ON CONFLICT (symbol, interval, open_time) DO UPDATE SET
               close_time=EXCLUDED.close_time, open=EXCLUDED.open,
@@ -40,7 +42,11 @@ def insert_klines_10s(conn, rows):
               bbo_bid_sz=EXCLUDED.bbo_bid_sz, bbo_ask_sz=EXCLUDED.bbo_ask_sz,
               spread_bps=EXCLUDED.spread_bps,
               book_imbalance_5=EXCLUDED.book_imbalance_5,
-              book_depth_5=EXCLUDED.book_depth_5
+              book_depth_5=EXCLUDED.book_depth_5,
+              book_imbalance_10=EXCLUDED.book_imbalance_10,
+              book_depth_10=EXCLUDED.book_depth_10,
+              book_imbalance_20=EXCLUDED.book_imbalance_20,
+              book_depth_20=EXCLUDED.book_depth_20
         """, [(
             r["symbol"], r["interval"], r["open_time"], r["close_time"],
             r["open"], r["high"], r["low"], r["close"], r["volume"], r["trades"],
@@ -48,7 +54,9 @@ def insert_klines_10s(conn, rows):
             r["funding"], r["open_interest"], r["premium"],
             r["oracle_px"], r["mark_px"], r["mid_px"],
             r["bbo_bid_px"], r["bbo_ask_px"], r["bbo_bid_sz"], r["bbo_ask_sz"],
-            r["spread_bps"], r["book_imbalance_5"], r["book_depth_5"]
+            r["spread_bps"], r["book_imbalance_5"], r["book_depth_5"],
+            r["book_imbalance_10"], r["book_depth_10"],
+            r["book_imbalance_20"], r["book_depth_20"]
         ) for r in rows])
     conn.commit()
 

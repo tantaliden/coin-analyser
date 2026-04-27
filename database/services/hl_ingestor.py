@@ -223,6 +223,10 @@ async def task_flush(cfg: dict, state: HLState):
                     "bbo_bid_sz": bbo["bbo_bid_sz"],
                     "bbo_ask_sz": bbo["bbo_ask_sz"],
                     "spread_bps": bbo["spread_bps"],
+                    "book_imbalance_10": bbo["book_imbalance_10"],
+                    "book_depth_10": bbo["book_depth_10"],
+                    "book_imbalance_20": bbo["book_imbalance_20"],
+                    "book_depth_20": bbo["book_depth_20"],
                     "book_imbalance_5": bbo["book_imbalance_5"],
                     "book_depth_5": bbo["book_depth_5"],
                 })
@@ -258,9 +262,13 @@ def _td(seconds: int):
 
 
 def compute_bbo(l2: dict) -> dict:
-    """Berechnet BBO/Book-Imbalance/Spread aus L2-Snapshot. None wenn L2 fehlt."""
-    empty = {k: None for k in ("bbo_bid_px", "bbo_ask_px", "bbo_bid_sz", "bbo_ask_sz",
-                               "spread_bps", "book_imbalance_5", "book_depth_5")}
+    """Berechnet BBO/Book-Imbalance/Spread/Depth fuer Top-5/10/20 aus L2-Snapshot."""
+    keys = ("bbo_bid_px", "bbo_ask_px", "bbo_bid_sz", "bbo_ask_sz",
+            "spread_bps",
+            "book_imbalance_5", "book_depth_5",
+            "book_imbalance_10", "book_depth_10",
+            "book_imbalance_20", "book_depth_20")
+    empty = {k: None for k in keys}
     if not l2:
         return empty
     bids = l2.get("bids") or []
@@ -273,16 +281,23 @@ def compute_bbo(l2: dict) -> dict:
     ask_sz = float(asks[0]["sz"])
     mid = (bid_px + ask_px) / 2.0
     spread_bps = (ask_px - bid_px) / mid * 10000.0 if mid > 0 else None
-    top5_bid = sum(float(b["sz"]) for b in bids[:5])
-    top5_ask = sum(float(a["sz"]) for a in asks[:5])
-    depth5 = top5_bid + top5_ask
-    imbalance5 = (top5_bid - top5_ask) / depth5 if depth5 > 0 else 0.0
+
+    def imb_depth(n):
+        tb = sum(float(b["sz"]) for b in bids[:n])
+        ta = sum(float(a["sz"]) for a in asks[:n])
+        d = tb + ta
+        return ((tb - ta) / d if d > 0 else 0.0), d
+
+    imb5, depth5 = imb_depth(5)
+    imb10, depth10 = imb_depth(10)
+    imb20, depth20 = imb_depth(20)
     return {
         "bbo_bid_px": bid_px, "bbo_ask_px": ask_px,
         "bbo_bid_sz": bid_sz, "bbo_ask_sz": ask_sz,
         "spread_bps": spread_bps,
-        "book_imbalance_5": imbalance5,
-        "book_depth_5": depth5,
+        "book_imbalance_5": imb5, "book_depth_5": depth5,
+        "book_imbalance_10": imb10, "book_depth_10": depth10,
+        "book_imbalance_20": imb20, "book_depth_20": depth20,
     }
 
 
