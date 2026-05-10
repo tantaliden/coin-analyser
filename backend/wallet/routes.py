@@ -1,5 +1,10 @@
-"""WALLET ROUTES - Binance + Hyperliquid Account Integration"""
+"""WALLET ROUTES - Binance + Hyperliquid Account Integration
+
+HL-Daten kommen primaer aus dem WS-Live-State (hl_ws_state.py) — sub-200ms
+Latenz, kein Rate-Limit. Bei stale WS-Daten Fallback auf REST mit Stale-Cache.
+"""
 import json
+import time
 from pathlib import Path
 from typing import Optional
 from pydantic import BaseModel
@@ -10,10 +15,107 @@ from hyperliquid.info import Info as HLInfo
 from hyperliquid.utils import constants as hl_constants
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from shared.database import get_app_db
+from shared.database import get_app_db, get_coins_db
 from auth.auth import get_current_user, decrypt_value
+from wallet.hl_ws_state import get_ws_state, ensure_started
 
 router = APIRouter(prefix="/api/v1/wallet", tags=["wallet"])
+
+# REST-Fallback-Caches — gefragt nur wenn WS-State stale ist.
+_HL_CACHE_TTL_S = 5.0
+_hl_user_state_cache: dict = {}
+_hl_open_orders_cache: dict = {}
+_hl_spot_state_cache: dict = {}
+_HL_FILLS_TTL_S = 30.0
+_hl_user_fills_cache: dict = {}
+
+
+def _cached_user_state(address: str) -> dict:
+    """Primary: WS-Live-State. Fallback: REST mit Stale-Cache."""
+    ensure_started(address)
+    ws_data = get_ws_state().get_user_state_view()
+    if ws_data is not None:
+        return ws_data
+    # Fallback: REST
+    now = time.time()
+    c = _hl_user_state_cache.get(address)
+    if c and now - c["ts"] < _HL_CACHE_TTL_S:
+        return c["data"]
+    try:
+        data = HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True).user_state(address)
+        _hl_user_state_cache[address] = {"ts": now, "data": data}
+        return data
+    except Exception as e:
+        print(f"[WALLET-HL] user_state REST fallback failed: {e}")
+        if c:
+            return c["data"]
+        raise
+
+
+def _cached_open_orders(address: str) -> list:
+    """Primary: WS-Live-State (openOrders aus webData2). Fallback: REST."""
+    ensure_started(address)
+    ws_data = get_ws_state().get_open_orders_view()
+    if ws_data is not None:
+        return ws_data
+    now = time.time()
+    c = _hl_open_orders_cache.get(address)
+    if c and now - c["ts"] < _HL_CACHE_TTL_S:
+        return c["data"]
+    try:
+        data = HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True).open_orders(address)
+        _hl_open_orders_cache[address] = {"ts": now, "data": data}
+        return data
+    except Exception as e:
+        print(f"[WALLET-HL] open_orders REST fallback failed: {e}")
+        if c:
+            return c["data"]
+        raise
+
+
+def _cached_spot_user_state(address: str) -> dict:
+    """Primary: WS-Live-State. Fallback: REST."""
+    ensure_started(address)
+    ws_data = get_ws_state().get_spot_state_view()
+    if ws_data is not None:
+        return ws_data
+    now = time.time()
+    c = _hl_spot_state_cache.get(address)
+    if c and now - c["ts"] < _HL_CACHE_TTL_S:
+        return c["data"]
+    try:
+        data = HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True).spot_user_state(address)
+        _hl_spot_state_cache[address] = {"ts": now, "data": data}
+        return data
+    except Exception as e:
+        print(f"[WALLET-HL] spot_user_state REST fallback failed: {e}")
+        if c:
+            return c["data"]
+        return {}
+
+
+def _cached_user_fills(address: str) -> list:
+    """Primary: WS-Live-State (userFills push). Fallback: REST."""
+    ensure_started(address)
+    ws = get_ws_state()
+    if ws.is_fills_fresh():
+        fills = ws.get_fills()
+        if fills:
+            return fills
+    # Fallback: REST (besonders nach Server-Start solange WS noch keinen Push hatte)
+    now = time.time()
+    c = _hl_user_fills_cache.get(address)
+    if c and now - c["ts"] < _HL_FILLS_TTL_S:
+        return c["data"]
+    try:
+        data = HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True).user_fills(address)
+        _hl_user_fills_cache[address] = {"ts": now, "data": data}
+        return data
+    except Exception as e:
+        print(f"[WALLET-HL] user_fills REST fallback failed: {e}")
+        if c:
+            return c["data"]
+        return []
 
 
 def get_user_binance_client(user_id: int):
@@ -236,6 +338,154 @@ async def create_order(request: CreateOrderRequest, current_user: dict = Depends
 @router.get("/history")
 async def get_trade_history(days: int = 30, limit: int = 500, current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
+    from datetime import datetime, timezone
+    cutoff_ms = int((time.time() - days * 86400) * 1000)
+    trades = []
+
+    # 1) HL-Fills — nur Close-Fills (closedPnl != 0) als History-Eintraege.
+    #    Open-Fills haben definitionsgemaess keinen Verkaufswert (Position ist noch offen).
+    # Fragmente mit gleicher oid werden zu einem Trade aggregiert (Fix 10.05.2026).
+    # Hebel-Lookup mit 4-Stufen-Fallback (Fix 10.05.2026: trader_positions als 2. Stufe):
+    #   1. open_predictions.effective_leverage (Predictor-Welt)
+    #   2. trader_positions.leverage (Trader-Welt) — definitiver Hebel pro Trade
+    #   3. Aktuell offene HL-Position fuer den Coin (manuelle Trades)
+    #   4. settings.predictor.trading.default_leverage
+    pred_index = []
+    trader_index = []
+    try:
+        with get_app_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT symbol, created_at,
+                           COALESCE(closed_at, NOW() + INTERVAL '30 seconds') AS end_at,
+                           effective_leverage
+                    FROM open_predictions
+                    WHERE created_at >= NOW() - (%s || ' days')::interval
+                      AND effective_leverage IS NOT NULL
+                    ORDER BY created_at DESC
+                """, (days,))
+                pred_index = cur.fetchall()
+                cur.execute("""
+                    SELECT symbol, opened_at,
+                           COALESCE(closed_at, NOW() + INTERVAL '30 seconds') AS end_at,
+                           leverage
+                    FROM trader_positions
+                    WHERE opened_at >= NOW() - (%s || ' days')::interval
+                      AND leverage IS NOT NULL
+                    ORDER BY opened_at DESC
+                """, (days,))
+                trader_index = cur.fetchall()
+    except Exception:
+        pred_index = []
+        trader_index = []
+
+    # Aktuelle HL-Positionen als Hebel-Quelle fuer manuelle Trades, die nicht
+    # ueber den Predictor liefen (also keine open_predictions-Row haben).
+    hl_position_levs = {}
+    try:
+        hl_address_for_lookup = get_user_hl_address(user_id)
+        if hl_address_for_lookup:
+            state_lookup = _cached_user_state(hl_address_for_lookup)
+            for ap in state_lookup.get("assetPositions", []):
+                p = ap.get("position", {})
+                coin = p.get("coin")
+                lev_v = p.get("leverage", {}).get("value")
+                if coin and lev_v:
+                    hl_position_levs[coin] = int(lev_v)
+    except Exception:
+        pass
+
+    # Settings-Default als finaler Fallback (Volker tradet i.d.R. mit 5x).
+    try:
+        with open("/opt/coin/settings.json") as fp:
+            _s = json.load(fp)
+        default_lev = int(_s.get("predictor", {}).get("trading", {}).get("default_leverage", 5))
+    except Exception:
+        default_lev = 5
+
+    def _lookup_leverage(coin, fill_dt):
+        from datetime import timedelta
+        # 1. open_predictions (Predictor-Welt)
+        for sym, start, end, lev in pred_index:
+            if sym == coin and start <= fill_dt <= end + timedelta(seconds=30):
+                return int(lev) if lev else 1
+        # 2. trader_positions (Trader-Welt) — fix fuer Faelle wo open_predictions
+        #    den Trade nicht im Window hat (z.B. Predictor closed schon gewatcht
+        #    aber Fragment-Close kam nach end_at). trader_positions ist Auto-Trade-Welt.
+        for sym, start, end, lev in trader_index:
+            if sym == coin and start <= fill_dt <= end + timedelta(seconds=30):
+                return int(lev) if lev else 1
+        # 3. Aktuelle HL-Position fuer diesen Coin (manuelle Trades, noch offen)
+        if coin in hl_position_levs:
+            return hl_position_levs[coin]
+        # 4. Settings-Default (Trade ohne DB-Spuren — selten)
+        return default_lev
+
+    hl_address = get_user_hl_address(user_id)
+    if hl_address:
+        from collections import defaultdict
+        fills = _cached_user_fills(hl_address)
+        # Fragment-Aggregation (Fix 10.05.2026): HL fuellt Orders manchmal in mehreren
+        # Stuecken gegen Order-Book-Levels. Pro oid wird nur EIN History-Eintrag erzeugt
+        # mit aufsummierter qty / quote / pnl / fee und volume-gewichtetem avg-Preis.
+        groups = defaultdict(list)
+        for f in fills:
+            t_ms = int(f.get("time", 0))
+            if t_ms < cutoff_ms:
+                continue
+            if float(f.get("closedPnl", 0) or 0) == 0.0:
+                continue  # Open-Fill, nicht in History
+            oid = f.get("oid")
+            if oid is None:
+                # Sehr seltener Fall — als Einzeltrade behalten (eindeutiger Key per t_ms+coin)
+                oid = f"_solo_{t_ms}_{f.get('coin','')}"
+            groups[oid].append(f)
+
+        for oid, frags in groups.items():
+            sz_total = sum(float(f.get("sz", 0)) for f in frags)
+            quote_total = sum(float(f.get("sz", 0)) * float(f.get("px", 0)) for f in frags)
+            pnl_total = sum(float(f.get("closedPnl", 0) or 0) for f in frags)
+            fee_total = sum(float(f.get("fee", 0) or 0) for f in frags)
+            avg_px = (quote_total / sz_total) if sz_total > 0 else 0.0
+            t_ms_min = min(int(f.get("time", 0)) for f in frags)
+            fill_dt = datetime.fromtimestamp(t_ms_min / 1000, tz=timezone.utc)
+            coin = frags[0].get("coin", "")
+            side_raw = frags[0].get("side", "")
+            side = "buy" if side_raw == "B" else "sell"
+            d = frags[0].get("dir", "")
+            sold_for = quote_total + pnl_total
+            lev = _lookup_leverage(coin, fill_dt)
+            margin = quote_total / lev if lev > 0 else quote_total
+            pnl_pct = (pnl_total / margin * 100.0) if margin > 0 else 0.0
+            if "Close Long" in d or "Long >" in d:
+                position_side = "long"
+            elif "Close Short" in d or "Short >" in d:
+                position_side = "short"
+            else:
+                position_side = side
+            trades.append({
+                "id": str(oid),
+                "symbol": coin,
+                "side": position_side,
+                "direction": d,
+                "price": avg_px,
+                "quantity": sz_total,
+                "quote_amount": round(quote_total, 2),
+                "sold_for": round(sold_for, 2),
+                "pnl_usd": round(pnl_total, 4),
+                "pnl_percent": round(pnl_pct, 2),
+                "leverage": lev,
+                "margin_usd": round(margin, 2),
+                "fee": round(fee_total, 4),
+                "exit_reason": d,
+                "exchange": "hyperliquid",
+                "is_bot_trade": False,
+                "source": "hl_fills",
+                "executed_at": fill_dt.isoformat(),
+                "hash": frags[0].get("hash"),
+                "n_fragments": len(frags),
+            })
+
     with get_app_db() as conn:
         with conn.cursor() as cur:
             # RL-Agent Positions (closed) als History
@@ -259,11 +509,9 @@ async def get_trade_history(days: int = 30, limit: int = 500, current_user: dict
             """, (user_id, days))
             old_trades = cur.fetchall()
 
-    trades = []
     # RL-Positions als Trades formatieren
     for t in rl_trades:
         size = float(t['position_size_usd']) if t['position_size_usd'] else 0
-        lev = int(t['leverage'] or 1)
         pnl = float(t['pnl_usd']) if t['pnl_usd'] else 0
         trades.append({
             "id": t['id'], "symbol": t['symbol'],
@@ -302,23 +550,29 @@ async def get_trade_history(days: int = 30, limit: int = 500, current_user: dict
 @router.get("/realized-pnl")
 async def get_realized_pnl(days: int = 7, current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
-    with get_app_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    SUM(CASE WHEN side = 'sell' THEN quote_amount ELSE 0 END) as total_sells,
-                    SUM(CASE WHEN side = 'buy' THEN quote_amount ELSE 0 END) as total_buys
-                FROM trade_history
-                WHERE user_id = %s AND executed_at >= NOW() - INTERVAL '%s days'
-            """, (user_id, days))
-            result = cur.fetchone()
-    total_sells = float(result['total_sells'] or 0)
-    total_buys = float(result['total_buys'] or 0)
+    cutoff_ms = int((time.time() - days * 86400) * 1000)
+
+    # HL realized PnL aus user_fills (closedPnl je Close-Trade, abzueglich fees)
+    hl_pnl = 0.0
+    hl_fees = 0.0
+    hl_trades_count = 0
+    hl_address = get_user_hl_address(user_id)
+    if hl_address:
+        for f in _cached_user_fills(hl_address):
+            t_ms = int(f.get("time", 0))
+            if t_ms < cutoff_ms:
+                continue
+            hl_pnl += float(f.get("closedPnl", 0) or 0)
+            hl_fees += float(f.get("fee", 0) or 0)
+            hl_trades_count += 1
+
     return {
-        "realized_pnl": round(total_sells - total_buys, 2),
-        "total_sells": round(total_sells, 2),
-        "total_buys": round(total_buys, 2),
-        "period_days": days
+        "realized_pnl": round(hl_pnl - hl_fees, 2),
+        "gross_pnl": round(hl_pnl, 2),
+        "total_fees": round(hl_fees, 4),
+        "trades_count": hl_trades_count,
+        "period_days": days,
+        "exchange": "hyperliquid"
     }
 
 
@@ -432,18 +686,36 @@ async def get_hl_balance(current_user: dict = Depends(get_current_user)):
     if not address:
         return {"error": "Kein gültiger Hyperliquid Key konfiguriert"}
     try:
-        info = get_hl_info()
-        state = info.user_state(address)
+        state = _cached_user_state(address)
         margin = state.get("marginSummary", {})
         account_value = float(margin.get("accountValue", 0))
         margin_used = float(margin.get("totalMarginUsed", 0))
         notional_pos = float(margin.get("totalNtlPos", 0))
         withdrawable = float(state.get("withdrawable", 0))
+        # Spot-Balance zusaetzlich (USDC auf Spot-Account) — eigener Cache
+        # spot_total = alle USDC im Wallet, spot_hold = davon als Perp-Margin gebunden
+        spot_usdc = 0.0
+        spot_hold = 0.0
+        spot = _cached_spot_user_state(address)
+        for b in spot.get("balances", []):
+            if b.get("coin") == "USDC":
+                spot_usdc = float(b.get("total", 0))
+                spot_hold = float(b.get("hold", 0))
+                break
+        spot_free = max(0.0, spot_usdc - spot_hold)
+        # equity = Perp accountValue (inkl. uPnL) + freier Spot. Vorher addierte
+        # die Formel spot_total und zaehlte damit spot_hold (= Perp-Margin) doppelt.
+        equity = account_value + spot_free
+        available = max(withdrawable, spot_free)
         return {
             "account_value": round(account_value, 2),
             "margin_used": round(margin_used, 2),
             "notional_positions": round(notional_pos, 2),
-            "withdrawable": round(withdrawable, 2)
+            "withdrawable": round(withdrawable, 2),
+            "spot_usdc": round(spot_usdc, 2),
+            "total_combined": round(equity, 2),
+            "equity": round(equity, 2),
+            "available": round(available, 2),
         }
     except Exception as e:
         print(f"[WALLET-HL] Error getting balance: {e}")
@@ -456,8 +728,39 @@ async def get_hl_positions(current_user: dict = Depends(get_current_user)):
     if not address:
         return {"error": "Kein gültiger Hyperliquid Key konfiguriert"}
     try:
-        info = get_hl_info()
-        state = info.user_state(address)
+        state = _cached_user_state(address)
+        # Predictor-DB-Lookup: peak/trough fuer offene Predictions
+        # → werden bei matching coin+side an die HL-Position angehaengt.
+        pred_lookup = {}  # key: (symbol, side) -> {peak_pct, trough_pct, tp_px, sl_px, entry_px}
+        try:
+            with get_app_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT symbol, side, entry_px, peak_px, trough_px, tp_px, sl_px
+                        FROM open_predictions
+                        WHERE status='open' AND peak_px IS NOT NULL AND trough_px IS NOT NULL
+                    """)
+                    for r in cur.fetchall():
+                        sym = r['symbol']; side = r['side']
+                        entry = float(r['entry_px'])
+                        if entry <= 0: continue
+                        peak = float(r['peak_px']); trough = float(r['trough_px'])
+                        # Profit-Richtung: long = peak (oben), short = trough (unten)
+                        if side == 'long':
+                            peak_pct = (peak - entry) / entry * 100.0
+                            trough_pct = (trough - entry) / entry * 100.0
+                        else:
+                            peak_pct = (entry - trough) / entry * 100.0
+                            trough_pct = (entry - peak) / entry * 100.0
+                        pred_lookup[(sym, side)] = {
+                            'peak_pct': round(peak_pct, 2),
+                            'trough_pct': round(trough_pct, 2),
+                            'tp_px': float(r['tp_px']) if r['tp_px'] else None,
+                            'sl_px': float(r['sl_px']) if r['sl_px'] else None,
+                        }
+        except Exception as e:
+            print(f"[WALLET-HL] predictor lookup failed (peak/trough): {e}")
+
         positions = []
         for asset in state.get("assetPositions", []):
             pos = asset.get("position", {})
@@ -474,9 +777,44 @@ async def get_hl_positions(current_user: dict = Depends(get_current_user)):
             margin_used = float(pos.get("marginUsed", 0))
             roe = float(pos.get("returnOnEquity", 0))
             current_price = position_value / abs(szi) if abs(szi) > 0 else 0
+            coin = pos.get("coin", "?")
+            direction = "long" if szi > 0 else "short"
+            pred_data = pred_lookup.get((coin, direction), {})
+            peak_pct = pred_data.get("peak_pct")
+            trough_pct = pred_data.get("trough_pct")
+            # Fallback: HL-Position ohne Predictor-Row -> peak/trough aus klines+fills
+            if peak_pct is None or trough_pct is None:
+                try:
+                    fills = _cached_user_fills(address)
+                    target_dir = f"Open {'Long' if direction == 'long' else 'Short'}"
+                    open_ts_ms = None
+                    for fl in fills:  # neueste zuerst
+                        if fl.get('coin') == coin and fl.get('dir') == target_dir:
+                            open_ts_ms = int(fl.get('time', 0))
+                            break
+                    if open_ts_ms and entry_px > 0:
+                        with get_coins_db() as cconn:
+                            with cconn.cursor() as ccur:
+                                ccur.execute("""
+                                    SELECT MAX(high) AS mh, MIN(low) AS ml
+                                    FROM klines
+                                    WHERE symbol=%s AND interval='10s'
+                                      AND open_time >= to_timestamp(%s/1000.0)
+                                """, (coin, open_ts_ms))
+                                row = ccur.fetchone()
+                        if row and row["mh"] is not None and row["ml"] is not None:
+                            mh = float(row["mh"]); ml = float(row["ml"])
+                            if direction == 'long':
+                                peak_pct = round((mh - entry_px) / entry_px * 100.0, 2)
+                                trough_pct = round((ml - entry_px) / entry_px * 100.0, 2)
+                            else:
+                                peak_pct = round((entry_px - ml) / entry_px * 100.0, 2)
+                                trough_pct = round((entry_px - mh) / entry_px * 100.0, 2)
+                except Exception as e:
+                    print(f"[WALLET-HL] peak/trough fallback {coin}/{direction} failed: {e}")
             positions.append({
-                "coin": pos.get("coin", "?"),
-                "direction": "long" if szi > 0 else "short",
+                "coin": coin,
+                "direction": direction,
                 "size": abs(szi),
                 "entry_price": entry_px,
                 "current_price": round(current_price, 6),
@@ -486,7 +824,12 @@ async def get_hl_positions(current_user: dict = Depends(get_current_user)):
                 "leverage": leverage,
                 "leverage_type": leverage_type,
                 "liquidation_price": float(liquidation_px) if liquidation_px else None,
-                "margin_used": round(margin_used, 2)
+                "margin_used": round(margin_used, 2),
+                # peak/trough aus Predictor-DB oder Fallback aus klines
+                "peak_pct": peak_pct,
+                "trough_pct": trough_pct,
+                "predictor_tp": pred_data.get("tp_px"),
+                "predictor_sl": pred_data.get("sl_px"),
             })
         positions.sort(key=lambda x: -abs(x['position_value']))
         return {"positions": positions}
@@ -501,8 +844,7 @@ async def get_hl_orders(current_user: dict = Depends(get_current_user)):
     if not address:
         return {"error": "Kein gültiger Hyperliquid Key konfiguriert"}
     try:
-        info = get_hl_info()
-        open_orders = info.open_orders(address)
+        open_orders = _cached_open_orders(address)
         orders = []
         for order in open_orders:
             orders.append({
@@ -523,50 +865,124 @@ class HLCloseRequest(BaseModel):
     coins: list[str]
 
 
-@router.post("/hl/close")
-async def close_hl_positions(request: HLCloseRequest, current_user: dict = Depends(get_current_user)):
-    """Schließt ausgewählte HL-Positionen manuell."""
-    from rl_agent.trader import get_hl_credentials, close_position_hl
+class HLUpdateTPRequest(BaseModel):
+    coins: list[str]
+    tp_pct: float
+
+
+@router.get("/hl/quick-tp-percentages")
+async def get_quick_tp_percentages(current_user: dict = Depends(get_current_user)):
+    """Liefert die konfigurierten Quick-TP-Werte aus settings.json."""
+    try:
+        cfg = json.load(open('/opt/coin/settings.json'))
+        return {"values": cfg.get('wallet', {}).get('quick_tp_percentages', [0.5, 1.0, 2.0, 3.0])}
+    except Exception as e:
+        return {"values": [0.5, 1.0, 2.0, 3.0], "error": str(e)}
+
+
+@router.put("/hl/quick-tp-percentages")
+async def set_quick_tp_percentages(request: dict, current_user: dict = Depends(get_current_user)):
+    """Speichert die Quick-TP-Werte in settings.json."""
+    try:
+        values = request.get('values', [])
+        cleaned = sorted({round(float(v), 2) for v in values if float(v) > 0})
+        path = '/opt/coin/settings.json'
+        cfg = json.load(open(path))
+        cfg.setdefault('wallet', {})['quick_tp_percentages'] = cleaned
+        with open(path, 'w') as fp:
+            json.dump(cfg, fp, indent=2, ensure_ascii=False)
+        return {"success": True, "values": cleaned}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/hl/update-tp")
+async def update_hl_tp(request: HLUpdateTPRequest, current_user: dict = Depends(get_current_user)):
+    """Setzt einheitlichen TP (% vor Hebel = Coin-%-Bewegung) auf markierte HL-Positionen.
+    Aendert NUR HL-Orders, DB-Predictor-Rows bleiben unberuehrt (Lernautonomie)."""
+    from rl_agent.trader import get_hl_credentials, get_hl_open_positions, update_tp_only_hl
 
     creds = get_hl_credentials()
-    wallet = creds['wallet_address']
+    positions = get_hl_open_positions(creds['wallet_address'])
+    pos_map = {p['coin']: p for p in positions}
+    pct = float(request.tp_pct)
     results = []
 
     for coin in request.coins:
+        pos = pos_map.get(coin)
+        if not pos:
+            results.append({"coin": coin, "success": False, "error": "no open position"})
+            continue
         try:
-            result = close_position_hl(creds, coin, wallet)
-            results.append({"coin": coin, "success": result.get("success", False), "price": result.get("avg_price")})
-            # DB-Position auf closed setzen
-            if result.get("success"):
-                exit_price = result.get("avg_price", 0)
-                with get_app_db() as conn:
-                    with conn.cursor() as cur:
-                        # Entry-Preis holen für PnL-Berechnung
-                        cur.execute("""
-                            SELECT id, entry_price, direction, position_size_usd
-                            FROM rl_positions WHERE symbol = %s AND status = 'open'
-                        """, (coin + "USDC",))
-                        pos = cur.fetchone()
-                        pnl_pct = None
-                        pnl_usd = None
-                        duration = None
-                        if pos and exit_price:
-                            ep = float(pos['entry_price'])
-                            if ep > 0:
-                                if pos['direction'] == 'long':
-                                    pnl_pct = (float(exit_price) - ep) / ep * 100
-                                else:
-                                    pnl_pct = (ep - float(exit_price)) / ep * 100
-                                size = float(pos['position_size_usd'] or 20)
-                                pnl_usd = size * pnl_pct / 100
-                        cur.execute("""
-                            UPDATE rl_positions SET status = 'closed', exit_reason = 'manual_close',
-                                   exit_time = NOW(), exit_price = %s, pnl_percent = %s,
-                                   pnl_usd = %s, duration_minutes = EXTRACT(EPOCH FROM (NOW() - entry_time))::int / 60
-                            WHERE symbol = %s AND status = 'open'
-                        """, (exit_price, pnl_pct, pnl_usd, coin + "USDC"))
-                        conn.commit()
+            entry = float(pos['entry_price'])
+            is_long = pos['direction'] == 'long'
+            new_tp = entry * (1 + pct / 100.0) if is_long else entry * (1 - pct / 100.0)
+            r = update_tp_only_hl(creds, coin, is_long, pos['size'], new_tp)
+            results.append({"coin": coin, "success": r.get('success', False),
+                             "tp_price": r.get('tp_price'), "cancelled": r.get('cancelled'),
+                             "error": r.get('error')})
         except Exception as e:
             results.append({"coin": coin, "success": False, "error": str(e)})
+
+    return {"results": results}
+
+
+@router.post("/hl/close")
+async def close_hl_positions(request: HLCloseRequest, current_user: dict = Depends(get_current_user)):
+    """Schließt ausgewählte HL-Positionen manuell — alle Coins parallel."""
+    from rl_agent.trader import get_hl_credentials, close_position_hl
+    import concurrent.futures
+
+    creds = get_hl_credentials()
+    wallet = creds['wallet_address']
+
+    def _close_one(coin):
+        try:
+            result = close_position_hl(creds, coin, wallet)
+            return coin, {"coin": coin, "success": result.get("success", False),
+                          "price": result.get("avg_price"),
+                          "error": result.get("error") if not result.get("success") else None}
+        except Exception as e:
+            return coin, {"coin": coin, "success": False, "error": str(e)}
+
+    # Alle Closes parallel statt sequentiell
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(request.coins) or 1, 8)) as ex:
+        futures = {ex.submit(_close_one, coin): coin for coin in request.coins}
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                _, res = fut.result(timeout=15)
+                results.append(res)
+            except Exception as e:
+                coin = futures[fut]
+                results.append({"coin": coin, "success": False, "error": f"timeout/exception: {e}"})
+
+    # DB-Updates fuer erfolgreiche Closes (sequentiell, ist eh schnell)
+    with get_app_db() as conn:
+        with conn.cursor() as cur:
+            for r in results:
+                if not r.get("success"):
+                    continue
+                coin = r["coin"]
+                exit_price = r.get("price") or 0
+                cur.execute("""
+                    SELECT id, entry_price, direction, position_size_usd
+                    FROM rl_positions WHERE symbol = %s AND status = 'open'
+                """, (coin + "USDC",))
+                pos = cur.fetchone()
+                pnl_pct = None; pnl_usd = None
+                if pos and exit_price:
+                    ep = float(pos['entry_price'])
+                    if ep > 0:
+                        pnl_pct = ((float(exit_price) - ep) / ep * 100) if pos['direction'] == 'long' else ((ep - float(exit_price)) / ep * 100)
+                        size = float(pos['position_size_usd'] or 20)
+                        pnl_usd = size * pnl_pct / 100
+                cur.execute("""
+                    UPDATE rl_positions SET status = 'closed', exit_reason = 'manual_close',
+                           exit_time = NOW(), exit_price = %s, pnl_percent = %s,
+                           pnl_usd = %s, duration_minutes = EXTRACT(EPOCH FROM (NOW() - entry_time))::int / 60
+                    WHERE symbol = %s AND status = 'open'
+                """, (exit_price, pnl_pct, pnl_usd, coin + "USDC"))
+        conn.commit()
 
     return {"results": results}
