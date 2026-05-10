@@ -12,7 +12,7 @@ import sys
 close_logger = logging.getLogger('rl_closes')
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from shared.database import get_app_db
+from shared.database import get_app_db, get_coins_db
 from auth.auth import decrypt_value
 
 from eth_account import Account as EthAccount
@@ -34,22 +34,11 @@ def get_hl_credentials(user_id: int = 1):
             row = cur.fetchone()
     if not row or not row["hyperliquid_wallet_address"]:
         return None
-    creds = {
+    return {
         "api_wallet": decrypt_value(row["hyperliquid_api_key_encrypted"]),
         "secret_key": decrypt_value(row["hyperliquid_api_secret_encrypted"]),
         "wallet_address": row["hyperliquid_wallet_address"],
-        "vault_address": None,
     }
-    # Sub-Account aus settings.json (falls konfiguriert)
-    try:
-        with open("/opt/coin/settings.json") as f:
-            s = json.load(f)
-        vault = s.get("hyperliquid", {}).get("vault_address")
-        if vault:
-            creds["vault_address"] = vault
-    except Exception:
-        pass
-    return creds
 
 
 def _hl_account(creds: dict):
@@ -67,15 +56,26 @@ def get_hl_exchange(creds):
         wallet=None,
         base_url=hl_constants.MAINNET_API_URL,
         account_address=creds["wallet_address"],
-        vault_address=creds.get("vault_address"),
+        vault_address=None,
     )
 
 
 def get_hl_balance(wallet_address: str) -> float:
-    """Aktuelles Perp-Guthaben auf Hyperliquid."""
+    """Aktueller HL-Guthaben (Unified-aware): Perp accountValue + Spot-USDC.
+    Im Unified-Modus liegt das Geld auf Spot und dient als Cross-Margin fuer Perp."""
     info = get_hl_info()
     state = info.user_state(wallet_address)
-    return float(state.get("marginSummary", {}).get("accountValue", 0))
+    perp_av = float(state.get("marginSummary", {}).get("accountValue", 0))
+    spot_usdc = 0.0
+    try:
+        spot = info.spot_user_state(wallet_address)
+        for b in spot.get("balances", []):
+            if b.get("coin") == "USDC":
+                spot_usdc = float(b.get("total", 0) or 0)
+                break
+    except Exception:
+        pass
+    return perp_av + spot_usdc
 
 
 def get_hl_open_positions(wallet_address: str) -> list:
@@ -119,24 +119,79 @@ def calculate_position_size(balance: float, min_size: float = 25.0, max_fraction
         return {"min": min_size, "max": min_size, "balance": round(balance, 2)}
 
 
+# Cache fuer price_decimals aus HL allMids (60s) — sz_decimals/max_leverage kommen aus hl_meta.
+_price_dec_cache = {"ts": 0.0, "data": {}}
+
+
+def _refresh_price_decimals():
+    """Liest aktuelle markPx von HL und leitet price_decimals ab. 60s gecached."""
+    now = time.time()
+    if now - _price_dec_cache["ts"] < 60 and _price_dec_cache["data"]:
+        return _price_dec_cache["data"]
+    try:
+        info = get_hl_info()
+        meta = info.meta_and_asset_ctxs()
+        universe, ctxs = meta[0]["universe"], meta[1]
+        d = {}
+        for i, asset in enumerate(universe):
+            if i >= len(ctxs):
+                break
+            mark = str(ctxs[i].get("markPx", "0"))
+            d[asset["name"]] = len(mark.split(".")[1]) if "." in mark else 0
+        _price_dec_cache["data"] = d
+        _price_dec_cache["ts"] = now
+    except Exception as e:
+        logging.getLogger("rl_trader").warning("HL price_decimals refresh failed: %s", e)
+    return _price_dec_cache["data"]
+
+
+def round_hl_price(px, sz_decimals: int) -> float:
+    """HL-konforme Preis-Rundung. HL hat ZWEI Constraints fuer Perp-Preise:
+      1) max (6 - szDecimals) Decimals
+      2) max 5 signifikante Stellen (sig figs)
+    Beide muessen erfuellt sein, sonst lehnt HL ab mit 'Price must be divisible by tick size' / 'Invalid TP/SL price'.
+
+    Beispiele:
+      BTC szDec=5 -> max 1 Decimal: 78325.567 -> 78325.6 (1 dec, 5 sig figs OK)
+      WIF szDec=1 -> max 5 Decimals: 0.876543 -> 0.87654 (5 dec, 5 sig figs OK)
+      MEME szDec=0 -> max 6 Decimals: 0.0123456 -> 0.012346 (5 sig figs, dann 6 dec)"""
+    if px is None: return px
+    px = float(px)
+    if px <= 0: return px
+    import math
+    max_dec = max(0, 6 - int(sz_decimals))
+    sig_figs = 5
+    # Erst auf 5 sig figs runden
+    d_for_sig = sig_figs - int(math.floor(math.log10(abs(px)))) - 1
+    px_rounded = round(px, max(0, d_for_sig))
+    # Dann auf max-Decimals begrenzen
+    return round(px_rounded, max_dec)
+
+
 def _get_hl_coin_info(coin: str) -> dict:
-    """Holt HL-spezifische Coin-Info aus der DB (szDecimals, maxLeverage, priceDecimals).
-    coin kann 'BTC' oder 'BTCUSDC' sein."""
-    symbol = coin if coin.endswith("USDC") else coin + "USDC"
-    with get_app_db() as conn:
+    """Holt HL-spezifische Coin-Info aus coins.hl_meta (single source: hl-ingestor pflegt sz/price/lev).
+    Fallback: bei fehlendem price_decimals -> live HL markPx (60s gecached). Akzeptiert 'BTC' oder 'BTCUSDC'."""
+    symbol = coin.replace("USDC", "") if coin.endswith("USDC") else coin
+    with get_coins_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT hl_sz_decimals, hl_max_leverage, hl_price_decimals FROM coin_info WHERE symbol = %s",
+                "SELECT sz_decimals, max_leverage, price_decimals FROM hl_meta WHERE symbol = %s",
                 (symbol,),
             )
             row = cur.fetchone()
-    if row and row["hl_sz_decimals"] is not None:
-        return {
-            "sz_decimals": row["hl_sz_decimals"],
-            "max_leverage": row["hl_max_leverage"],
-            "price_decimals": row["hl_price_decimals"],
-        }
-    return None
+    if not row or row["sz_decimals"] is None:
+        return None
+    price_dec = row["price_decimals"]
+    if price_dec is None:
+        # Fallback: hl_meta hat (noch) kein price_decimals -> live aus HL parsen
+        price_dec = _refresh_price_decimals().get(symbol)
+    if price_dec is None:
+        return None
+    return {
+        "sz_decimals": row["sz_decimals"],
+        "max_leverage": row["max_leverage"],
+        "price_decimals": price_dec,
+    }
 
 
 def refresh_hl_coin_info():
@@ -169,10 +224,31 @@ def refresh_hl_coin_info():
         print(f"[RL-TRADER] HL Coin-Info Refresh fehlgeschlagen: {e}")
 
 
+# Leverage-Cache: (wallet, coin) -> (timestamp, leverage_value), 5min TTL.
+_leverage_cache = {}
+_LEVERAGE_TTL = 300
+
+
+def _maybe_update_leverage(exchange, coin: str, leverage: int, wallet: str = "") -> None:
+    """Setzt leverage nur wenn Wert nicht schon kuerzlich gesetzt wurde (spart 300-500ms pro Order)."""
+    now = time.time()
+    key = (wallet, coin)
+    cached = _leverage_cache.get(key)
+    if cached and (now - cached[0] < _LEVERAGE_TTL) and (cached[1] == leverage):
+        return  # bereits aktuell, skip update
+    try:
+        exchange.update_leverage(leverage, coin, is_cross=True)
+        _leverage_cache[key] = (now, leverage)
+    except Exception as e:
+        # Fehler beim leverage-Update darf Order nicht blockieren — HL behaelt evtl alten Wert
+        logging.getLogger("rl_trader").warning("update_leverage %s failed: %s", coin, e)
+
+
 def place_limit_order_hl(creds: dict, coin: str, is_buy: bool, size_usd: float,
-                         price: float, leverage: int = 1) -> dict:
+                         price: float, leverage: int = 1, slippage_pct: float = 0.5) -> dict:
     """
-    Platziert eine Market Order auf Hyperliquid (SDK market_open mit 5% Slippage).
+    Platziert eine Market Order auf Hyperliquid (SDK market_open).
+    slippage_pct: max. Slippage in Prozent (default 0.5 %).
     Returns: {"success": True, "order_id": ..., "status": ...} oder {"success": False, "error": ...}
     """
     try:
@@ -193,16 +269,16 @@ def place_limit_order_hl(creds: dict, coin: str, is_buy: bool, size_usd: float,
             wallet=_hl_account(creds),
             base_url=hl_constants.MAINNET_API_URL,
             account_address=creds["wallet_address"],
-            vault_address=creds.get("vault_address"),
         )
 
-        # Leverage setzen (IMMER, auch bei 1x — HL merkt sich alten Wert)
+        # Leverage setzen — gecached pro Coin/User (5min) damit nicht bei jeder Order ein
+        # Extra-RTT zur HL-API gemacht wird (spart ~300-500ms pro Order).
         max_lev = coin_info.get("max_leverage", 5)
         leverage = min(leverage, max_lev)
-        exchange.update_leverage(leverage, coin, is_cross=True)
+        _maybe_update_leverage(exchange, coin, leverage, creds.get("wallet_address", ""))
 
-        # Market Order via SDK (aggressive IOC, max 0.5% Slippage)
-        order_result = exchange.market_open(coin, is_buy, quantity, slippage=0.005)
+        # Market Order via SDK (aggressive IOC, max slippage_pct % Slippage)
+        order_result = exchange.market_open(coin, is_buy, quantity, slippage=slippage_pct / 100.0)
 
         if order_result.get("status") == "ok":
             statuses = order_result.get("response", {}).get("data", {}).get("statuses", [])
@@ -231,7 +307,6 @@ def cancel_order_hl(creds: dict, coin: str, order_id: int) -> dict:
             wallet=_hl_account(creds),
             base_url=hl_constants.MAINNET_API_URL,
             account_address=creds["wallet_address"],
-            vault_address=creds.get("vault_address"),
         )
         result = exchange.cancel(coin, order_id)
         return {"success": True, "result": result}
@@ -240,102 +315,76 @@ def cancel_order_hl(creds: dict, coin: str, order_id: int) -> dict:
 
 
 def close_position_hl(creds: dict, coin: str, wallet_address: str) -> dict:
-    """Schließt eine offene Position via market_close (SDK). 3 Versuche, 10s Timeout."""
+    """Schließt eine offene Position via market_close (SDK).
+
+    Schlank: kein Pre-Check (HL meldet selbst wenn keine Position),
+    kein Post-Verify (fill-status im SDK-Response reicht), Slippage 1%
+    (greift auch bei volatilen Spikes), maximal 1 Retry. Erwartete Latenz:
+    ~500ms-1s pro Aufruf.
+    """
     import concurrent.futures
 
-    for attempt in range(1, 4):
+    exchange = HLExchange(
+        wallet=_hl_account(creds),
+        base_url=hl_constants.MAINNET_API_URL,
+        account_address=creds["wallet_address"],
+    )
+
+    def _do_close():
+        return exchange.market_close(coin, slippage=0.01)  # 1% slippage
+
+    for attempt in range(1, 3):  # max 2 attempts (1 retry)
         try:
-            close_logger.info(f"HL_CLOSE_TRY {coin} | Versuch {attempt}/3")
+            close_logger.info(f"HL_CLOSE {coin} | Versuch {attempt}/2 | slippage=1%")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                raw = ex.submit(_do_close).result(timeout=8)
 
-            def _do_close():
-                # Prüfen ob Position existiert
-                info = get_hl_info()
-                state = info.user_state(wallet_address)
-                position = None
-                for asset in state.get("assetPositions", []):
-                    pos = asset.get("position", {})
-                    if pos.get("coin") == coin and float(pos.get("szi", 0)) != 0:
-                        position = pos
-                        break
-                if not position:
-                    return {"success": False, "error": f"Keine offene Position für {coin}"}
-
-                szi = float(position["szi"])
-                exchange = HLExchange(
-                    wallet=_hl_account(creds),
-                    base_url=hl_constants.MAINNET_API_URL,
-                    account_address=creds["wallet_address"],
-                    vault_address=creds.get("vault_address"),
-                )
-
-                # SDK market_close — handhabt Tick-Size + Lot-Size korrekt
-                close_logger.info(f"HL_MARKET_CLOSE {coin} | szi={szi} | slippage=0.2%")
-                result = exchange.market_close(coin, slippage=0.002)
-                return {"raw_result": result}
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_do_close)
-                result = future.result(timeout=10)
-
-            if "raw_result" not in result:
-                close_logger.warning(f"HL_CLOSE_ERROR {coin} | {result.get('error')}")
-                return result
-
-            raw = result["raw_result"]
-
-            if raw.get("status") == "ok":
-                statuses = raw.get("response", {}).get("data", {}).get("statuses", [])
-                if statuses and "filled" in statuses[0]:
-                    fill = statuses[0]["filled"]
-                    avg_px = float(fill.get("avgPx", 0))
-                    # Bestätigung: Position wirklich weg?
-                    try:
-                        info2 = get_hl_info()
-                        state2 = info2.user_state(wallet_address)
-                        still_open = False
-                        for asset in state2.get("assetPositions", []):
-                            p = asset.get("position", {})
-                            if p.get("coin") == coin and float(p.get("szi", 0)) != 0:
-                                still_open = True
-                                break
-                        if still_open:
-                            close_logger.error(f"HL_FILL_BUT_STILL_OPEN {coin} | avgPx={avg_px} — Position existiert noch!")
-                            if attempt < 3:
-                                time.sleep(1)
-                                continue
-                            return {"success": False, "error": f"Fill gemeldet aber Position noch offen"}
-                        close_logger.info(f"HL_CONFIRMED {coin} | avgPx={avg_px} | Position bestätigt geschlossen")
-                    except Exception as ve:
-                        close_logger.warning(f"HL_VERIFY_FAILED {coin} | {ve} — nehme Fill als bestätigt")
-                    return {"success": True, "avg_price": avg_px}
-                else:
-                    close_logger.warning(f"HL_NOT_FILLED {coin} | statuses={statuses} | Versuch {attempt}")
-                    if attempt < 3:
-                        time.sleep(1)
-                        continue
-                    return {"success": False, "error": f"Nicht gefüllt nach 3 Versuchen: {statuses}"}
-            else:
-                close_logger.error(f"HL_ORDER_FAILED {coin} | result={raw} | Versuch {attempt}")
-                if attempt < 3:
-                    time.sleep(1)
+            if not raw or raw.get("status") != "ok":
+                close_logger.warning(f"HL_CLOSE_FAIL {coin} | Versuch {attempt} | {raw}")
+                if attempt < 2:
+                    time.sleep(0.3)
                     continue
                 return {"success": False, "error": str(raw)}
 
-        except concurrent.futures.TimeoutError:
-            close_logger.error(f"HL_TIMEOUT {coin} | Versuch {attempt}/3 — 10s Timeout")
-            if attempt < 3:
-                time.sleep(1)
-                continue
-            return {"success": False, "error": f"Timeout nach 3 Versuchen"}
+            statuses = raw.get("response", {}).get("data", {}).get("statuses", [])
+            if not statuses:
+                if attempt < 2:
+                    time.sleep(0.3)
+                    continue
+                return {"success": False, "error": f"empty statuses: {raw}"}
 
+            st0 = statuses[0]
+            # Manchmal meldet HL "no_position" wenn die Pos. schon weg ist (z.B. via TP/SL)
+            if isinstance(st0, dict) and st0.get("error", "").lower().startswith("no position"):
+                close_logger.info(f"HL_CLOSE {coin} | Position bereits geschlossen (no_position)")
+                return {"success": True, "avg_price": 0, "note": "no_position"}
+
+            if "filled" in st0:
+                fill = st0["filled"]
+                avg_px = float(fill.get("avgPx", 0))
+                close_logger.info(f"HL_CLOSE_OK {coin} | avgPx={avg_px}")
+                return {"success": True, "avg_price": avg_px}
+
+            close_logger.warning(f"HL_NOT_FILLED {coin} | statuses={statuses}")
+            if attempt < 2:
+                time.sleep(0.3)
+                continue
+            return {"success": False, "error": f"nicht gefüllt: {statuses}"}
+
+        except concurrent.futures.TimeoutError:
+            close_logger.error(f"HL_TIMEOUT {coin} | Versuch {attempt}/2")
+            if attempt < 2:
+                time.sleep(0.3)
+                continue
+            return {"success": False, "error": "timeout"}
         except Exception as e:
-            close_logger.error(f"HL_EXCEPTION {coin} | {e} | Versuch {attempt}/3")
-            if attempt < 3:
-                time.sleep(1)
+            close_logger.error(f"HL_EXCEPTION {coin} | {e} | Versuch {attempt}/2")
+            if attempt < 2:
+                time.sleep(0.3)
                 continue
             return {"success": False, "error": str(e)}
 
-    return {"success": False, "error": "3 Versuche fehlgeschlagen"}
+    return {"success": False, "error": "2 Versuche fehlgeschlagen"}
 
 
 def get_current_prices_hl() -> dict:
@@ -353,10 +402,117 @@ def place_tp_sl_hl(creds: dict, coin: str, is_long: bool, quantity,
     """
     try:
         coin_info = _get_hl_coin_info(coin)
+        sz_dec = int(coin_info["sz_decimals"]) if coin_info else 0
+        quantity = float(quantity)
+        # HL-konforme Rundung: max (6-szDec) Decimals UND max 5 sig figs
+        tp_price = round_hl_price(tp_price, sz_dec)
+        sl_price = round_hl_price(sl_price, sz_dec)
+        exchange = HLExchange(
+            wallet=_hl_account(creds),
+            base_url=hl_constants.MAINNET_API_URL,
+            account_address=creds["wallet_address"],
+        )
+
+        # TP + SL SEQUENTIELL feuern, NICHT parallel.
+        # Grund: HL-API nutzt monoton steigenden Nonce pro API-Wallet. Bei
+        # parallelen Calls greifen beide Threads den gleichen Nonce-Wert ab,
+        # HL lehnt einen ab mit "Invalid nonce: duplicate nonce". Sequentiell
+        # mit kleiner Pause loest das. Latenz-Kosten: ~250-400ms, dafuer
+        # Failsafe-Auslosungen quasi 0.
+        tp_is_buy = not is_long  # Long → Sell bei TP
+        sl_is_buy = not is_long  # symmetrisch fuer SL
+
+        try:
+            tp_result = exchange.order(coin, tp_is_buy, quantity, tp_price,
+                                        {"limit": {"tif": "Gtc"}}, reduce_only=True)
+        except Exception as e:
+            tp_result = {"status": "error", "error": str(e)}
+
+        # Mini-Pause damit HL den Nonce sicher inkrementiert hat
+        time.sleep(0.08)
+
+        try:
+            sl_result = exchange.order(coin, sl_is_buy, quantity, sl_price,
+                                        {"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}},
+                                        reduce_only=True)
+        except Exception as e:
+            sl_result = {"status": "error", "error": str(e)}
+
+        def _parse_oid(res):
+            if res.get("status") != "ok":
+                return None, str(res)
+            statuses = res.get("response", {}).get("data", {}).get("statuses", [])
+            if statuses and "resting" in statuses[0]:
+                return statuses[0]["resting"]["oid"], None
+            if statuses and "filled" in statuses[0]:
+                # Sofort gefuellt — auch ok
+                return statuses[0]["filled"].get("oid"), None
+            return None, f"unexpected response: {statuses}"
+
+        tp_oid, tp_err = _parse_oid(tp_result)
+        sl_oid, sl_err = _parse_oid(sl_result)
+
+        # Verify-Loop (10.05.2026): nach Platzierung gegen frontend_open_orders pruefen
+        # ob beide Orders wirklich resting sind. Falls nicht -> success=False, Caller
+        # entscheidet (place_tp_sl-Caller macht failsafe-close).
+        if tp_oid is not None and sl_oid is not None:
+            time.sleep(1.0)  # HL-OrderBook-Propagation
+            try:
+                info = HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True)
+                fe_orders = info.frontend_open_orders(creds["wallet_address"]) or []
+                live_oids = {int(o.get("oid", 0)) for o in fe_orders if o.get("coin") == coin}
+                tp_live = int(tp_oid) in live_oids
+                sl_live = int(sl_oid) in live_oids
+                if not tp_live:
+                    tp_err = f"verify_failed: tp_oid {tp_oid} not in open orders after 1s"
+                if not sl_live:
+                    sl_err = f"verify_failed: sl_oid {sl_oid} not in open orders after 1s"
+            except Exception as ve:
+                # Verify-Fehler ist kein harter Fail (OrderBook-Read kann auch failen),
+                # aber wird im Log dokumentiert
+                tp_err = tp_err or f"verify_exception: {ve}"
+
+        # STRIKT: success NUR wenn BEIDE platziert UND beide live im OrderBook
+        success = (tp_oid is not None and sl_oid is not None
+                   and tp_err is None and sl_err is None)
+        return {
+            "success": success,
+            "tp_oid": tp_oid, "sl_oid": sl_oid,
+            "tp_error": tp_err, "sl_error": sl_err,
+        }
+
+    except Exception as e:
+        # tp_error/sl_error explizit setzen, damit Reporting im Caller konsistent ist
+        return {"success": False, "error": str(e), "tp_oid": None, "sl_oid": None,
+                "tp_error": f"exception: {e}", "sl_error": f"exception: {e}"}
+
+
+def update_tp_only_hl(creds: dict, coin: str, is_long: bool, quantity, new_tp_price) -> dict:
+    """Aendert NUR die TP-Limit-Order: bestehende reduce-only Limit-Orders auf der
+    Gegenseite canceln, neue TP-Limit-Order platzieren. SL-Trigger-Orders bleiben.
+    DB wird nicht beruehrt (Predictor-Lernautonomie)."""
+    try:
+        coin_info = _get_hl_coin_info(coin)
         price_dec = coin_info["price_decimals"] if coin_info else 5
         quantity = float(quantity)
-        tp_price = round(float(tp_price), price_dec)
-        sl_price = round(float(sl_price), price_dec)
+        tp_price = round(float(new_tp_price), price_dec)
+
+        info = get_hl_info()
+        address = creds["wallet_address"]
+
+        tp_is_buy = not is_long
+        target_side = "B" if tp_is_buy else "A"
+
+        try:
+            fe_orders = info.frontend_open_orders(address)
+        except Exception:
+            fe_orders = []
+        existing_tps = [o for o in fe_orders
+                         if o.get("coin") == coin
+                         and o.get("reduceOnly")
+                         and o.get("orderType") == "Limit"
+                         and o.get("side") == target_side]
+
         exchange = HLExchange(
             wallet=_hl_account(creds),
             base_url=hl_constants.MAINNET_API_URL,
@@ -364,35 +520,28 @@ def place_tp_sl_hl(creds: dict, coin: str, is_long: bool, quantity,
             vault_address=creds.get("vault_address"),
         )
 
-        results = {"tp": None, "sl": None}
+        cancelled = 0
+        for o in existing_tps:
+            try:
+                exchange.cancel(coin, o["oid"])
+                cancelled += 1
+            except Exception:
+                pass
 
-        # TP: Limit Order auf Gegenseite (reduce_only)
-        tp_is_buy = not is_long  # Long → Sell bei TP, Short → Buy bei TP
-        tp_result = exchange.order(
+        result = exchange.order(
             coin, tp_is_buy, quantity, tp_price,
             {"limit": {"tif": "Gtc"}},
             reduce_only=True,
         )
-        if tp_result.get("status") == "ok":
-            statuses = tp_result.get("response", {}).get("data", {}).get("statuses", [])
+        if result.get("status") == "ok":
+            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
             if statuses and "resting" in statuses[0]:
-                results["tp"] = statuses[0]["resting"]["oid"]
-
-        # SL: Trigger Order (Stop Market)
-        sl_is_buy = not is_long  # Long → Buy-to-close bei SL (nein, Sell!), Short → Buy bei SL
-        # Trigger: wenn Preis SL erreicht → Market Order zum Schließen
-        trigger_above = not is_long  # Long: SL unter Entry → trigger wenn Preis FÄLLT (triggerPx > marketPx → isMarket=True)
-        sl_result = exchange.order(
-            coin, sl_is_buy, quantity, sl_price,
-            {"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}},
-            reduce_only=True,
-        )
-        if sl_result.get("status") == "ok":
-            statuses = sl_result.get("response", {}).get("data", {}).get("statuses", [])
-            if statuses and "resting" in statuses[0]:
-                results["sl"] = statuses[0]["resting"]["oid"]
-
-        return {"success": True, "tp_oid": results["tp"], "sl_oid": results["sl"]}
+                return {"success": True, "tp_oid": statuses[0]["resting"]["oid"],
+                        "tp_price": tp_price, "cancelled": cancelled}
+            if statuses and "filled" in statuses[0]:
+                return {"success": True, "tp_oid": None, "filled": True,
+                        "tp_price": tp_price, "cancelled": cancelled}
+        return {"success": False, "error": str(result), "cancelled": cancelled}
 
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -419,7 +568,6 @@ def cancel_all_orders_for_coin_hl(creds: dict, coin: str) -> dict:
             wallet=_hl_account(creds),
             base_url=hl_constants.MAINNET_API_URL,
             account_address=creds["wallet_address"],
-            vault_address=creds.get("vault_address"),
         )
 
         cancelled = 0

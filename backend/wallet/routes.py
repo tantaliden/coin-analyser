@@ -929,8 +929,16 @@ async def update_hl_tp(request: HLUpdateTPRequest, current_user: dict = Depends(
 
 @router.post("/hl/close")
 async def close_hl_positions(request: HLCloseRequest, current_user: dict = Depends(get_current_user)):
-    """Schließt ausgewählte HL-Positionen manuell — alle Coins parallel."""
-    from rl_agent.trader import get_hl_credentials, close_position_hl
+    """Schließt ausgewählte HL-Positionen manuell — alle Coins parallel.
+
+    Nutzt safe_close_position_hl (10.05.2026): close + cancel_all_orders + verify.
+    Damit bleiben nach manuellem Close keine TP/SL-Phantom-Orders zurueck.
+    """
+    import sys
+    if '/opt/coin/backend' not in sys.path:
+        sys.path.insert(0, '/opt/coin/backend')
+    from services.predictor_service import safe_close_position_hl
+    from rl_agent.trader import get_hl_credentials
     import concurrent.futures
 
     creds = get_hl_credentials()
@@ -938,9 +946,10 @@ async def close_hl_positions(request: HLCloseRequest, current_user: dict = Depen
 
     def _close_one(coin):
         try:
-            result = close_position_hl(creds, coin, wallet)
+            result = safe_close_position_hl(creds, coin, wallet)
             return coin, {"coin": coin, "success": result.get("success", False),
                           "price": result.get("avg_price"),
+                          "orders_cancelled": result.get("orders_cancelled", 0),
                           "error": result.get("error") if not result.get("success") else None}
         except Exception as e:
             return coin, {"coin": coin, "success": False, "error": str(e)}

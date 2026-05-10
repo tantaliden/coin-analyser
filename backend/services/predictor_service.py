@@ -1874,6 +1874,52 @@ def modify_pass(s, modify_bandit, modify_scaler, rng):
             pos_feat = position_features(o, mark_px, current_tp, current_sl, mod_count, timeout_h=timeout_h)
             full_feat = {**base_feat, **pos_feat}
 
+            # Hard-Timeout-Check (Reform 10.05.2026): age >= timeout_h -> Trader close_now.
+            # Wird in trader_decisions als reguläre Bandit-Action (close_now) eingetragen,
+            # damit Hindsight den Reward wie für eine normale Trader-Entscheidung berechnet.
+            age_h = (datetime.now(timezone.utc) - o['opened_at']).total_seconds() / 3600.0
+            if age_h >= timeout_h:
+                try:
+                    if '/opt/coin/backend' not in sys.path:
+                        sys.path.insert(0, '/opt/coin/backend')
+                    from rl_agent.trader import get_hl_credentials
+                    creds = get_hl_credentials()
+                    sc = safe_close_position_hl(creds, o['symbol'], creds['wallet_address'])
+                    if sc.get('success'):
+                        entry = float(o['entry_px'])
+                        exit_px = float(sc.get('avg_price') or mark_px)
+                        pnl = ((exit_px - entry)/entry*100) if o['side']=='long' else ((entry - exit_px)/entry*100)
+                        idx_close = next((i for i, a in enumerate(modify_bandit.actions)
+                                          if a.get('special') == 'close'), 1)
+                        with app.cursor() as cur_t:
+                            cur_t.execute("""
+                                UPDATE trader_positions
+                                SET status='closed', closed_at=now(), exit_px=%s, pnl_pct=%s
+                                WHERE id=%s AND status='open'
+                            """, (exit_px, pnl, o['id']))
+                        with app.cursor() as cur_d:
+                            cur_d.execute("""
+                                INSERT INTO trader_decisions
+                                  (position_id, features, action_idx, action_name,
+                                   tp_delta_pct, sl_delta_pct, expected_r,
+                                   tp_px_before, sl_px_before, tp_px_after, sl_px_after,
+                                   executed, close_triggered)
+                                VALUES (%s, %s::jsonb, %s, 'close_now', NULL, NULL, NULL,
+                                        %s, %s, NULL, NULL, true, true)
+                            """, (o['id'], json.dumps(full_feat), idx_close,
+                                  float(current_tp), float(current_sl)))
+                        app.commit()
+                        n_modified += 1
+                        log.info("TRADER-TIMEOUT-CLOSE %s %s age=%.2fh pnl=%.3f%% trader_pid=%s",
+                                 o['symbol'], o['side'], age_h, pnl, o['id'])
+                        continue
+                    else:
+                        log.warning("TIMEOUT-CLOSE %s safe_close failed: %s", o['symbol'], sc.get('error'))
+                except Exception as e:
+                    log.warning("TIMEOUT-CLOSE %s exception: %s", o['symbol'], e)
+                    try: app.rollback()
+                    except Exception: pass
+
             x_raw = vectorize_modify(full_feat)
             modify_scaler.update(x_raw)
             x = modify_scaler.transform(x_raw)
@@ -2235,9 +2281,45 @@ def sync_hl_to_db(s):
             except Exception as e:
                 log.warning("ORPHAN-ORDER cancel %s exception: %s", coin, e)
 
-    if n_failsafe or n_repaired or n_orphan_cancelled:
-        log.info("trader-sync: failsafe=%d repaired=%d orphan-orders=%d",
-                 n_failsafe, n_repaired, n_orphan_cancelled)
+        # Richtung E (10.05.2026): Phantom-Orders bei AKTIVEN Positionen.
+        # Pro offene Position: reduceOnly-Orders mit sz != position.sz sind Phantome
+        # aus früheren Iterationen (TP/SL-Hit hat 1 Order genutzt, andere blieb +
+        # neue Position bekam neue Orders). Sicheres Canceln: nur reduceOnly + sz-Mismatch.
+        n_phantom_cancelled = 0
+        try:
+            from rl_agent.trader import cancel_order_hl
+        except Exception:
+            cancel_order_hl = None
+        for coin, pos in hl_pos_by_coin.items():
+            try:
+                pos_sz = abs(float(pos.get('szi', 0)))
+                if pos_sz <= 0: continue
+                coin_orders = [o for o in fe_after if o.get('coin') == coin and o.get('reduceOnly')]
+                # sz_mismatch = sz weicht > 0.1% von Position-sz ab
+                phantoms = [o for o in coin_orders
+                            if abs(float(o.get('sz', 0)) - pos_sz) / max(pos_sz, 1e-9) > 0.001]
+                for ph in phantoms:
+                    if cancel_order_hl is None: break
+                    try:
+                        oid = ph.get('oid')
+                        if oid is None: continue
+                        cr = cancel_order_hl(creds, coin, oid)
+                        if cr.get('success'):
+                            n_phantom_cancelled += 1
+                            log.info("PHANTOM-ORDER cancel %s oid=%s (sz=%s pos_sz=%s)",
+                                     coin, oid, ph.get('sz'), pos_sz)
+                        else:
+                            log.warning("PHANTOM-ORDER cancel %s oid=%s failed: %s",
+                                        coin, oid, cr.get('error'))
+                    except Exception as e:
+                        log.warning("PHANTOM-ORDER cancel %s oid=%s exception: %s",
+                                    coin, ph.get('oid'), e)
+            except Exception as e:
+                log.warning("PHANTOM-ORDER check %s exception: %s", coin, e)
+
+    if n_failsafe or n_repaired or n_orphan_cancelled or n_phantom_cancelled:
+        log.info("trader-sync: failsafe=%d repaired=%d orphan-orders=%d phantom-orders=%d",
+                 n_failsafe, n_repaired, n_orphan_cancelled, n_phantom_cancelled)
     return n_failsafe + n_repaired
 
 
