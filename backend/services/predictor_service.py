@@ -1639,9 +1639,10 @@ def watch_pass_v4(s, bandit, scaler, state_path):
 # =============================================================================
 
 _MODIFY_POSITION_KEYS = [
-    'time_in_trade_h', 'pnl_now_pct', 'peak_pct_now', 'trough_pct_now',
+    'time_in_trade_h', 'time_remaining_h',  # 10.05.2026: time_remaining ergaenzt
+    'pnl_now_pct', 'peak_pct_now', 'trough_pct_now',
     'dist_to_tp_pct', 'dist_to_sl_pct', 'modify_count', 'original_action_idx',
-    'leverage', 'margin_pnl_pct',  # NEU (Variante B): Hebel-Awareness
+    'leverage', 'margin_pnl_pct',
 ]
 
 
@@ -1666,35 +1667,27 @@ def vectorize_modify(feat_dict):
     return v
 
 
-def build_modify_actions(tp_deltas, sl_deltas):
-    """Action-Space: hold + close_now + (tp_delta x sl_delta in 0.1-Schritten).
-    Default = 122 Actions. Action-Order ist deterministisch fuer State-Vergleich."""
-    actions = [
-        {'name': 'hold', 'special': 'hold', 'tp_delta': 0.0, 'sl_delta': 0.0},
+def build_modify_actions(*_args, **_kwargs):
+    """Action-Space: nur hold + close_now (Reform 10.05.2026).
+    Trader entscheidet pro Tick: weiter halten oder jetzt schliessen.
+    TP/SL bleiben auf Predictor-Werten — Trader greift nicht ein.
+    Args werden ignoriert (rueckwaerts-kompatibel zu alten Callern)."""
+    return [
+        {'name': 'hold', 'special': 'hold', 'tp_delta': None, 'sl_delta': None},
         {'name': 'close_now', 'special': 'close', 'tp_delta': None, 'sl_delta': None},
     ]
-    seen = {'hold', 'close_now'}
-    tps = sorted(set(round(float(x), 2) for x in tp_deltas))
-    sls = sorted(set(round(float(x), 2) for x in sl_deltas))
-    for tp_d in tps:
-        for sl_d in sls:
-            if tp_d == 0.0 and sl_d == 0.0:
-                continue
-            name = f'tp{tp_d:+g}_sl{sl_d:+g}'
-            if name in seen: continue
-            seen.add(name)
-            actions.append({'name': name, 'special': None,
-                             'tp_delta': tp_d, 'sl_delta': sl_d})
-    return actions
 
 
-def position_features(trader_pos_row, mark_px, current_tp_px, current_sl_px, modify_count):
-    """Zehn Position-Features fuer Modify-Bandit (8 Trade-State + 2 Hebel-Awareness).
-    Eingabe: Row aus trader_positions (NICHT open_predictions!) — saubere Trennung."""
+def position_features(trader_pos_row, mark_px, current_tp_px, current_sl_px, modify_count, timeout_h=2.0):
+    """Position-Features fuer Modify-Bandit (Trade-State + Hebel + time_remaining).
+    Eingabe: Row aus trader_positions (NICHT open_predictions!) — saubere Trennung.
+    timeout_h kommt aus settings.predictor.bandit.timeout_hours (Predictor-Hard-Close)."""
     entry = float(trader_pos_row['entry_px'])
     side = trader_pos_row['side']
     leverage = float(trader_pos_row.get('leverage') or 1)
     age_s = (datetime.now(timezone.utc) - trader_pos_row['opened_at']).total_seconds()
+    time_in_h = age_s / 3600.0
+    time_left_h = max(0.0, float(timeout_h) - time_in_h)
     if side == 'long':
         pnl_now = (mark_px - entry) / entry * 100.0
         peak = float(trader_pos_row.get('peak_px') or entry)
@@ -1717,7 +1710,8 @@ def position_features(trader_pos_row, mark_px, current_tp_px, current_sl_px, mod
     try: orig_idx = float(orig_idx)
     except (TypeError, ValueError): orig_idx = -1.0
     return {
-        'time_in_trade_h': age_s / 3600.0,
+        'time_in_trade_h': time_in_h,
+        'time_remaining_h': time_left_h,
         'pnl_now_pct': pnl_now,
         'peak_pct_now': peak_pct,
         'trough_pct_now': trough_pct,
@@ -1791,69 +1785,33 @@ def safe_close_position_hl(creds, coin, addr, max_retries=2):
 
 
 def apply_modify_to_hl(prediction, action, current_tp, current_sl, mark_px):
-    """Setzt Modify-Action auf HL um. Returns (success, new_tp, new_sl, close_executed).
+    """Setzt Trader-Action auf HL um. 2 Actions: hold | close_now.
+    Returns (success, new_tp, new_sl, close_executed).
 
-    Garantien (gegen Phantome):
-    - close_now: safe_close (cancel + close + verify)
-    - tp/sl-delta: nach cancel+place_tp_sl-Fail FAILSAFE schliessen (Position
-      sonst ungeschuetzt -> safer: schliessen).
-    - hold: keine HL-Aktion."""
-    if '/opt/coin/backend' not in sys.path:
-        sys.path.insert(0, '/opt/coin/backend')
-    from rl_agent.trader import (
-        get_hl_credentials, get_hl_open_positions,
-        cancel_all_orders_for_coin_hl, place_tp_sl_hl,
-    )
-    creds = get_hl_credentials()
-    coin = prediction['symbol']
-    is_long = (prediction['side'] == 'long')
-
+    - hold:     keine HL-Aktion
+    - close_now: safe_close (cancel + close + verify)"""
     if action.get('special') == 'hold':
         return True, current_tp, current_sl, False
+    if action.get('special') != 'close':
+        return False, current_tp, current_sl, False
 
+    if '/opt/coin/backend' not in sys.path:
+        sys.path.insert(0, '/opt/coin/backend')
+    from rl_agent.trader import get_hl_credentials, get_hl_open_positions
+    creds = get_hl_credentials()
+    coin = prediction['symbol']
     positions = get_hl_open_positions(creds['wallet_address'])
     match = next((p for p in positions if p.get('coin') == coin), None)
     if not match:
         return False, current_tp, current_sl, False  # HL-Position weg
-
-    if action.get('special') == 'close':
-        r = safe_close_position_hl(creds, coin, creds['wallet_address'])
-        return r['success'], current_tp, current_sl, r.get('position_closed', False)
-
-    # tp_delta / sl_delta: neue Levels
-    tp_d = float(action.get('tp_delta') or 0.0)
-    sl_d = float(action.get('sl_delta') or 0.0)
-    if is_long:
-        new_tp = current_tp + (mark_px * tp_d / 100.0)
-        new_sl = current_sl - (mark_px * sl_d / 100.0)
-    else:
-        new_tp = current_tp - (mark_px * tp_d / 100.0)
-        new_sl = current_sl + (mark_px * sl_d / 100.0)
-
-    cancel_res = cancel_all_orders_for_coin_hl(creds, coin)
-    qty = float(match.get('size', 0))
-    if qty <= 0:
-        return False, current_tp, current_sl, False
-    place_res = place_tp_sl_hl(creds, coin, is_long=is_long, quantity=qty,
-                                tp_price=new_tp, sl_price=new_sl)
-    if not place_res.get('success'):
-        # PHANTOM-VERMEIDUNG: place_tp_sl_hl scheitert -> Position waere ungeschuetzt
-        # -> Failsafe close (cancel + close + verify).
-        log.warning("modify-bandit %s: place_tp_sl_hl failed (%s) -> failsafe-close",
-                    coin, place_res.get('error'))
-        sc = safe_close_position_hl(creds, coin, creds['wallet_address'])
-        if sc['success']:
-            log.warning("modify-bandit %s: failsafe-close erfolgreich",coin)
-            return True, current_tp, current_sl, True  # close_executed=True
-        log.error("modify-bandit %s: failsafe-close FEHLGESCHLAGEN: %s",
-                  coin, sc.get('error'))
-        return False, current_tp, current_sl, False
-    return True, new_tp, new_sl, False
+    r = safe_close_position_hl(creds, coin, creds['wallet_address'])
+    return r['success'], current_tp, current_sl, r.get('position_closed', False)
 
 
 def modify_pass(s, modify_bandit, modify_scaler, rng):
     """Trader-Tick — operiert AUSSCHLIESSLICH auf trader_positions / trader_decisions.
-    KEIN Zugriff auf open_predictions (saubere Welt-Trennung)."""
+    KEIN Zugriff auf open_predictions (saubere Welt-Trennung).
+    Action-Space: hold | close_now (Reform 10.05.2026)."""
     cfg = s["predictor"]
     mb_cfg = cfg.get("modify_bandit", {})
     if not mb_cfg.get("enabled"):
@@ -1861,6 +1819,7 @@ def modify_pass(s, modify_bandit, modify_scaler, rng):
     if not bool(cfg.get("trading", {}).get("auto_trade")):
         return 0
 
+    timeout_h = float(cfg.get("bandit", {}).get("timeout_hours", 2.0))
     min_age = float(mb_cfg.get("min_open_age_seconds", 60))
     expl_floor = float(mb_cfg.get("exploration_floor", 0.05))
     expl_init = float(mb_cfg.get("exploration_init", 1.0))
@@ -1912,7 +1871,7 @@ def modify_pass(s, modify_bandit, modify_scaler, rng):
 
             base_feat = feature_snapshot_v2(coins, o['symbol'], rule_flags={}, btc_moves=btc_moves)
             if base_feat is None: continue
-            pos_feat = position_features(o, mark_px, current_tp, current_sl, mod_count)
+            pos_feat = position_features(o, mark_px, current_tp, current_sl, mod_count, timeout_h=timeout_h)
             full_feat = {**base_feat, **pos_feat}
 
             x_raw = vectorize_modify(full_feat)
@@ -1949,21 +1908,6 @@ def modify_pass(s, modify_bandit, modify_scaler, rng):
                         n_modified += 1
                         log.info("TRADER-CLOSE %s %s pnl=%.3f%% mark=%.6g trader_pid=%s",
                                  o['symbol'], o['side'], pnl_now, mark_px, o['id'])
-                elif action.get('special') is None and ok:
-                    tp_after = new_tp
-                    sl_after = new_sl
-                    # current_tp_px/sl_px in trader_positions aktualisieren
-                    with app.cursor() as cur_u:
-                        cur_u.execute("""
-                            UPDATE trader_positions
-                            SET current_tp_px=%s, current_sl_px=%s, modify_count=modify_count+1
-                            WHERE id=%s AND status='open'
-                        """, (float(new_tp), float(new_sl), o['id']))
-                    app.commit()
-                    n_modified += 1
-                    log.info("MODIFY %s %s action=%s tp=%.6g->%.6g sl=%.6g->%.6g trader_pid=%s",
-                             o['symbol'], o['side'], action['name'],
-                             current_tp, new_tp, current_sl, new_sl, o['id'])
             except Exception as e:
                 log.warning("modify_pass %s/%s failed: %s", o['symbol'], action.get('name'), e)
                 executed = False
@@ -2030,75 +1974,50 @@ def replay_modify_action(klines_rows, side, entry, tp_px, sl_px):
     return 'incomplete', last_close, pnl, elapsed_h
 
 
-def apply_sweet_spot_bonus(pnl_coin, leverage, cfg=None, is_close_now=False):
-    """OUTCOME-basierter Bonus/Strafe (Margin-PnL).
+def compute_efficiency_reward(captured_margin, max_margin_in_box, cfg=None):
+    """Efficiency-Reward (Reform 10.05.2026).
 
-    Strafe gilt fuer ALLE Actions (close_now, hold, tp-X, tp+X, sl-X, sl+X):
-    - 0..close_hard_max%% Margin (default 0.4%%): -2.0 (Hard-Block)
-    - close_hard_max..close_light_max%% (default 0.6%%): -0.5 (Light-Penalty)
-    - close_light_max..sweet_min: bonus * decay_below (default +0.1)
-    - sweet_min..sweet_max (5-10%%): voller bonus (+1.0)
-    - >sweet_max: bonus * decay_above (default +0.3)
-    - negativ: 0 (Loss hat time_penalty)
+    captured_margin    = realisierter PnL der Action × Hebel (Margin-PnL in %)
+    max_margin_in_box  = max(margin_pnl) im Fenster [decision .. min(close, open+timeout)]
 
-    is_close_now-Parameter wird ignoriert (rueckwaerts-kompatibel) — der
-    Outcome bestimmt die Strafe, nicht der Action-Type. Damit kann der Bandit
-    keine Luecke ueber TP-tighten finden: jede Strategie die zu Mini-Profit-Close
-    fuehrt = Hard-Strafe."""
-    if cfg is None: cfg = {}
-    if pnl_coin <= 0: return 0.0
-    margin_pnl = float(pnl_coin) * float(leverage or 1)
-    close_hard_max = float(cfg.get("close_hard_max_pct", 0.4))
-    close_light_max = float(cfg.get("close_light_max_pct", 0.6))
-    close_hard_penalty = float(cfg.get("close_hard_penalty", -2.0))
-    close_light_penalty = float(cfg.get("close_light_penalty", -0.5))
-    if margin_pnl <= close_hard_max:
-        return close_hard_penalty
-    if margin_pnl <= close_light_max:
-        return close_light_penalty
-    sweet_min = float(cfg.get("margin_pnl_min", 5.0))
-    sweet_max = float(cfg.get("margin_pnl_max", 10.0))
-    bonus = float(cfg.get("bonus", 1.0))
-    decay_above = float(cfg.get("decay_above", 0.3))
-    decay_below = float(cfg.get("decay_below", 0.1))
-    if sweet_min <= margin_pnl <= sweet_max:
-        return bonus
-    if margin_pnl > sweet_max:
-        return bonus * decay_above
-    return bonus * decay_below
+    Logik:
+    - Verlust  -> reward = captured * loss_scale  (negativer wird linear bestraft)
+    - max <= 0 -> reward = 0  (Trade konnte nicht profitabel werden, neutral)
+    - sonst    -> efficiency = captured/max in [0..1], reward = (eff-0.5)*2*profit_scale
 
-
-def apply_time_penalty(pnl, dur_h, cfg=None):
-    """Reward-Penalty fuer Trade-Dauer:
-    - bei pnl < 0: -neg_per_h * dur_h (jede Stunde im Minus = mehr Strafe)
-    - bei pnl > 0 und dur_h > pos_thresh_h: -pos_per_h * (dur_h - pos_thresh_h)
-      (Profit unter 90 Min = penalty-frei; ab 90 Min sanfte Strafe)
+    Der Bandit bekommt damit:
+    - Nahe Maximum erwischt = +profit_scale
+    - Halbwegs erwischt    = ~0
+    - Wenig vom Potential  = -profit_scale
+    - Verlust              = captured * loss_scale (negativ)
     """
     if cfg is None: cfg = {}
-    neg_per_h = float(cfg.get("negative_per_hour", 0.15))
-    pos_per_h = float(cfg.get("positive_per_hour", 0.15))
-    pos_thresh = float(cfg.get("positive_threshold_hours", 1.5))
-    if pnl < 0:
-        return -neg_per_h * float(dur_h)
-    if pnl > 0 and dur_h > pos_thresh:
-        return -pos_per_h * (float(dur_h) - pos_thresh)
-    return 0.0
+    profit_scale = float(cfg.get("profit_scale", 2.0))
+    loss_scale = float(cfg.get("loss_scale", 1.5))
+    if captured_margin < 0:
+        return float(captured_margin) * loss_scale
+    if max_margin_in_box <= 0:
+        return 0.0
+    efficiency = float(captured_margin) / float(max_margin_in_box)
+    efficiency = max(0.0, min(1.0, efficiency))
+    return (efficiency - 0.5) * 2.0 * profit_scale
 
 
 def hindsight_replay_modify_neural(coins_conn, app_conn, modify_bandit, modify_scaler,
                                      prediction, lookahead_minutes=120,
-                                     penalty_cfg=None, sweet_cfg=None):
-    """Trader-Hindsight für NeuralBandit. Klines-Range = [first_decision, closed_at + lookahead].
+                                     reward_cfg=None, **_legacy_kwargs):
+    """Trader-Hindsight (Reform 10.05.2026) — Efficiency-Reward, 2 Actions.
 
-    Pro Decision × pro 102 Actions wird Reward = pnl + time_penalty
-    (apply_time_penalty: -0.15/h bei Loss; -0.15/h ab 1.5h bei Profit).
+    Pro Decision werden BEIDE Actions (hold, close_now) counterfactual bewertet:
+      max_box      = max(margin_pnl) im Fenster [decided_at .. min(closed_at, open+timeout)]
+      captured_hold  = margin_pnl am Fenster-Ende (was wuerde Halten bringen?)
+      captured_close = margin_pnl am decided_at (was wuerde sofort schliessen bringen?)
+      reward = compute_efficiency_reward(captured, max_box, reward_cfg)
 
-    Jede valide Bewertung wird als (features, action_idx, reward) in den
-    Replay-Buffer gepackt. Training findet nach der ganzen Charge im Caller statt
-    (process_due_hindsight ruft am Ende train_steps).
+    Predictor-DB (open_predictions) wird NICHT angefasst (Welt-Trennung).
+    LinTSBandit.update(i, x, r) — kein Replay-Buffer, direkt-online.
 
-    Predictor-DB (open_predictions) wird NICHT angefasst."""
-    # `prediction` ist hier in Wahrheit eine trader_position-Row (Welt-Trennung).
+    legacy_kwargs (penalty_cfg, sweet_cfg) werden ignoriert — nur fuer Aufruf-Kompatibilitaet."""
     pid = prediction['id']
     side = prediction['side']
     entry = float(prediction['entry_px'])
@@ -2106,7 +2025,7 @@ def hindsight_replay_modify_neural(coins_conn, app_conn, modify_bandit, modify_s
 
     with app_conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
-            SELECT id, decided_at, features, tp_px_before, sl_px_before
+            SELECT id, decided_at, features
             FROM trader_decisions WHERE position_id=%s ORDER BY decided_at
         """, (pid,))
         decisions = cur.fetchall()
@@ -2114,9 +2033,10 @@ def hindsight_replay_modify_neural(coins_conn, app_conn, modify_bandit, modify_s
         return 0
 
     sym = prediction['symbol']
+    # Fenster-Ende: closed_at (echter Trade-Close), max +lookahead. Niemals in Zukunft.
     base_end = closed_at if closed_at else datetime.now(timezone.utc)
     end_at = base_end + timedelta(minutes=int(lookahead_minutes))
-    end_at = min(end_at, datetime.now(timezone.utc))  # nicht in Zukunft
+    end_at = min(end_at, datetime.now(timezone.utc))
 
     with coins_conn.cursor(cursor_factory=RealDictCursor) as cur_c:
         cur_c.execute("""
@@ -2125,54 +2045,57 @@ def hindsight_replay_modify_neural(coins_conn, app_conn, modify_bandit, modify_s
             ORDER BY open_time
         """, (sym, decisions[0]['decided_at'], end_at))
         klines = cur_c.fetchall()
+    if not klines:
+        return 0
+
+    # Action-Index-Lookup (robust gegen Reihenfolgen-Aenderungen)
+    name_to_idx = {a['name']: i for i, a in enumerate(modify_bandit.actions)}
+    idx_hold = name_to_idx.get('hold')
+    idx_close = name_to_idx.get('close_now')
+    if idx_hold is None or idx_close is None:
+        return 0
 
     n_updates = 0
     for d in decisions:
         feat_dict = d['features'] if isinstance(d['features'], dict) else {}
-        # Trade-Dauer zum Decision-Tick (= "wie lange laeuft Trade schon")
-        time_at_decision_h = float(feat_dict.get('time_in_trade_h', 0.0) or 0.0)
-        # Hebel aus Features (Position-Feature seit Variante B)
         leverage = float(feat_dict.get('leverage', 1) or 1)
         x_raw = vectorize_modify(feat_dict)
         x = modify_scaler.transform(x_raw)
-        tp_before = float(d['tp_px_before'])
-        sl_before = float(d['sl_px_before'])
+
         klines_after = [k for k in klines if k['open_time'] >= d['decided_at']]
         if not klines_after: continue
         first_close = float(klines_after[0].get('close') or entry)
+        last_close = float(klines_after[-1].get('close') or entry)
 
-        for i, action in enumerate(modify_bandit.actions):
-            if action.get('special') == 'hold':
-                test_tp, test_sl = tp_before, sl_before
-            elif action.get('special') == 'close':
-                pnl = ((first_close - entry)/entry*100) if side=='long' else ((entry - first_close)/entry*100)
-                # close_now: Trade-Dauer ist time_at_decision (geschlossen JETZT)
-                # Outcome-basiert: Margin <0.4% -> -2.0, <0.6% -> -0.5 (gilt fuer ALLE Actions)
-                reward = (pnl
-                          + apply_time_penalty(pnl, time_at_decision_h, penalty_cfg)
-                          + apply_sweet_spot_bonus(pnl, leverage, sweet_cfg))
-                modify_bandit.add_observation(x, i, reward)
-                n_updates += 1
-                continue
+        # Margin-PnL der einzelnen Klines im Fenster (high+low fuer max_box)
+        max_pnl_pct = -1e9
+        for k in klines_after:
+            h = k.get('high'); l = k.get('low')
+            if h is None or l is None: continue
+            h = float(h); l = float(l)
+            best = h if side == 'long' else l
+            if side == 'long':
+                pnl_pct = (best - entry) / entry * 100.0
             else:
-                tp_d = float(action.get('tp_delta') or 0.0)
-                sl_d = float(action.get('sl_delta') or 0.0)
-                if side == 'long':
-                    test_tp = tp_before + (first_close * tp_d / 100.0)
-                    test_sl = sl_before - (first_close * sl_d / 100.0)
-                else:
-                    test_tp = tp_before - (first_close * tp_d / 100.0)
-                    test_sl = sl_before + (first_close * sl_d / 100.0)
-            status, _, pnl, dur_after = replay_modify_action(klines_after, side, entry, test_tp, test_sl)
-            if status == 'no_data':
-                continue
-            # Gesamt-Trade-Dauer = bisher + counterfactual Verlauf
-            total_dur_h = time_at_decision_h + float(dur_after)
-            reward = (pnl
-                      + apply_time_penalty(pnl, total_dur_h, penalty_cfg)
-                      + apply_sweet_spot_bonus(pnl, leverage, sweet_cfg))
-            modify_bandit.add_observation(x, i, reward)
-            n_updates += 1
+                pnl_pct = (entry - best) / entry * 100.0
+            if pnl_pct > max_pnl_pct: max_pnl_pct = pnl_pct
+        if max_pnl_pct == -1e9:
+            continue
+        max_margin = max_pnl_pct * leverage
+
+        # captured_close = jetzt schliessen zum first_close
+        pnl_close_pct = ((first_close - entry)/entry*100) if side == 'long' else ((entry - first_close)/entry*100)
+        captured_close = pnl_close_pct * leverage
+
+        # captured_hold = warten bis Fenster-Ende, exit zum last_close
+        pnl_hold_pct = ((last_close - entry)/entry*100) if side == 'long' else ((entry - last_close)/entry*100)
+        captured_hold = pnl_hold_pct * leverage
+
+        r_close = compute_efficiency_reward(captured_close, max_margin, reward_cfg)
+        r_hold = compute_efficiency_reward(captured_hold, max_margin, reward_cfg)
+        modify_bandit.update(idx_close, x, r_close)
+        modify_bandit.update(idx_hold, x, r_hold)
+        n_updates += 2
     return n_updates
 
 
@@ -2478,12 +2401,11 @@ def backfill_trader_from_closed_trades(s, modify_bandit, modify_scaler,
 def process_due_hindsight(s, modify_bandit, modify_scaler, batch_size=64,
                            epochs=5, lookahead_minutes=120):
     """Holt due Pending-Hindsights aus Queue (ready_at <= now), faehrt
-    hindsight_replay_modify_neural fuer jeden, anschliessend train_steps
-    auf dem Replay-Buffer. Markiert processed_at + n_updates in der Queue."""
+    hindsight_replay_modify_neural fuer jeden. LinTSBandit.update ist online —
+    kein separater Train-Step noetig. Markiert processed_at + n_updates."""
     n_processed = 0
     n_total_updates = 0
-    penalty_cfg = s["predictor"]["modify_bandit"].get("reward_time_penalty", {})
-    sweet_cfg = s["predictor"]["modify_bandit"].get("reward_sweet_spot", {})
+    reward_cfg = s["predictor"]["modify_bandit"].get("reward", {})
     with db_app(s) as app, db_coins(s) as coins:
         while True:
             with app.cursor(cursor_factory=RealDictCursor) as cur:
@@ -2508,7 +2430,7 @@ def process_due_hindsight(s, modify_bandit, modify_scaler, batch_size=64,
                     n_u = hindsight_replay_modify_neural(
                         coins, app, modify_bandit, modify_scaler,
                         pred_dict, lookahead_minutes=lookahead_minutes,
-                        penalty_cfg=penalty_cfg, sweet_cfg=sweet_cfg)
+                        reward_cfg=reward_cfg)
                 except Exception as e:
                     log.warning("hindsight position_id=%s fehlgeschlagen: %s",
                                 d['position_id'], e)
@@ -2526,10 +2448,8 @@ def process_due_hindsight(s, modify_bandit, modify_scaler, batch_size=64,
             if len(due) < 10:
                 break
     if n_processed > 0:
-        # Nach jedem Batch: SGD auf Replay-Buffer
-        steps, avg_loss = modify_bandit.train_steps(batch_size=batch_size, n_epochs=epochs)
-        log.info("modify-hindsight: %d preds, %d updates, train=%d steps loss=%.4f buffer=%d",
-                 n_processed, n_total_updates, steps, avg_loss, len(modify_bandit.replay_buffer))
+        log.info("trader-hindsight: %d positions, %d action-updates (n_obs total=%d)",
+                 n_processed, n_total_updates, sum(modify_bandit.n_obs))
     return n_processed
 
 
@@ -2600,7 +2520,8 @@ def main():
              ACTIVE_VERSION, tp_buckets, sl_buckets,
              cfg["scan_interval_seconds"], cfg["watch_interval_seconds"], cfg["universe_top_n"])
 
-    # ============= Trader-Setup (NeuralBandit, separater State, eigene Welt) =============
+    # ============= Trader-Setup (LinTSBandit, 2 Actions, eigene Welt) =============
+    # Reform 10.05.2026: NeuralBandit -> LinTSBandit, 102 Actions -> 2 Actions
     mb_cfg = cfg.get("modify_bandit", {})
     modify_bandit = None
     modify_scaler = None
@@ -2608,75 +2529,57 @@ def main():
     modify_interval = float(mb_cfg.get("interval_seconds", 30))
     hindsight_delay_min = float(mb_cfg.get("hindsight_delay_minutes", 120))
     if mb_cfg.get("enabled"):
-        if torch is None:
-            log.error("Trader: torch nicht installiert -> Trader bleibt aus")
+        MODIFY_FEATURE_KEYS = build_modify_feature_keys(s)
+        N_FEAT_MODIFY = len(MODIFY_FEATURE_KEYS) + 1
+        m_actions = build_modify_actions()
+        m_action_names = [a['name'] for a in m_actions]
+        modify_state_path = mb_cfg.get(
+            "state_path",
+            "/opt/coin/database/data/models/predictor_modify_lints.pkl")
+        b_alpha = float(mb_cfg.get("prior_alpha", 1.0))
+        b_sigma2 = float(mb_cfg.get("noise_sigma2", 1.0))
+
+        m_state = None
+        m_fresh = None
+        if os.path.exists(modify_state_path):
+            try:
+                with open(modify_state_path, 'rb') as fp:
+                    m_state = pickle.load(fp)
+            except Exception as e:
+                log.warning("modify-bandit state load failed: %s", e)
+                m_state = None
+
+        if m_state is None:
+            m_fresh = "no state file"
+        elif m_state.get('arch') != 'lints':
+            m_fresh = f"arch changed ({m_state.get('arch')!r} -> lints)"
+        elif m_state.get('action_names') != m_action_names:
+            m_fresh = "action-space changed"
+        elif m_state.get('feature_keys') != MODIFY_FEATURE_KEYS:
+            m_fresh = "feature-keys changed"
+        elif m_state.get('n_features') != N_FEAT_MODIFY:
+            m_fresh = "n_features changed"
+
+        if m_fresh:
+            if m_state is not None:
+                log.warning("Trader fresh start — %s", m_fresh)
+            modify_bandit = LinTSBandit(N_FEAT_MODIFY, m_actions,
+                                         alpha=b_alpha, sigma2=b_sigma2)
+            modify_scaler = OnlineScaler(N_FEAT_MODIFY)
+            log.info("Trader (LinTS) fresh start: %d actions, %d features",
+                     len(m_actions), N_FEAT_MODIFY)
+            with open(modify_state_path, 'wb') as fp:
+                pickle.dump({'arch': 'lints', 'bandit': modify_bandit,
+                             'scaler': modify_scaler,
+                             'feature_keys': MODIFY_FEATURE_KEYS,
+                             'n_features': N_FEAT_MODIFY,
+                             'action_names': m_action_names}, fp)
         else:
-            MODIFY_FEATURE_KEYS = build_modify_feature_keys(s)
-            N_FEAT_MODIFY = len(MODIFY_FEATURE_KEYS) + 1
-            m_actions = build_modify_actions(
-                mb_cfg.get("tp_delta_buckets", [-0.5,-0.4,-0.3,-0.2,-0.1,0.1,0.2,0.3,0.4,0.5]),
-                mb_cfg.get("sl_delta_buckets", [-0.5,-0.4,-0.3,-0.2,-0.1,0.1,0.2,0.3,0.4,0.5]))
-            m_action_names = [a['name'] for a in m_actions]
-            modify_state_path = mb_cfg.get("state_path", "/opt/coin/database/data/models/predictor_modify_bandit.pkl")
-            n_cfg = mb_cfg.get("neural", {})
-            hidden = tuple(n_cfg.get("hidden_layers", [128, 64]))
-            dropout = float(n_cfg.get("dropout", 0.2))
-            lr = float(n_cfg.get("learning_rate", 1e-3))
-            buffer_max = int(n_cfg.get("replay_buffer_max", 50000))
-            ts_samples = int(n_cfg.get("ts_samples", 5))
-
-            # Versuche bestehenden Neural-State zu laden
-            m_state = None
-            m_fresh = None
-            if os.path.exists(modify_state_path):
-                try:
-                    with open(modify_state_path, 'rb') as fp:
-                        m_state = pickle.load(fp)
-                except Exception as e:
-                    log.warning("modify-bandit state load failed: %s", e)
-                    m_state = None
-
-            if m_state is None:
-                m_fresh = "no state file"
-            else:
-                if m_state.get('arch') != 'neural':
-                    m_fresh = f"arch changed ({m_state.get('arch')!r} -> neural)"
-                elif m_state.get('action_names') != m_action_names:
-                    m_fresh = "action-space changed"
-                elif m_state.get('feature_keys') != MODIFY_FEATURE_KEYS:
-                    m_fresh = "feature-keys changed"
-                else:
-                    cfgsd = m_state['bandit_state']['config']
-                    if (cfgsd['n_features'] != N_FEAT_MODIFY or
-                        cfgsd['hidden'] != list(hidden) or
-                        cfgsd['n_actions'] != len(m_actions)):
-                        m_fresh = "neural config changed"
-
-            if m_fresh:
-                if m_state is not None:
-                    log.warning("Trader fresh start — %s", m_fresh)
-                modify_bandit = NeuralBandit(N_FEAT_MODIFY, len(m_actions), m_actions,
-                                              hidden=hidden, dropout=dropout, lr=lr,
-                                              buffer_max=buffer_max, ts_samples=ts_samples)
-                modify_scaler = OnlineScaler(N_FEAT_MODIFY)
-                log.info("Trader (Neural) fresh start: %d actions, %d features, hidden=%s",
-                         len(m_actions), N_FEAT_MODIFY, list(hidden))
-
-                # Cold-Start-Backfill: deaktiviert nach Refactor 10.05.2026
-                # (alter Backfill las aus open_predictions = Welt-Trennung-Verstoss).
-                # Trader lernt nur aus eigenen trader_positions/decisions ab jetzt.
-
-                with open(modify_state_path, 'wb') as fp:
-                    pickle.dump({'arch': 'neural', 'bandit_state': modify_bandit.state_dict(),
-                                 'scaler': modify_scaler,
-                                 'feature_keys': MODIFY_FEATURE_KEYS,
-                                 'action_names': m_action_names}, fp)
-            else:
-                modify_bandit = NeuralBandit.from_state_dict(m_state['bandit_state'], m_actions)
-                modify_scaler = m_state['scaler']
-                log.info("Trader (Neural) loaded: %d actions, %d features, n_obs=%d, train_steps=%d, buffer=%d",
-                         len(m_actions), N_FEAT_MODIFY, sum(modify_bandit.n_obs),
-                         modify_bandit.n_train_steps, len(modify_bandit.replay_buffer))
+            modify_bandit = m_state['bandit']
+            modify_scaler = m_state['scaler']
+            log.info("Trader (LinTS) loaded: %d actions, %d features, n_obs=%s, cum_reward=%s",
+                     len(m_actions), N_FEAT_MODIFY,
+                     modify_bandit.n_obs, [round(r, 2) for r in modify_bandit.cum_reward])
     else:
         log.info("Trader disabled in settings")
 
@@ -2771,21 +2674,16 @@ def main():
                 except Exception as e:
                     log.exception("queue_pending_hindsight failed: %s", e)
 
-                # Due-Hindsights verarbeiten (alle wo ready_at <= now): replay+train
+                # Due-Hindsights verarbeiten — LinTS lernt online, kein Train-Step.
                 try:
-                    n_cfg = cfg.get("modify_bandit", {}).get("neural", {})
-                    bs = int(n_cfg.get("batch_size", 64))
-                    ne = int(n_cfg.get("train_epochs_per_hindsight", 5))
                     n_p = process_due_hindsight(s, modify_bandit, modify_scaler,
-                                                 batch_size=bs, epochs=ne,
                                                  lookahead_minutes=int(hindsight_delay_min))
                     if n_p > 0:
-                        # State persistieren nach Lernen
                         with open(modify_state_path, 'wb') as fp:
-                            pickle.dump({'arch': 'neural',
-                                         'bandit_state': modify_bandit.state_dict(),
+                            pickle.dump({'arch': 'lints', 'bandit': modify_bandit,
                                          'scaler': modify_scaler,
                                          'feature_keys': MODIFY_FEATURE_KEYS,
+                                         'n_features': N_FEAT_MODIFY,
                                          'action_names': [a['name'] for a in modify_bandit.actions]},
                                         fp)
                 except Exception as e:
