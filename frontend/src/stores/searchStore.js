@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
 import api from '../utils/api'
 
 // Debounce Helper
@@ -8,7 +9,7 @@ const debouncedSave = (saveFunc, delay = 2000) => {
   saveTimeout = setTimeout(saveFunc, delay)
 }
 
-export const useSearchStore = create((set, get) => ({
+export const useSearchStore = create(persist((set, get) => ({
   // Such-Filter
   searchParams: {
     direction: 'up',
@@ -21,6 +22,7 @@ export const useSearchStore = create((set, get) => ({
     weekdays: [],
     hourStart: -1,
     hourEnd: -1,
+    hlOnly: true,
   },
 
   // Such-Ergebnisse (Primär)
@@ -90,6 +92,9 @@ export const useSearchStore = create((set, get) => ({
       if (searchParams.hourStart >= 0 && searchParams.hourEnd >= 0) {
         params.hour_start = searchParams.hourStart
         params.hour_end = searchParams.hourEnd
+      }
+      if (searchParams.hlOnly !== undefined) {
+        params.hl_only = searchParams.hlOnly
       }
 
       const response = await api.get('/api/v1/search/events', { params })
@@ -213,4 +218,15 @@ export const useSearchStore = create((set, get) => ({
   clearResults: () => {
     set({ results: [], cascadeResults: [], selectedEvents: [], searchError: null })
   }
+}), {
+  name: 'search-store',
+  partialize: (state) => ({
+    searchParams: state.searchParams,
+    results: state.results,
+    selectedEvents: state.selectedEvents,
+    prehistoryMinutes: state.prehistoryMinutes,
+    selectedSetId: state.selectedSetId,
+    indicatorChain: state.indicatorChain,
+    cascadeResults: state.cascadeResults,
+  }),
 }))

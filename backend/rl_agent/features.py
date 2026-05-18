@@ -311,8 +311,8 @@ def get_candles_from_db(conn, table, symbol, before_time, n_candles):
     col_time = 'open_time' if table == 'kline_metrics' else 'bucket'
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT open, high, low, close, volume, number_of_trades,
-                   taker_buy_base_asset_volume
+            SELECT open, high, low, close, volume, trades,
+                   taker_buy_base
             FROM {table}
             WHERE symbol = %s AND {col_time} <= %s
             ORDER BY {col_time} DESC LIMIT %s
@@ -329,8 +329,8 @@ def get_candles_from_db(conn, table, symbol, before_time, n_candles):
         'low': np.array([float(r['low']) for r in rows], dtype=np.float32),
         'close': np.array([float(r['close']) for r in rows], dtype=np.float32),
         'volume': np.array([float(r['volume'] or 0) for r in rows], dtype=np.float32),
-        'trades': np.array([float(r['number_of_trades'] or 0) for r in rows], dtype=np.float32),
-        'taker': np.array([float(r['taker_buy_base_asset_volume'] or 0) for r in rows], dtype=np.float32),
+        'trades': np.array([float(r['trades'] or 0) for r in rows], dtype=np.float32),
+        'taker': np.array([float(r['taker_buy_base'] or 0) for r in rows], dtype=np.float32),
     }
 
 

@@ -1,0 +1,631 @@
+"""Predictor Service — regelbasiert + River Online-Learning + Watcher.
+
+Settings: settings.json -> 'predictor'.
+Tabellen:
+  analyser_app.open_predictions        - offene+abgeschlossene Predictions (Symbol-Lock)
+  analyser_app.predictor_state         - Threshold + Universe + Counts
+  learner.prediction_feedback          - Closed Outcomes (mit Feature-Snapshot)
+"""
+
+import json
+import logging
+import math
+import os
+import pickle
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+from river import linear_model, optim, preprocessing
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger("predictor")
+
+SETTINGS_PATH = '/opt/coin/settings.json'
+
+
+def load_settings():
+    with open(SETTINGS_PATH) as fp:
+        return json.load(fp)
+
+
+def db_coins(s):
+    db = s["databases"]["coins"]
+    return psycopg2.connect(host=db["host"], port=db["port"], dbname=db["name"],
+                            user=db["user"], password=db["password"])
+
+
+def db_app(s):
+    db = s["databases"]["app"]
+    return psycopg2.connect(host=db["host"], port=db["port"], dbname=db["name"],
+                            user=db["user"], password=db["password"])
+
+
+def db_learner(s):
+    db = s["databases"]["learner"]
+    return psycopg2.connect(host=db["host"], port=db["port"], dbname=db["name"],
+                            user=db["user"], password=db["password"])
+
+
+# Decimal-tolerant ---------------------------------------------------------
+def f(x):
+    if x is None:
+        return None
+    return float(x)
+
+
+def fseries(series):
+    return [f(x) for x in series]
+
+
+# Operatoren ---------------------------------------------------------------
+def op_gt(val, threshold, *_):
+    val = f(val); threshold = float(threshold)
+    return val is not None and val > threshold
+
+def op_lt(val, threshold, *_):
+    val = f(val); threshold = float(threshold)
+    return val is not None and val < threshold
+
+def op_rising_pct(series, threshold_pct, *_):
+    s = fseries(series)
+    if not s or len(s) < 2: return False
+    first = next((x for x in s if x is not None), None)
+    last = s[-1]
+    if first is None or last is None or first == 0: return False
+    return (last / first - 1) * 100 >= float(threshold_pct)
+
+def op_abs_change_pct_max(series, threshold_pct, *_):
+    s = fseries(series)
+    if not s or len(s) < 2: return False
+    first = next((x for x in s if x is not None), None)
+    if first is None or first == 0: return False
+    clean = [x for x in s if x is not None]
+    if not clean: return False
+    mx = max(clean); mn = min(clean)
+    return max(abs(mx/first - 1), abs(mn/first - 1)) * 100 <= float(threshold_pct)
+
+def op_z_score(series, threshold_z, *_):
+    s = fseries(series)
+    if not s or len(s) < 10: return False
+    baseline = [x for x in s[:-1] if x is not None]
+    if len(baseline) < 3: return False
+    mean = sum(baseline) / len(baseline)
+    var = sum((x - mean) ** 2 for x in baseline) / len(baseline)
+    std = math.sqrt(var)
+    if std == 0: return False
+    last = s[-1]
+    if last is None: return False
+    return (last - mean) / std >= float(threshold_z)
+
+def op_bollinger_pos(series, threshold, period, *_):
+    s = fseries(series)
+    period = int(period)
+    if not s or len(s) < period: return False
+    win = s[-period:]
+    clean = [x for x in win if x is not None]
+    if len(clean) < period: return False
+    mean = sum(clean) / period
+    var = sum((x - mean) ** 2 for x in clean) / period
+    std = math.sqrt(var)
+    if std == 0: return False
+    pos = (clean[-1] - mean) / (2 * std)
+    threshold = float(threshold)
+    if threshold < 0:
+        return pos <= threshold
+    return pos >= threshold
+
+OP_FUNCS = {
+    ">": op_gt, "<": op_lt,
+    "rising_pct": op_rising_pct,
+    "abs_change_pct_max": op_abs_change_pct_max,
+    "z_score": op_z_score,
+    "bollinger_pos": op_bollinger_pos,
+}
+
+
+# Series-Loader ------------------------------------------------------------
+SERIES_FIELDS = (
+    "open","close","volume","trades","taker_buy_base","taker_buy_quote",
+    "funding","open_interest","premium","spread_bps","book_imbalance_5",
+    "book_depth_5","mark_px","mid_px","oracle_px",
+    "bbo_bid_px","bbo_ask_px","bbo_bid_sz","bbo_ask_sz",
+)
+
+
+def load_series(cur, symbol, field, minutes):
+    lookback = max(int(minutes), 30)
+    cur.execute(f"""
+        SELECT bucket, {", ".join(SERIES_FIELDS)}
+        FROM agg_1m WHERE symbol=%s AND bucket >= now() - (%s || ' minutes')::interval
+        ORDER BY bucket
+    """, (symbol, lookback))
+    rows = cur.fetchall()
+    if not rows: return []
+    if field == "taker_buy_base_ratio":
+        out = []
+        for r in rows:
+            v = f(r['volume']); t = f(r['taker_buy_base'])
+            if v and v > 0 and t is not None:
+                out.append(t / v)
+            else:
+                out.append(None)
+        return out
+    return [f(r.get(field)) for r in rows]
+
+
+# Regel-Auswertung ---------------------------------------------------------
+def evaluate_rule(cur, symbol, rule, base_lookback):
+    details = []
+    for cond in rule["conditions"]:
+        field = cond["field"]
+        op = cond["op"]
+        val = cond["value"]
+        window = cond.get("window_min", base_lookback)
+        series = load_series(cur, symbol, field, window)
+        series_window = series[-max(1, int(window)):] if series else []
+        fn = OP_FUNCS.get(op)
+        if fn is None:
+            return {"ok": False, "details": details, "reason": f"unknown op {op}"}
+        if op in (">", "<"):
+            last = next((s for s in reversed(series_window) if s is not None), None)
+            ok = fn(last, val)
+            details.append({"cond": cond, "ok": ok, "value": last})
+        elif op == "bollinger_pos":
+            period = cond.get("window_min", 20)
+            ok = op_bollinger_pos(series, val, period)
+            details.append({"cond": cond, "ok": ok})
+        else:
+            ok = fn(series_window, val)
+            details.append({"cond": cond, "ok": ok, "n": len(series_window)})
+        if not ok:
+            return {"ok": False, "details": details}
+    return {"ok": True, "details": details}
+
+
+# ATR (für SL/TP) ----------------------------------------------------------
+def calc_atr(coins_conn, symbol, period, source_view):
+    with coins_conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"""
+            SELECT high, low, close FROM {source_view}
+            WHERE symbol=%s ORDER BY bucket DESC LIMIT %s
+        """, (symbol, period + 1))
+        rows = list(reversed(cur.fetchall()))
+    if len(rows) < period + 1:
+        return None
+    trs = []
+    prev_close = f(rows[0]['close'])
+    for r in rows[1:]:
+        h, l, c = f(r['high']), f(r['low']), f(r['close'])
+        if h is None or l is None or c is None or prev_close is None:
+            prev_close = c
+            continue
+        tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        trs.append(tr)
+        prev_close = c
+    if not trs: return None
+    return sum(trs) / len(trs)
+
+
+# Feature-Snapshot (für River) --------------------------------------------
+def feature_snapshot(coins_conn, symbol):
+    with coins_conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT bucket, open, close, volume, trades, taker_buy_base, taker_buy_quote,
+                   funding, open_interest, premium, spread_bps, book_imbalance_5,
+                   book_depth_5, mark_px, mid_px, oracle_px, bbo_bid_sz, bbo_ask_sz
+            FROM agg_1m WHERE symbol=%s ORDER BY bucket DESC LIMIT 30
+        """, (symbol,))
+        rows = list(reversed(cur.fetchall()))
+    if not rows: return None
+    last = rows[-1]
+    if last['close'] is None: return None
+    cl = f(last['close'])
+    feat = {}
+    for k in ("funding","open_interest","premium","spread_bps","book_imbalance_5","book_depth_5"):
+        v = f(last[k])
+        feat[k] = v if v is not None else 0.0
+    bidsz = f(last['bbo_bid_sz']) or 0
+    asksz = f(last['bbo_ask_sz']) or 0
+    feat['bbo_size_ratio'] = (bidsz - asksz) / (bidsz + asksz + 1e-9)
+    mark = f(last['mark_px']); mid = f(last['mid_px']); oracle = f(last['oracle_px'])
+    feat['mark_vs_mid_bps'] = ((mark - mid) / mid * 10000) if (mark and mid) else 0.0
+    feat['mark_vs_oracle_bps'] = ((mark - oracle) / oracle * 10000) if (mark and oracle) else 0.0
+    vol = f(last['volume']) or 0
+    tb = f(last['taker_buy_base']) or 0
+    feat['taker_buy_ratio'] = (tb / vol) if vol > 0 else 0.5
+    if len(rows) >= 6:
+        c5 = f(rows[-6]['close'])
+        feat['close_pct_5m'] = ((cl - c5) / c5 * 100) if c5 else 0.0
+    else:
+        feat['close_pct_5m'] = 0.0
+    if len(rows) >= 16:
+        c15 = f(rows[-16]['close'])
+        feat['close_pct_15m'] = ((cl - c15) / c15 * 100) if c15 else 0.0
+        oi0 = f(rows[-16]['open_interest']) or 0
+        oi1 = f(last['open_interest']) or 0
+        feat['oi_pct_15m'] = ((oi1 - oi0) / oi0 * 100) if oi0 else 0.0
+    else:
+        feat['close_pct_15m'] = 0.0
+        feat['oi_pct_15m'] = 0.0
+    vols = [f(r['volume']) or 0 for r in rows]
+    if len(vols) >= 10:
+        m = sum(vols[:-1]) / len(vols[:-1])
+        v = sum((x - m) ** 2 for x in vols[:-1]) / len(vols[:-1])
+        sd = math.sqrt(v)
+        feat['vol_zscore'] = ((vols[-1] - m) / sd) if sd > 0 else 0.0
+    else:
+        feat['vol_zscore'] = 0.0
+    return feat
+
+
+# River Modell -------------------------------------------------------------
+def make_model():
+    return preprocessing.StandardScaler() | linear_model.LogisticRegression(optimizer=optim.SGD(0.01))
+
+
+def load_model(path):
+    if os.path.exists(path):
+        try:
+            with open(path, 'rb') as fp:
+                return pickle.load(fp)
+        except Exception as e:
+            log.warning("load_model failed: %s -> fresh", e)
+    return make_model()
+
+
+def save_model(model, path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as fp:
+        pickle.dump(model, fp)
+    os.replace(tmp, path)
+
+
+# Universe -----------------------------------------------------------------
+def refresh_universe(coins_conn, top_n):
+    with coins_conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT DISTINCT ON (symbol) symbol, day_ntl_vlm
+            FROM hl_asset_ctx ORDER BY symbol, ts DESC
+        """)
+        rows = cur.fetchall()
+    rows = [r for r in rows if r['day_ntl_vlm'] is not None]
+    rows.sort(key=lambda r: f(r['day_ntl_vlm']) or 0, reverse=True)
+    return [r['symbol'] for r in rows[:top_n]]
+
+
+# Predictions schreiben/abfragen ------------------------------------------
+def has_open(app_conn, symbol):
+    with app_conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM open_predictions WHERE symbol=%s AND status='open' LIMIT 1", (symbol,))
+        return cur.fetchone() is not None
+
+
+def open_prediction(app_conn, symbol, side, entry, sl, tp, score, rule, source, features):
+    with app_conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO open_predictions
+              (symbol, side, entry_px, sl_px, tp_px, score, rule_name, source, features, last_px, last_check_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,now())
+            ON CONFLICT DO NOTHING RETURNING id
+        """, (symbol, side, entry, sl, tp, score, rule, source, json.dumps(features), entry))
+        r = cur.fetchone()
+    app_conn.commit()
+    return r[0] if r else None
+
+
+# Telegram ----------------------------------------------------------------
+def send_telegram(s, text):
+    tg = s.get("telegram") or {}
+    if not tg.get("bot_token") or not tg.get("chat_id"): return
+    url = f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": tg["chat_id"], "text": text}).encode()
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, data=data, method="POST"), timeout=10).read()
+    except Exception as e:
+        log.warning("telegram failed: %s", e)
+
+
+# Scan-Pass ---------------------------------------------------------------
+def scan_pass(s, model, threshold, last_alert):
+    cfg = s["predictor"]
+    rules = cfg["rules"]
+    cooldown = cfg["cooldown_seconds_per_symbol"]
+    lookback = cfg["lookback_minutes"]
+    atr_period = cfg["atr_period"]
+    atr_view = cfg["atr_source_view"]
+    sl_mult = float(cfg["sl_atr_mult"])
+    tp_mult = float(cfg["tp_atr_mult"])
+
+    matches = 0
+    with db_coins(s) as coins, db_app(s) as app:
+        with app.cursor(cursor_factory=RealDictCursor) as cur_a:
+            cur_a.execute("SELECT universe, universe_refreshed_at FROM predictor_state WHERE id=1")
+            st = cur_a.fetchone()
+        need_refresh = (
+            not st or not st['universe'] or not st['universe_refreshed_at']
+            or (datetime.now(timezone.utc) - st['universe_refreshed_at']).total_seconds()
+                > cfg["universe_refresh_minutes"] * 60
+        )
+        if need_refresh:
+            uni = refresh_universe(coins, cfg["universe_top_n"])
+            with app.cursor() as cur_a:
+                cur_a.execute("UPDATE predictor_state SET universe=%s::jsonb, universe_refreshed_at=now(), updated_at=now() WHERE id=1",
+                              (json.dumps(uni),))
+            app.commit()
+            log.info("universe refreshed: %d symbols", len(uni))
+        else:
+            uni = st['universe']
+
+        with coins.cursor(cursor_factory=RealDictCursor) as cur_c:
+            for sym in uni:
+                if has_open(app, sym):
+                    continue
+                for rule in rules:
+                    try:
+                        result = evaluate_rule(cur_c, sym, rule, lookback)
+                    except Exception as e:
+                        log.warning("rule eval %s/%s failed: %s", sym, rule['name'], e)
+                        continue
+                    if not result["ok"]:
+                        continue
+                    now_s = time.time()
+                    key = (sym, rule["name"])
+                    if key in last_alert and now_s - last_alert[key] < cooldown:
+                        continue
+                    last_alert[key] = now_s
+
+                    cur_c.execute("SELECT close FROM agg_1m WHERE symbol=%s ORDER BY bucket DESC LIMIT 1", (sym,))
+                    p = cur_c.fetchone()
+                    if not p or p['close'] is None: continue
+                    entry = f(p['close'])
+
+                    atr = calc_atr(coins, sym, atr_period, atr_view)
+                    if not atr or atr <= 0:
+                        atr = entry * 0.01
+
+                    side = rule["direction"]
+                    if side == "long":
+                        sl = entry - sl_mult * atr
+                        tp = entry + tp_mult * atr
+                    else:
+                        sl = entry + sl_mult * atr
+                        tp = entry - tp_mult * atr
+
+                    feat = feature_snapshot(coins, sym) or {}
+
+                    if model is not None:
+                        try:
+                            proba = model.predict_proba_one(feat).get(True, model.predict_proba_one(feat).get(1, 0.0))
+                            score = float(proba)
+                        except Exception:
+                            score = 1.0
+                    else:
+                        score = 1.0
+
+                    if score < threshold:
+                        continue
+
+                    pid = open_prediction(app, sym, side, entry, sl, tp, score,
+                                           rule["name"], "rule", feat)
+                    if pid:
+                        matches += 1
+                        log.info("OPEN %s %s entry=%.6g sl=%.6g tp=%.6g score=%.3f rule=%s",
+                                 sym, side, entry, sl, tp, score, rule["name"])
+                        if cfg.get("alert_on_open"):
+                            send_telegram(s, f"[Predictor] OPEN {sym} {side} entry={entry:.6g} "
+                                            f"sl={sl:.6g} tp={tp:.6g} ({rule['name']})")
+                    break  # ein Match pro Symbol pro Pass
+    return matches
+
+
+# Watch-Pass --------------------------------------------------------------
+def watch_pass(s, model, model_path):
+    cfg = s["predictor"]
+    timeout_h = float(cfg["timeout_hours"])
+    closes = []
+    with db_coins(s) as coins, db_app(s) as app:
+        with app.cursor(cursor_factory=RealDictCursor) as cur_a:
+            cur_a.execute("""
+                SELECT id, symbol, side, entry_px, sl_px, tp_px, score, rule_name, features, created_at
+                FROM open_predictions WHERE status='open'
+            """)
+            opens = cur_a.fetchall()
+        if not opens:
+            return 0
+
+        symbols = list({o['symbol'] for o in opens})
+        with coins.cursor(cursor_factory=RealDictCursor) as cur_c:
+            cur_c.execute("""
+                SELECT DISTINCT ON (symbol) symbol, mid_px, close
+                FROM klines
+                WHERE symbol = ANY(%s) AND interval='10s'
+                ORDER BY symbol, open_time DESC
+            """, (symbols,))
+            prices = {r['symbol']: (f(r['mid_px']) or f(r['close'])) for r in cur_c.fetchall()}
+
+        for o in opens:
+            cur_px = prices.get(o['symbol'])
+            if cur_px is None:
+                continue
+            entry = f(o['entry_px'])
+            sl = f(o['sl_px'])
+            tp = f(o['tp_px'])
+            side = o['side']
+            status = None
+            if side == 'long':
+                if cur_px >= tp: status = 'win'
+                elif cur_px <= sl: status = 'loss'
+            else:
+                if cur_px <= tp: status = 'win'
+                elif cur_px >= sl: status = 'loss'
+            age_h = (datetime.now(timezone.utc) - o['created_at']).total_seconds() / 3600
+            if status is None and age_h >= timeout_h:
+                status = 'timeout'
+
+            with app.cursor() as cur_a:
+                if status:
+                    pnl_pct = ((cur_px - entry) / entry * 100) if side == 'long' else ((entry - cur_px) / entry * 100)
+                    cur_a.execute("""
+                        UPDATE open_predictions
+                        SET status=%s, exit_px=%s, pnl_pct=%s, closed_at=now(), last_px=%s, last_check_at=now()
+                        WHERE id=%s AND status='open'
+                    """, (status, cur_px, pnl_pct, cur_px, o['id']))
+                    closes.append({
+                        'id': o['id'], 'symbol': o['symbol'], 'side': side,
+                        'entry': entry, 'exit': cur_px, 'pnl_pct': pnl_pct,
+                        'status': status, 'features': o['features'],
+                        'rule': o['rule_name'], 'score': f(o['score']),
+                        'created_at': o['created_at'],
+                    })
+                    log.info("CLOSE %s %s status=%s pnl=%.3f%%", o['symbol'], side, status, pnl_pct)
+                else:
+                    cur_a.execute("""
+                        UPDATE open_predictions SET last_px=%s, last_check_at=now() WHERE id=%s AND status='open'
+                    """, (cur_px, o['id']))
+            app.commit()
+
+    if closes:
+        learn_and_calibrate(s, model, model_path, closes)
+    return len(closes)
+
+
+def learn_and_calibrate(s, model, model_path, closes):
+    cfg = s["predictor"]
+    learner_cfg = cfg["online_learner"]
+    cal_cfg = cfg["self_calibration"]
+
+    with db_learner(s) as ldb, db_app(s) as app:
+        with ldb.cursor() as cur_l:
+            for c in closes:
+                label = c['status'] == 'win'
+                if learner_cfg.get("enabled") and model is not None and c.get('features'):
+                    try:
+                        model.learn_one(c['features'], 1 if label else 0)
+                    except Exception as e:
+                        log.warning("learn_one %s: %s", c['symbol'], e)
+                duration = int((datetime.now(timezone.utc) - c['created_at']).total_seconds() / 60)
+                cur_l.execute("""
+                    INSERT INTO prediction_feedback
+                      (prediction_id, scanner_type, symbol, direction, entry_price,
+                       detected_at, resolved_at, status, was_correct,
+                       actual_result_pct, duration_minutes, time_result,
+                       features, rule_name, score)
+                    VALUES (%s, 'predictor', %s, %s, %s, %s, now(), %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+                    ON CONFLICT (prediction_id, scanner_type) DO NOTHING
+                """, (c['id'], c['symbol'], c['side'], c['entry'], c['created_at'],
+                       c['status'], label, c['pnl_pct'], duration,
+                       'within_timeout' if c['status'] != 'timeout' else 'timeout',
+                       json.dumps(c['features'] or {}), c['rule'], c['score']))
+        ldb.commit()
+
+        if learner_cfg.get("enabled") and model is not None:
+            try:
+                save_model(model, model_path)
+            except Exception as e:
+                log.warning("save_model: %s", e)
+
+        if cal_cfg.get("enabled"):
+            with app.cursor() as cur_a:
+                cur_a.execute("UPDATE predictor_state SET closed_count = closed_count + %s WHERE id=1",
+                              (len(closes),))
+            app.commit()
+            with app.cursor() as cur_a:
+                cur_a.execute("SELECT closed_count, threshold FROM predictor_state WHERE id=1")
+                row = cur_a.fetchone()
+            cnt, thr = row[0], f(row[1])
+            review_n = int(cal_cfg.get("review_after_n_closes", 10))
+            if review_n > 0 and cnt % review_n == 0:
+                win = int(cal_cfg["rolling_window"])
+                with ldb.cursor() as cur_l:
+                    cur_l.execute("""
+                        SELECT was_correct FROM prediction_feedback
+                        WHERE scanner_type='predictor'
+                        ORDER BY resolved_at DESC LIMIT %s
+                    """, (win,))
+                    rows = cur_l.fetchall()
+                if len(rows) >= 20:
+                    wr = sum(1 for r in rows if r[0]) / len(rows)
+                    target = float(cal_cfg["target_winrate"])
+                    step = float(cal_cfg["adjust_step"])
+                    if wr < target: thr += step
+                    elif wr > target + 0.05: thr -= step
+                    thr = max(float(cal_cfg.get("min_threshold", 0.0)),
+                              min(float(cal_cfg.get("max_threshold", 0.95)), thr))
+                    with app.cursor() as cur_a:
+                        cur_a.execute("""
+                            UPDATE predictor_state SET threshold=%s, rolling_winrate=%s,
+                                last_calibration_at=now(), updated_at=now() WHERE id=1
+                        """, (thr, wr))
+                    app.commit()
+                    log.info("calibrate: WR=%.3f target=%.3f -> threshold=%.3f", wr, target, thr)
+
+
+# Main loop ----------------------------------------------------------------
+def main():
+    s = load_settings()
+    cfg = s["predictor"]
+    if not cfg.get("enabled"):
+        log.info("predictor disabled in settings, exit")
+        return
+
+    learner_cfg = cfg["online_learner"]
+    model_path = learner_cfg["model_path"]
+    model = load_model(model_path) if learner_cfg.get("enabled") else None
+
+    with db_app(s) as app:
+        with app.cursor() as cur:
+            cur.execute("SELECT threshold FROM predictor_state WHERE id=1")
+            r = cur.fetchone()
+            threshold = f(r[0]) if r else 0.0
+
+    log.info("Predictor start. threshold=%.3f scan=%ss watch=%ss top_n=%d",
+             threshold, cfg["scan_interval_seconds"], cfg["watch_interval_seconds"], cfg["universe_top_n"])
+
+    last_alert = {}
+    last_scan = 0.0
+    last_watch = 0.0
+    last_settings_reload = 0.0
+
+    while True:
+        try:
+            now = time.time()
+            if now - last_settings_reload >= 60:
+                s = load_settings()
+                cfg = s["predictor"]
+                last_settings_reload = now
+                with db_app(s) as app:
+                    with app.cursor() as cur:
+                        cur.execute("SELECT threshold FROM predictor_state WHERE id=1")
+                        r = cur.fetchone()
+                        threshold = f(r[0]) if r else 0.0
+
+            if now - last_scan >= cfg["scan_interval_seconds"]:
+                m = scan_pass(s, model, threshold, last_alert)
+                last_scan = now
+                if m > 0:
+                    log.info("scan-pass: %d new predictions, threshold=%.3f", m, threshold)
+
+            if now - last_watch >= cfg["watch_interval_seconds"]:
+                c = watch_pass(s, model, model_path)
+                last_watch = now
+                if c > 0:
+                    log.info("watch-pass: %d closed", c)
+
+            time.sleep(0.5)
+        except KeyboardInterrupt:
+            log.info("interrupt")
+            break
+        except Exception as e:
+            log.exception("loop error: %s", e)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()

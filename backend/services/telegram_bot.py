@@ -54,6 +54,10 @@ DB_CONFIG = {
     'password': SETTINGS['ingestor']['database']['password']
 }
 
+# health_check-Konfig aus zentraler settings.json (Single Source of Truth fuer Service-Liste)
+with open('/opt/coin/settings.json') as f:
+    HEALTH_CFG = json.load(f).get('health_check', {})
+
 def log(msg):
     timestamp = datetime.now(BERLIN_TZ).strftime('%Y-%m-%d %H:%M:%S')
     line = f"[{timestamp}] {msg}"
@@ -325,12 +329,8 @@ def run_health_check():
     
     problems = []
     
-    # Service Check - critical services
-    critical_services = [
-        'analyser-ingestor', 'agg-refresher',
-        'coin-analyser-api', 'coin-info-updater',
-        'rl-agent',
-    ]
+    # Service Check - critical services (aus settings.json health_check.required_services)
+    critical_services = HEALTH_CFG.get('required_services', [])
     for svc in critical_services:
         if not check_service(f'{svc}.service'):
             problems.append(f"Service: {svc} DOWN!")
@@ -443,14 +443,8 @@ def cmd_health():
     """Manueller Health-Check"""
     lines = []
 
-    # Services
-    services = [
-        'analyser-ingestor', 'agg-refresher',
-        'analyser-telegram-bot', 'heartbeat-watchdog',
-        'coin-info-updater',
-        'coin-analyser-api', 'coin-analyser-frontend',
-        'rl-agent',
-    ]
+    # Services (aus settings.json health_check.required_services)
+    services = HEALTH_CFG.get('required_services', [])
     for svc in services:
         ok = check_service(f'{svc}.service')
         emoji = "✅" if ok else "❌"

@@ -21,12 +21,33 @@ from wallet.hl_ws_state import get_ws_state, ensure_started
 
 router = APIRouter(prefix="/api/v1/wallet", tags=["wallet"])
 
-# REST-Fallback-Caches — gefragt nur wenn WS-State stale ist.
-_HL_CACHE_TTL_S = 5.0
+# REST-Fallback-Caches — TTLs werden bei jedem Cache-Lookup live aus settings.json
+# gelesen. So sind Frontend-Änderungen sofort wirksam, OHNE Service-Restart.
+# KEIN Default — fehlt der Wert raise (keine silent fallbacks).
+import logging
+_wallet_log = logging.getLogger("wallet")
+
+def _wallet_cfg() -> dict:
+    with open('/opt/coin/settings.json') as f:
+        return json.load(f).get('wallet', {})
+
+def _get_state_ttl() -> float:
+    v = _wallet_cfg().get('hl_cache_ttl_seconds')
+    if v is None:
+        _wallet_log.error("FALLBACK_TRIGGERED wallet.routes: wallet.hl_cache_ttl_seconds fehlt -> raise")
+        raise RuntimeError("settings.wallet.hl_cache_ttl_seconds missing")
+    return float(v)
+
+def _get_fills_ttl() -> float:
+    v = _wallet_cfg().get('hl_fills_ttl_seconds')
+    if v is None:
+        _wallet_log.error("FALLBACK_TRIGGERED wallet.routes: wallet.hl_fills_ttl_seconds fehlt -> raise")
+        raise RuntimeError("settings.wallet.hl_fills_ttl_seconds missing")
+    return float(v)
+
 _hl_user_state_cache: dict = {}
 _hl_open_orders_cache: dict = {}
 _hl_spot_state_cache: dict = {}
-_HL_FILLS_TTL_S = 30.0
 _hl_user_fills_cache: dict = {}
 
 
@@ -39,7 +60,7 @@ def _cached_user_state(address: str) -> dict:
     # Fallback: REST
     now = time.time()
     c = _hl_user_state_cache.get(address)
-    if c and now - c["ts"] < _HL_CACHE_TTL_S:
+    if c and now - c["ts"] < _get_state_ttl():
         return c["data"]
     try:
         data = HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True).user_state(address)
@@ -60,7 +81,7 @@ def _cached_open_orders(address: str) -> list:
         return ws_data
     now = time.time()
     c = _hl_open_orders_cache.get(address)
-    if c and now - c["ts"] < _HL_CACHE_TTL_S:
+    if c and now - c["ts"] < _get_state_ttl():
         return c["data"]
     try:
         data = HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True).open_orders(address)
@@ -81,7 +102,7 @@ def _cached_spot_user_state(address: str) -> dict:
         return ws_data
     now = time.time()
     c = _hl_spot_state_cache.get(address)
-    if c and now - c["ts"] < _HL_CACHE_TTL_S:
+    if c and now - c["ts"] < _get_state_ttl():
         return c["data"]
     try:
         data = HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True).spot_user_state(address)
@@ -105,7 +126,7 @@ def _cached_user_fills(address: str) -> list:
     # Fallback: REST (besonders nach Server-Start solange WS noch keinen Push hatte)
     now = time.time()
     c = _hl_user_fills_cache.get(address)
-    if c and now - c["ts"] < _HL_FILLS_TTL_S:
+    if c and now - c["ts"] < _get_fills_ttl():
         return c["data"]
     try:
         data = HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True).user_fills(address)
@@ -130,6 +151,31 @@ def get_user_binance_client(user_id: int):
     except Exception as e:
         print(f"[WALLET] Error creating Binance client for user {user_id}: {e}")
         return None
+
+
+@router.get("/config")
+async def get_wallet_config(current_user: dict = Depends(get_current_user)):
+    """Liefert den 'wallet'-Block aus settings.json — für UI-Settings."""
+    with open('/opt/coin/settings.json') as f:
+        return json.load(f).get('wallet', {})
+
+
+class WalletConfigUpdate(BaseModel):
+    config: dict
+
+
+@router.put("/config")
+async def put_wallet_config(payload: WalletConfigUpdate,
+                              current_user: dict = Depends(get_current_user)):
+    """Ersetzt den 'wallet'-Block in settings.json. Live-Reload — wirkt sofort."""
+    settings_path = '/opt/coin/settings.json'
+    with open(settings_path) as f:
+        s = json.load(f)
+    s['wallet'] = payload.config
+    with open(settings_path + '.tmp', 'w') as f:
+        json.dump(s, f, indent=2)
+    Path(settings_path + '.tmp').rename(settings_path)
+    return {"status": "ok"}
 
 
 @router.get("/status")
@@ -403,23 +449,43 @@ async def get_trade_history(days: int = 30, limit: int = 500, current_user: dict
     except Exception:
         default_lev = 5
 
+    # Coin-spezifischer HL-Max-Leverage aus coins.hl_meta (TimescaleDB) als
+    # finaler Cap. HL akzeptiert nicht jeden Hebel fuer jeden Coin (POPCAT/AERO
+    # = 3x max, BTC = 40x). Wenn DB/Default-Wert ueber dem HL-Max liegt, war
+    # der Trade in Realitaet auf hl_max gekappt -> Anzeige korrigieren.
+    hl_max_lev = {}
+    try:
+        with get_coins_db() as cconn:
+            with cconn.cursor() as ccur:
+                ccur.execute("SELECT symbol, max_leverage FROM hl_meta WHERE max_leverage IS NOT NULL")
+                hl_max_lev = {r['symbol']: int(r['max_leverage']) for r in ccur.fetchall()}
+    except Exception as e:
+        print(f"[WALLET-HL] hl_meta max_leverage lookup failed: {e}")
+
     def _lookup_leverage(coin, fill_dt):
         from datetime import timedelta
+        lev = default_lev
         # 1. open_predictions (Predictor-Welt)
-        for sym, start, end, lev in pred_index:
+        for sym, start, end, l in pred_index:
             if sym == coin and start <= fill_dt <= end + timedelta(seconds=30):
-                return int(lev) if lev else 1
-        # 2. trader_positions (Trader-Welt) — fix fuer Faelle wo open_predictions
-        #    den Trade nicht im Window hat (z.B. Predictor closed schon gewatcht
-        #    aber Fragment-Close kam nach end_at). trader_positions ist Auto-Trade-Welt.
-        for sym, start, end, lev in trader_index:
-            if sym == coin and start <= fill_dt <= end + timedelta(seconds=30):
-                return int(lev) if lev else 1
-        # 3. Aktuelle HL-Position fuer diesen Coin (manuelle Trades, noch offen)
-        if coin in hl_position_levs:
-            return hl_position_levs[coin]
-        # 4. Settings-Default (Trade ohne DB-Spuren — selten)
-        return default_lev
+                lev = int(l) if l else 1
+                break
+        else:
+            # 2. trader_positions (Trader-Welt) — fix fuer Faelle wo open_predictions
+            #    den Trade nicht im Window hat (z.B. Predictor closed schon gewatcht
+            #    aber Fragment-Close kam nach end_at). trader_positions ist Auto-Trade-Welt.
+            for sym, start, end, l in trader_index:
+                if sym == coin and start <= fill_dt <= end + timedelta(seconds=30):
+                    lev = int(l) if l else 1
+                    break
+            else:
+                # 3. Aktuelle HL-Position fuer diesen Coin (manuelle Trades, noch offen)
+                if coin in hl_position_levs:
+                    lev = hl_position_levs[coin]
+                # 4. sonst bleibt default_lev
+        # Final-Cap gegen coin-spezifisches HL-Maximum (stetig statt hardcoded).
+        cap = hl_max_lev.get(coin)
+        return min(lev, cap) if cap else lev
 
     hl_address = get_user_hl_address(user_id)
     if hl_address:
@@ -761,6 +827,31 @@ async def get_hl_positions(current_user: dict = Depends(get_current_user)):
         except Exception as e:
             print(f"[WALLET-HL] predictor lookup failed (peak/trough): {e}")
 
+        # Trader-DB Lookup: timeout_enabled + opened_at fuer offene HL-Positionen
+        trader_lookup = {}  # key: (symbol, side) -> {timeout_enabled, opened_at}
+        try:
+            with get_app_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT symbol, side, timeout_enabled, opened_at
+                        FROM trader_positions WHERE status='open'
+                    """)
+                    for r in cur.fetchall():
+                        trader_lookup[(r['symbol'], r['side'])] = {
+                            'timeout_enabled': bool(r['timeout_enabled']),
+                            'opened_at': r['opened_at'].isoformat() if r['opened_at'] else None,
+                        }
+        except Exception as e:
+            print(f"[WALLET-HL] trader lookup failed: {e}")
+
+        # Settings-Timeout-Hours fuer Frontend (kein Hardcode)
+        try:
+            with open("/opt/coin/settings.json") as fp:
+                _s = json.load(fp)
+            timeout_hours = float(_s.get("predictor", {}).get("bandit", {}).get("timeout_hours", 2))
+        except Exception:
+            timeout_hours = 2.0
+
         positions = []
         for asset in state.get("assetPositions", []):
             pos = asset.get("position", {})
@@ -812,6 +903,7 @@ async def get_hl_positions(current_user: dict = Depends(get_current_user)):
                                 trough_pct = round((entry_px - mh) / entry_px * 100.0, 2)
                 except Exception as e:
                     print(f"[WALLET-HL] peak/trough fallback {coin}/{direction} failed: {e}")
+            t_info = trader_lookup.get((coin, direction), {})
             positions.append({
                 "coin": coin,
                 "direction": direction,
@@ -819,7 +911,7 @@ async def get_hl_positions(current_user: dict = Depends(get_current_user)):
                 "entry_price": entry_px,
                 "current_price": round(current_price, 6),
                 "position_value": round(position_value, 2),
-                "unrealized_pnl": round(unrealized_pnl, 2),
+                "unrealized_pnl": round(unrealized_pnl, 4),
                 "roe_percent": round(roe * 100, 2),
                 "leverage": leverage,
                 "leverage_type": leverage_type,
@@ -830,11 +922,41 @@ async def get_hl_positions(current_user: dict = Depends(get_current_user)):
                 "trough_pct": trough_pct,
                 "predictor_tp": pred_data.get("tp_px"),
                 "predictor_sl": pred_data.get("sl_px"),
+                # Trader-Welt: Timeout-Status pro Position + Opened-Zeitpunkt
+                "timeout_enabled": t_info.get('timeout_enabled', None),
+                "opened_at": t_info.get('opened_at', None),
             })
         positions.sort(key=lambda x: -abs(x['position_value']))
-        return {"positions": positions}
+        return {"positions": positions, "timeout_hours": timeout_hours}
     except Exception as e:
         print(f"[WALLET-HL] Error getting positions: {e}")
+        return {"error": str(e)}
+
+
+class HLTimeoutToggle(BaseModel):
+    enabled: bool
+
+
+@router.post("/hl/positions/{coin}/{side}/timeout")
+async def toggle_hl_position_timeout(coin: str, side: str, body: HLTimeoutToggle,
+                                       current_user: dict = Depends(get_current_user)):
+    """Toggelt timeout_enabled der offenen trader_positions-Row fuer (coin, side).
+    Trader-Welt only — keine Auswirkung auf open_predictions oder HL-Orders."""
+    if side not in ('long', 'short'):
+        return {"error": f"invalid side: {side}"}
+    try:
+        with get_app_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE trader_positions
+                    SET timeout_enabled=%s
+                    WHERE symbol=%s AND side=%s AND status='open'
+                """, (bool(body.enabled), coin, side))
+                n = cur.rowcount
+            conn.commit()
+        return {"ok": True, "updated": n, "timeout_enabled": bool(body.enabled)}
+    except Exception as e:
+        print(f"[WALLET-HL] timeout toggle {coin}/{side} failed: {e}")
         return {"error": str(e)}
 
 

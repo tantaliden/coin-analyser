@@ -18,8 +18,8 @@ DB_CONFIG = {
     'host': SETTINGS['databases']['coins']['host'],
     'port': SETTINGS['databases']['coins']['port'],
     'dbname': SETTINGS['databases']['coins']['name'],
-    'user': 'volker_admin',
-    'password': 'VoltiStrongPass2025'
+    'user': SETTINGS['databases']['coins']['user'],
+    'password': SETTINGS['databases']['coins']['password'],
 }
 DURATIONS = [30, 60, 90, 120, 180, 240, 300, 330, 360, 420, 480, 540, 600]
 
@@ -30,15 +30,15 @@ def backfill_symbol_day(conn, symbol, day_start, day_end):
     lookback_start = day_start - timedelta(minutes=660)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
-            SELECT open_time, open, close FROM klines
-            WHERE symbol = %s AND interval = '1m' AND open_time >= %s AND open_time <= %s
-            ORDER BY open_time
+            SELECT bucket AS open_time, open, close FROM agg_1m
+            WHERE symbol = %s AND bucket >= %s AND bucket <= %s
+            ORDER BY bucket
         """, (symbol, lookback_start, day_end))
         candles = cur.fetchall()
-    
+
     if len(candles) < 100:
         return 0
-    
+
     candle_map = {c['open_time']: c for c in candles}
     
     cols = ["symbol", "open_time"]
@@ -87,14 +87,14 @@ def main():
     start_str = sys.argv[1] if len(sys.argv) > 1 else '2026-01-22'
     end_str = sys.argv[2] if len(sys.argv) > 2 else datetime.now().strftime('%Y-%m-%d')
     
-    start = datetime.strptime(start_str, '%Y-%m-%d')
-    end = datetime.strptime(end_str, '%Y-%m-%d')
+    start = BERLIN_TZ.localize(datetime.strptime(start_str, '%Y-%m-%d'))
+    end = BERLIN_TZ.localize(datetime.strptime(end_str, '%Y-%m-%d'))
     
     log(f"Backfill metrics: {start_str} -> {end_str}")
     
     conn = psycopg2.connect(**DB_CONFIG)
     with conn.cursor() as cur:
-        cur.execute("SELECT DISTINCT symbol FROM klines WHERE interval='1m' ORDER BY symbol")
+        cur.execute("SELECT DISTINCT symbol FROM agg_1m ORDER BY symbol")
         symbols = [r[0] for r in cur.fetchall()]
     log(f"{len(symbols)} symbols")
     

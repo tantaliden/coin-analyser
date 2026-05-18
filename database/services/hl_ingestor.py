@@ -37,6 +37,8 @@ class HLState:
         self.latest_l2: dict = {}      # symbol -> {bids, asks} letzter L2-Snapshot
         self.subscribed: set = set()
         self.last_l2_ts: dict = {}
+        self.last_ctx_update_ts: dict = {}    # symbol -> time.time() beim letzten ctx-WS-update
+        self.last_l2_update_ts: dict = {}     # symbol -> time.time() beim letzten l2-WS-update
         self.bucket_collector: BucketCollector = None
         self.pending_ctx_rows: list = []
         self.pending_l2_rows: list = []
@@ -52,26 +54,54 @@ async def fetch_meta(info_url: str) -> list:
     return data["universe"]
 
 
-async def task_meta(cfg: dict, state: HLState, on_new_symbols):
-    """Periodisch Meta holen, hl_meta updaten, neue Symbole rueckmelden."""
+async def fetch_all_mids(info_url: str) -> dict:
+    """REST /info allMids -> {symbol: mid_price_str}. Wir parsen daraus die price_decimals."""
+    async with aiohttp.ClientSession() as s:
+        async with s.post(info_url, json={"type": "allMids"}) as r:
+            r.raise_for_status()
+            return await r.json()
+
+
+def _price_decimals_from_str(px_str) -> int:
+    """HL liefert markPx als String wie '78325.5'. Anzahl Nachkommastellen = price_decimals."""
+    s = str(px_str)
+    if '.' not in s: return 0
+    return len(s.split('.', 1)[1])
+
+
+async def task_meta(cfg: dict, state: HLState, on_new_symbols, on_delisted):
+    """Periodisch Meta holen, hl_meta updaten, neue Symbole rueckmelden, Zombies unsubscriben.
+    Plus: price_decimals aus allMids parsen und mitschreiben (Volker-Wunsch: konsistente Rundung)."""
     url = cfg["info_url"]
     interval = cfg["meta_refresh_seconds"]
     db_cfg = load_settings()
     while True:
         try:
             universe = await fetch_meta(url)
+            try:
+                mids = await fetch_all_mids(url)
+            except Exception as e:
+                log.warning("allMids fetch failed: %s -- price_decimals nicht aktualisiert in diesem Refresh", e)
+                mids = {}
+            active = [u for u in universe if not u.get("isDelisted", False)]
+            delisted_set = {u["name"] for u in universe if u.get("isDelisted", False)}
             rows = [{
                 "symbol": u["name"],
                 "sz_decimals": u.get("szDecimals"),
                 "max_leverage": u.get("maxLeverage"),
                 "margin_table_id": u.get("marginTableId"),
-            } for u in universe]
+                "price_decimals": _price_decimals_from_str(mids[u["name"]]) if u["name"] in mids else None,
+            } for u in active]
             with get_conn(db_cfg) as conn:
                 upsert_meta(conn, rows)
             new_syms = [r["symbol"] for r in rows if r["symbol"] not in state.subscribed]
-            log.info("meta refresh: %d coins total, %d new", len(rows), len(new_syms))
+            zombie_syms = sorted(s for s in state.subscribed if s in delisted_set)
+            log.info("meta refresh: %d active, %d delisted (%d zombies subscribed), %d new",
+                     len(rows), len(delisted_set), len(zombie_syms), len(new_syms))
             if new_syms:
                 await on_new_symbols(new_syms)
+            if zombie_syms:
+                await on_delisted(zombie_syms)
         except Exception as e:
             log.exception("meta task error: %s", e)
         await asyncio.sleep(interval)
@@ -98,10 +128,25 @@ async def task_ws(cfg: dict, state: HLState):
                     except Exception:
                         pass
 
+    async def on_delisted(syms):
+        # Delisted Coins: aus subscribed entfernen + WS-Unsubscribe — keine neuen Rows mehr
+        for c in syms:
+            state.subscribed.discard(c)
+        if state.ws_conn is not None:
+            for c in syms:
+                for t in ("trades", "activeAssetCtx", "l2Book"):
+                    try:
+                        await state.ws_conn.send(json.dumps({
+                            "method": "unsubscribe",
+                            "subscription": {"type": t, "coin": c}}))
+                    except Exception:
+                        pass
+        log.info("Unsubscribed %d zombie coins: %s", len(syms), syms)
+
     state.ws_conn = None
 
     # Starte Meta-Task parallel (triggert initiales Subscriben via on_new_symbols)
-    asyncio.create_task(task_meta(cfg, state, on_new_symbols))
+    asyncio.create_task(task_meta(cfg, state, on_new_symbols, on_delisted))
 
     # Warte bis wir die initiale Coin-Liste haben
     while not state.subscribed:
@@ -160,6 +205,7 @@ async def handle_msg(raw: str, state: HLState, cfg: dict, db_cfg: dict):
             "prev_day_px": _f(ctx.get("prevDayPx")),
         }
         state.latest_ctx[coin] = row
+        state.last_ctx_update_ts[coin] = time.time()
         state.pending_ctx_rows.append(row)
     elif ch == "l2Book":
         ts_ms = int(data.get("time", time.time() * 1000))
@@ -169,6 +215,7 @@ async def handle_msg(raw: str, state: HLState, cfg: dict, db_cfg: dict):
         asks = levels[1] if len(levels) > 1 else []
         # Immer latest_l2 aktualisieren (fuer BBO-Features beim Bucket-Close)
         state.latest_l2[coin] = {"bids": bids, "asks": asks}
+        state.last_l2_update_ts[coin] = time.time()
         # Throttle fuer DB-Insert der Full-Snapshots (hl_l2_snapshot)
         last = state.last_l2_ts.get(coin, 0)
         now = time.time()
@@ -199,9 +246,21 @@ async def task_flush(cfg: dict, state: HLState):
             closed = state.bucket_collector.drain(
                 now, state.latest_ctx, state.subscribed, grace_seconds=cfg["bucket_grace_seconds"])
             klines_rows = []
+            cap_age = float(cfg.get("live_value_max_age_seconds", 60))
+            now_mono_for_age = time.time()
             for b in closed:
-                last = state.latest_ctx.get(b.symbol, {}) or {}
-                bbo = compute_bbo(state.latest_l2.get(b.symbol))
+                # Cap fuer ctx: wenn Wert zu alt -> nicht mehr stempeln (gap-recovery soll greifen)
+                ctx_age = now_mono_for_age - state.last_ctx_update_ts.get(b.symbol, 0)
+                if ctx_age <= cap_age:
+                    last = state.latest_ctx.get(b.symbol, {}) or {}
+                else:
+                    last = {}
+                # Cap fuer L2 analog
+                l2_age = now_mono_for_age - state.last_l2_update_ts.get(b.symbol, 0)
+                if l2_age <= cap_age:
+                    bbo = compute_bbo(state.latest_l2.get(b.symbol))
+                else:
+                    bbo = compute_bbo(None)
                 klines_rows.append({
                     "symbol": b.symbol,
                     "interval": "10s",
@@ -223,12 +282,12 @@ async def task_flush(cfg: dict, state: HLState):
                     "bbo_bid_sz": bbo["bbo_bid_sz"],
                     "bbo_ask_sz": bbo["bbo_ask_sz"],
                     "spread_bps": bbo["spread_bps"],
+                    "book_imbalance_5": bbo["book_imbalance_5"],
+                    "book_depth_5": bbo["book_depth_5"],
                     "book_imbalance_10": bbo["book_imbalance_10"],
                     "book_depth_10": bbo["book_depth_10"],
                     "book_imbalance_20": bbo["book_imbalance_20"],
                     "book_depth_20": bbo["book_depth_20"],
-                    "book_imbalance_5": bbo["book_imbalance_5"],
-                    "book_depth_5": bbo["book_depth_5"],
                 })
             now_mono = time.time()
             flush_ctx = (now_mono - state.ctx_last_flush) >= ctx_debounce and state.pending_ctx_rows

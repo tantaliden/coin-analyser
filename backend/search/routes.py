@@ -39,16 +39,19 @@ class EventSearchRequest(BaseModel):
 
 # === HELPERS ===
 
+
+# HL-Symbol-Mapping: legacy coin_info/coin_group_members nutzen "BONKUSDC",
+# klines/kline_metrics nutzen HL-Form "BONK". Strippe USDC-Suffix.
+def _to_hl_symbol(s: str) -> str:
+    if not s: return s
+    return s[:-4] if s.endswith("USDC") else s
+
 def get_table_for_interval(interval: str) -> str:
     mapping = {
-        '1m': 'klines', '2m': 'agg_2m', '5m': 'agg_5m', '10m': 'agg_10m',
-        '15m': 'agg_15m', '30m': 'agg_30m', '1h': 'agg_1h', '2h': 'agg_2h',
-        '4h': 'agg_4h', '6h': 'agg_6h', '12h': 'agg_12h', '1d': 'agg_1d',
-        '3d': 'agg_3d', '7d': 'agg_7d', '14d': 'agg_14d', '30d': 'agg_30d',
-        '1mo': 'agg_1mo', '2mo': 'agg_2mo', '3mo': 'agg_3mo', '6mo': 'agg_6mo',
-        '1y': 'agg_1y', '2y': 'agg_2y', '3y': 'agg_3y',
+        '1m': 'klines_1m', '5m': 'klines_5m', '15m': 'klines_15m', '30m': 'klines_30m',
+        '1h': 'klines_1h', '4h': 'klines_4h', '1d': 'klines_1d',
     }
-    return mapping.get(interval, 'klines')
+    return mapping.get(interval, 'klines_1m')
 
 # === ROUTES ===
 
@@ -64,6 +67,7 @@ async def search_events_get(
     weekdays: str = "",
     hour_start: int = -1,
     hour_end: int = -1,
+    hl_only: bool = True,
     limit: int = 100000,
     current_user: dict = Depends(get_current_user)
 ):
@@ -102,8 +106,20 @@ async def search_events_get(
         if group_ids:
             with get_app_db() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT DISTINCT symbol FROM coin_group_items WHERE group_id = ANY(%s)", (group_ids,))
-                    symbols = [row['symbol'] for row in cur.fetchall()]
+                    cur.execute("SELECT DISTINCT symbol FROM coin_group_members WHERE group_id = ANY(%s)", (group_ids,))
+                    symbols = [_to_hl_symbol(row['symbol']) for row in cur.fetchall()]
+    
+    # HL-Only Filter
+    if hl_only:
+        with get_app_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT symbol FROM coin_info WHERE hl_sz_decimals IS NOT NULL")
+                hl_symbols = set(_to_hl_symbol(row['symbol']) for row in cur.fetchall())
+        symbols = [_to_hl_symbol(s) for s in symbols]
+        if symbols:
+            symbols = [s for s in symbols if s in hl_symbols]
+        else:
+            symbols = list(hl_symbols)
     
     pct_column = f"pct_{duration_minutes}m"
     events = []
@@ -265,7 +281,7 @@ async def search_events(request: EventSearchRequest, current_user: dict = Depend
                     
                     cur.execute("""
                         SELECT open_time, open, high, low, close, volume, trades
-                        FROM klines WHERE symbol = %s AND interval = '1m'
+                        FROM klines_1m WHERE symbol = %s
                           AND open_time >= %s AND open_time <= %s
                         ORDER BY open_time
                     """, (symbol, event_start_time, event_end_time))
@@ -346,38 +362,50 @@ async def get_candles(
         raise HTTPException(status_code=400, detail="Invalid datetime format")
     
     table = get_table_for_interval(interval)
-    time_col = 'open_time' if table == 'klines' else 'bucket'
-    
     with get_coins_db() as conn:
         with conn.cursor() as cur:
-            if table == 'klines':
-                query = f"""
-                    SELECT {time_col} as time, open, high, low, close, volume, trades, quote_asset_volume, taker_buy_base, taker_buy_quote
-                    FROM {table} WHERE symbol = %s AND interval = '1m' AND {time_col} >= %s AND {time_col} <= %s
-                    ORDER BY {time_col}
-                """
-            else:
-                query = f"""
-                    SELECT {time_col} as time, open, high, low, close, volume, number_of_trades as trades, quote_asset_volume, taker_buy_base_asset_volume as taker_buy_base, taker_buy_quote_asset_volume as taker_buy_quote
-                    FROM {table} WHERE symbol = %s AND {time_col} >= %s AND {time_col} <= %s
-                    ORDER BY {time_col}
-                """
+            query = f"""
+                SELECT open_time as time, open, high, low, close, volume, trades,
+                       quote_asset_volume, taker_buy_base, taker_buy_quote,
+                       funding, open_interest, premium, oracle_px, mark_px, mid_px,
+                       bbo_bid_px, bbo_ask_px, bbo_bid_sz, bbo_ask_sz,
+                       spread_bps, book_imbalance_5, book_depth_5
+                FROM {table}
+                WHERE symbol = %s AND open_time >= %s AND open_time <= %s
+                ORDER BY open_time
+            """
             cur.execute(query, (symbol, start_dt, end_dt))
             rows = cur.fetchall()
-    
+
+    def _fnum(v):
+        return float(v) if v is not None else None
+
     candles = []
     for row in rows:
         candles.append({
             "time": int(row['time'].timestamp()),
-            "open": float(row['open']),
-            "high": float(row['high']),
-            "low": float(row['low']),
-            "close": float(row['close']),
-            "volume": float(row['volume']),
+            "open": _fnum(row['open']),
+            "high": _fnum(row['high']),
+            "low": _fnum(row['low']),
+            "close": _fnum(row['close']),
+            "volume": _fnum(row['volume']),
             "trades": int(row['trades'] or 0),
-            "quote_asset_volume": float(row['quote_asset_volume'] or 0),
-            "taker_buy_base": float(row['taker_buy_base'] or 0),
-            "taker_buy_quote": float(row['taker_buy_quote'] or 0)
+            "quote_asset_volume": _fnum(row['quote_asset_volume']),
+            "taker_buy_base": _fnum(row['taker_buy_base']),
+            "taker_buy_quote": _fnum(row['taker_buy_quote']),
+            "funding": _fnum(row.get('funding')),
+            "open_interest": _fnum(row.get('open_interest')),
+            "premium": _fnum(row.get('premium')),
+            "oracle_px": _fnum(row.get('oracle_px')),
+            "mark_px": _fnum(row.get('mark_px')),
+            "mid_px": _fnum(row.get('mid_px')),
+            "bbo_bid_px": _fnum(row.get('bbo_bid_px')),
+            "bbo_ask_px": _fnum(row.get('bbo_ask_px')),
+            "bbo_bid_sz": _fnum(row.get('bbo_bid_sz')),
+            "bbo_ask_sz": _fnum(row.get('bbo_ask_sz')),
+            "spread_bps": _fnum(row.get('spread_bps')),
+            "book_imbalance_5": _fnum(row.get('book_imbalance_5')),
+            "book_depth_5": _fnum(row.get('book_depth_5')),
         })
     
     return {"symbol": symbol, "interval": interval, "candles": candles, "count": len(candles)}
@@ -525,3 +553,29 @@ async def cascade_filter(
         "total_matched": len(matched),
         "match_rate": match_rate
     }
+
+
+@router.get("/day-open")
+async def get_day_open(
+    symbol: str,
+    date: str,  # YYYY-MM-DD in Berlin TZ
+    current_user: dict = Depends(get_current_user)
+):
+    """Liefert den Open-Preis der ersten Candle des Tages (00:00 Berlin) fuer ein Symbol."""
+    try:
+        day_start = BERLIN_TZ.localize(datetime.strptime(date, "%Y-%m-%d"))
+        day_end = day_start + timedelta(days=1)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date: {e}")
+    
+    with get_coins_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT open_time, open FROM klines
+                WHERE symbol = %s AND open_time >= %s AND open_time < %s
+                ORDER BY open_time LIMIT 1
+            """, (symbol, day_start, day_end))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail=f"No klines for {symbol} on {date}")
+            return {"symbol": symbol, "date": date, "open": float(row['open']), "open_time": row['open_time'].isoformat()}

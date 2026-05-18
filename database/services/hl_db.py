@@ -62,26 +62,49 @@ def insert_klines_10s(conn, rows):
 
 
 def insert_asset_ctx(conn, rows):
-    # LEAN (Test-Server Backup): keine hl_asset_ctx-Tabelle.
-    return
+    if not rows:
+        return
+    with conn.cursor() as cur:
+        execute_values(cur, """
+            INSERT INTO hl_asset_ctx
+              (symbol, ts, funding, open_interest, premium,
+               oracle_px, mark_px, mid_px, impact_bid, impact_ask,
+               day_ntl_vlm, day_base_vlm, prev_day_px)
+            VALUES %s
+            ON CONFLICT (symbol, ts) DO NOTHING
+        """, [(
+            r["symbol"], r["ts"], r["funding"], r["open_interest"], r["premium"],
+            r["oracle_px"], r["mark_px"], r["mid_px"], r["impact_bid"], r["impact_ask"],
+            r["day_ntl_vlm"], r["day_base_vlm"], r["prev_day_px"]
+        ) for r in rows])
+    conn.commit()
 
 
 def insert_l2_snapshot(conn, rows):
-    # LEAN (Test-Server Backup): keine hl_l2_snapshot-Tabelle.
-    return
+    if not rows:
+        return
+    with conn.cursor() as cur:
+        execute_values(cur, """
+            INSERT INTO hl_l2_snapshot (symbol, ts, bids, asks)
+            VALUES %s
+            ON CONFLICT (symbol, ts) DO NOTHING
+        """, [(r["symbol"], r["ts"], json.dumps(r["bids"]), json.dumps(r["asks"])) for r in rows])
+    conn.commit()
 
 
 def upsert_meta(conn, rows):
     if not rows:
         return
     with conn.cursor() as cur:
+        # price_decimals: COALESCE behaelt vorhandenen Wert wenn neu None ist (allMids-Fetch fehlgeschlagen)
         execute_values(cur, """
-            INSERT INTO hl_meta (symbol, sz_decimals, max_leverage, margin_table_id)
+            INSERT INTO hl_meta (symbol, sz_decimals, max_leverage, margin_table_id, price_decimals)
             VALUES %s
             ON CONFLICT (symbol) DO UPDATE SET
               sz_decimals=EXCLUDED.sz_decimals,
               max_leverage=EXCLUDED.max_leverage,
               margin_table_id=EXCLUDED.margin_table_id,
+              price_decimals=COALESCE(EXCLUDED.price_decimals, hl_meta.price_decimals),
               updated_at=now()
-        """, [(r["symbol"], r["sz_decimals"], r["max_leverage"], r["margin_table_id"]) for r in rows])
+        """, [(r["symbol"], r["sz_decimals"], r["max_leverage"], r["margin_table_id"], r.get("price_decimals")) for r in rows])
     conn.commit()

@@ -273,8 +273,12 @@ def place_limit_order_hl(creds: dict, coin: str, is_buy: bool, size_usd: float,
 
         # Leverage setzen — gecached pro Coin/User (5min) damit nicht bei jeder Order ein
         # Extra-RTT zur HL-API gemacht wird (spart ~300-500ms pro Order).
-        max_lev = coin_info.get("max_leverage", 5)
-        leverage = min(leverage, max_lev)
+        max_lev = coin_info.get("max_leverage")
+        if max_lev is None:
+            err = f"FALLBACK_TRIGGERED place_limit_order_hl {coin}: max_leverage in coin_info fehlt -> order rejected"
+            print(f"[RL-TRADER] {err}")
+            return {"success": False, "error": err}
+        leverage = min(leverage, int(max_lev))
         _maybe_update_leverage(exchange, coin, leverage, creds.get("wallet_address", ""))
 
         # Market Order via SDK (aggressive IOC, max slippage_pct % Slippage)
@@ -402,7 +406,11 @@ def place_tp_sl_hl(creds: dict, coin: str, is_long: bool, quantity,
     """
     try:
         coin_info = _get_hl_coin_info(coin)
-        sz_dec = int(coin_info["sz_decimals"]) if coin_info else 0
+        if not coin_info:
+            err = f"FALLBACK_TRIGGERED place_tp_sl_hl {coin}: coin_info None -> TP/SL rejected"
+            print(f"[RL-TRADER] {err}")
+            return {"success": False, "error": err}
+        sz_dec = int(coin_info["sz_decimals"])
         quantity = float(quantity)
         # HL-konforme Rundung: max (6-szDec) Decimals UND max 5 sig figs
         tp_price = round_hl_price(tp_price, sz_dec)
@@ -493,7 +501,11 @@ def update_tp_only_hl(creds: dict, coin: str, is_long: bool, quantity, new_tp_pr
     DB wird nicht beruehrt (Predictor-Lernautonomie)."""
     try:
         coin_info = _get_hl_coin_info(coin)
-        price_dec = coin_info["price_decimals"] if coin_info else 5
+        if not coin_info:
+            err = f"FALLBACK_TRIGGERED update_tp_only_hl {coin}: coin_info None -> rejected"
+            print(f"[RL-TRADER] {err}")
+            return {"success": False, "error": err}
+        price_dec = coin_info["price_decimals"]
         quantity = float(quantity)
         tp_price = round(float(new_tp_price), price_dec)
 

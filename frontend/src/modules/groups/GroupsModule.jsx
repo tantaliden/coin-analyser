@@ -20,6 +20,7 @@ export default function GroupsModule() {
   const [networks, setNetworks] = useState([])
   const [categories, setCategories] = useState([])
   const [coinsLoading, setCoinsLoading] = useState(false)
+  const [hlOnly, setHlOnly] = useState(true)
 
   // Sort state
   const [sortCol, setSortCol] = useState('symbol')
@@ -50,7 +51,8 @@ export default function GroupsModule() {
       const params = new URLSearchParams()
       if (coinSearch) params.set('search', coinSearch)
       if (networkFilter) params.set('network', networkFilter)
-      if (categoryFilter) params.set('category', categoryFilter)
+      if (categoryFilter) params.set("category", categoryFilter)
+      if (hlOnly) params.set("hl_only", "true")
       const res = await api.get(`/api/v1/coins?${params}`)
       setCoins(res.data.coins || [])
     } catch {}
@@ -58,7 +60,7 @@ export default function GroupsModule() {
   }
 
   useEffect(() => { loadGroups(); loadFilters() }, [])
-  useEffect(() => { if (showCoinPicker) loadCoins() }, [showCoinPicker, coinSearch, networkFilter, categoryFilter])
+  useEffect(() => { if (showCoinPicker) loadCoins() }, [showCoinPicker, coinSearch, networkFilter, categoryFilter, hlOnly])
 
   // Debounce search
   const [searchTimeout, setSearchTimeout] = useState(null)
@@ -220,6 +222,7 @@ export default function GroupsModule() {
                     <option value="">Alle Kategorien</option>
                     {categories.map(c => <option key={c} value={c}>{c}</option>)}
                   </select>
+<label className="flex items-center gap-1 cursor-pointer">                    <div className={`relative w-8 h-4 rounded-full transition-colors ${hlOnly ? "bg-blue-600" : "bg-gray-600"}`}                      onClick={() => setHlOnly(!hlOnly)}>                      <div className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-transform ${hlOnly ? "translate-x-4" : "translate-x-0.5"}`} />                    </div>                    <span className="text-[10px] text-gray-400">HL</span>                  </label>
                   <span className="text-gray-500 ml-1">{sortedCoins.length}</span>
                 </div>
 

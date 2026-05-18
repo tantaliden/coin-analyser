@@ -2,23 +2,35 @@
 venv/
 __pycache__/
 *.pyc
-.env
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
 
-# Node
+# Node / Frontend
 node_modules/
-dist/
+frontend/dist/
+npm-debug.log*
 
 # Logs
 logs/
 *.log
 
-# Alt/Backup
-alt/
+# Database Binaries & Models (147 MB)
+database/data/
 
-# Large data files
-database/data/checkpoints/
-*.pkl
+# Backups & temp
+*.backup_*
+*.bak_*
+*.bak
+*~
+.DS_Store
 
-# IDE
-.vscode/
-.idea/
+# Secrets
+settings.json
+settings_analyse.json
+**/settings*.json
+.env
+*.pem
+*.key

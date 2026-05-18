@@ -375,8 +375,11 @@ def scan_entries(model, app_conn, creds, wallet_address, state, coins_conn):
     try:
         with app_conn.cursor() as cur:
             cur.execute("SELECT symbol FROM coin_info WHERE blacklisted = true")
-            blacklisted = {r['symbol'] for r in cur.fetchall()}
-    except:
+            blacklisted = {r['symbol'] if hasattr(r, 'get') else r[0] for r in cur.fetchall()}
+        app_conn.commit()
+    except Exception:
+        try: app_conn.rollback()
+        except Exception: pass
         blacklisted = set()
 
     # Alle HL-Coins holen

@@ -70,8 +70,8 @@ MGMT_INTERVAL = 300         # Position-Management alle 5 Min (wie im Training)
 
 SL_PERCENT = None           # Kein SL
 MAX_POSITION_AGE = None     # Kein Timeout
-MAX_CONCURRENT_START = 10
-MAX_CONCURRENT_FULL = 10
+MAX_CONCURRENT_START = 15
+MAX_CONCURRENT_FULL = 15
 MAX_CONCURRENT_THRESHOLD = 1500.0
 
 FEE_RATE = 0.00035          # 0.035% pro Seite (Hyperliquid Taker)
@@ -472,7 +472,6 @@ def _finalize_close(app_conn, state, pos, current_price, exit_price, pnl_pct, ex
         'entry_price': float(pos['entry_price']),
         'pnl_pct': pnl_pct,
         'reward': reward,
-        'action': leverage if direction == 'long' else leverage + 10,
     })
 
 
@@ -931,11 +930,7 @@ def experience_learn(model, experiences):
         env._replay_rewards = {}
         for e in experiences:
             key = (e['symbol'], e['entry_time'].isoformat()[:16])
-            env._replay_rewards[key] = {
-                'reward': e['reward'],
-                'direction': e['direction'],
-                'pnl_pct': e['pnl_pct'],
-            }
+            env._replay_rewards[key] = e['reward']
 
         model.set_env(env)
         model.learn(total_timesteps=LEARN_STEPS, reset_num_timesteps=False)

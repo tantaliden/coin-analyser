@@ -11,6 +11,7 @@ export default function WalletModule() {
   const [hlBalance, setHlBalance] = useState(null)
   const [positions, setPositions] = useState([])
   const [hlPositions, setHlPositions] = useState([])
+  const [timeoutHours, setTimeoutHours] = useState(2)
   const [orders, setOrders] = useState([])
   const [hlOrders, setHlOrders] = useState([])
   const [history, setHistory] = useState([])
@@ -30,6 +31,12 @@ export default function WalletModule() {
   const [selectedCoins, setSelectedCoins] = useState(new Set())
   const [closing, setClosing] = useState(false)
   const [histSort, setHistSort] = useState({ col: 'executed_at', asc: false })
+  const [posSort, setPosSort] = useState({ col: '', asc: false })
+  const [quickTPs, setQuickTPs] = useState([0.5, 1, 2, 3])
+  const [editingQuickTPs, setEditingQuickTPs] = useState(false)
+  const [newQuickTP, setNewQuickTP] = useState('')
+  const [tpUpdating, setTpUpdating] = useState(false)
+  const [tpMsg, setTpMsg] = useState(null)
 
   const loadData = useCallback(async () => {
     setLoading(true)
@@ -78,12 +85,29 @@ export default function WalletModule() {
       setRealizedPnl(pnlRes?.data || null)
       if (hlBalRes) setHlBalance(hlBalRes.data?.error ? null : hlBalRes.data)
       setHlPositions(hlPosRes?.data?.positions || [])
+      setTimeoutHours(hlPosRes?.data?.timeout_hours ?? 2)
       setHlOrders(hlOrdRes?.data?.orders || [])
     } catch (err) { setError('Fehler beim Laden') }
     finally { setLoading(false) }
   }, [])
 
-  useEffect(() => { loadData(); const i = setInterval(loadData, 5000); return () => clearInterval(i) }, [loadData])
+  useEffect(() => {
+    loadData()
+    let inFlight = false
+    const tick = async () => {
+      if (inFlight) return
+      inFlight = true
+      try { await loadData() } finally { inFlight = false }
+    }
+    const i = setInterval(tick, 1000)
+    return () => clearInterval(i)
+  }, [loadData])
+
+  useEffect(() => {
+    api.get('/api/v1/wallet/hl/quick-tp-percentages')
+      .then(r => { if (Array.isArray(r.data?.values)) setQuickTPs(r.data.values) })
+      .catch(() => {})
+  }, [])
 
   const cancelOrder = async (symbol, orderId) => {
     if (!confirm(`Order ${orderId} stornieren?`)) return
@@ -131,9 +155,74 @@ export default function WalletModule() {
     setClosing(false)
   }
 
+  const toggleTimeout = async (coin, side, currentEnabled) => {
+    try {
+      await api.post(`/api/v1/wallet/hl/positions/${coin}/${side}/timeout`,
+                     { enabled: !currentEnabled })
+      setHlPositions(prev => prev.map(p =>
+        (p.coin === coin && p.direction === side) ? { ...p, timeout_enabled: !currentEnabled } : p))
+    } catch (e) { alert('Timeout-Toggle fehlgeschlagen') }
+  }
+
+  const fmtHM = (iso) => {
+    if (!iso) return ''
+    try { const d = new Date(iso); return d.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' }) }
+    catch { return '' }
+  }
+
   const toggleHistSort = (col) => {
     setHistSort(prev => prev.col === col ? { col, asc: !prev.asc } : { col, asc: false })
   }
+  const togglePosSort = (col) => {
+    setPosSort(prev => prev.col === col ? { col, asc: !prev.asc } : { col, asc: false })
+  }
+  const posSortIcon = (col) => posSort.col === col ? (posSort.asc ? ' ▲' : ' ▼') : ''
+  const sortedHlPositions = posSort.col ? [...hlPositions].sort((a, b) => {
+    const { col, asc } = posSort
+    const get = (p) => col === 'pnl_pct'
+      ? (p.roe_percent ?? (p.margin_used > 0 ? p.unrealized_pnl / p.margin_used * 100 : 0))
+      : p[col]
+    let va = get(a), vb = get(b)
+    if (va == null) va = ''
+    if (vb == null) vb = ''
+    if (typeof va === 'string') return asc ? va.localeCompare(vb) : vb.localeCompare(va)
+    return asc ? va - vb : vb - va
+  }) : hlPositions
+  const allHlSelected = sortedHlPositions.length > 0 && sortedHlPositions.every(p => selectedCoins.has(p.coin))
+  const someHlSelected = sortedHlPositions.some(p => selectedCoins.has(p.coin))
+  const toggleAllHl = () => {
+    if (allHlSelected) setSelectedCoins(new Set())
+    else setSelectedCoins(new Set(sortedHlPositions.map(p => p.coin)))
+  }
+  const applyTP = async (pct) => {
+    if (selectedCoins.size === 0) return
+    if (!confirm(`TP auf ${pct}% (vor Hebel) für ${selectedCoins.size} Position(en) setzen?`)) return
+    setTpUpdating(true); setTpMsg(null)
+    try {
+      const r = await api.post('/api/v1/wallet/hl/update-tp', { coins: [...selectedCoins], tp_pct: pct })
+      const ok = (r.data.results || []).filter(x => x.success).length
+      const fail = (r.data.results || []).filter(x => !x.success)
+      setTpMsg(`${ok} OK${fail.length ? `, ${fail.length} Fehler` : ''}`)
+      if (fail.length) console.warn('TP-Update Fehler:', fail)
+      loadData()
+    } catch (e) { setTpMsg('Fehler: ' + (e.response?.data?.detail || e.message)) }
+    setTpUpdating(false)
+    setTimeout(() => setTpMsg(null), 4000)
+  }
+  const saveQuickTPs = async (next) => {
+    try {
+      const r = await api.put('/api/v1/wallet/hl/quick-tp-percentages', { values: next })
+      if (r.data?.values) setQuickTPs(r.data.values)
+    } catch {}
+  }
+  const addQuickTP = () => {
+    const v = parseFloat(newQuickTP)
+    if (!v || v <= 0) return
+    const next = [...new Set([...quickTPs, Math.round(v * 100) / 100])].sort((a, b) => a - b)
+    setNewQuickTP('')
+    saveQuickTPs(next)
+  }
+  const removeQuickTP = (val) => saveQuickTPs(quickTPs.filter(v => v !== val))
   const sortedHistory = [...history].sort((a, b) => {
     const { col, asc } = histSort
     let va = a[col], vb = b[col]
@@ -192,7 +281,8 @@ export default function WalletModule() {
   const totalUPnl = positions.reduce((s, p) => s + (p.unrealized_pnl || 0), 0)
   const hlUPnl = hlPositions.reduce((s, p) => s + (p.unrealized_pnl || 0), 0)
   const binanceTotal = balance?.total_portfolio || 0
-  const hlTotal = hlBalance?.account_value || 0
+  const hlTotal = hlBalance?.equity ?? hlBalance?.account_value ?? 0
+  const hlAvail = hlBalance?.available ?? 0
   const grandTotal = binanceTotal + hlTotal
 
   return (
@@ -220,10 +310,10 @@ export default function WalletModule() {
           {hlBalance && (
             <>
               <div><span className="text-emerald-500 font-semibold">HL</span> <span className="font-mono">${fp(hlTotal)}</span></div>
-              {hlBalance.account_value > 0 && (
+              {hlAvail > 0 && (
                 <div className="flex items-center gap-1">
                   <span className="text-zinc-500">Frei</span>
-                  <span className="font-mono text-emerald-300">${fp(hlBalance.account_value - (hlBalance.notional_positions || 0))}</span>
+                  <span className="font-mono text-emerald-300">${fp(hlAvail)}</span>
                 </div>
               )}
               {hlUPnl !== 0 && <div className={hlUPnl >= 0 ? 'text-green-400' : 'text-red-400'}>{fPnl(hlUPnl)}</div>}
@@ -326,48 +416,115 @@ export default function WalletModule() {
         )}
 
         {activeTab === 'positions' && posSource === 'hyperliquid' && (<>
+          <div className="px-2 py-1.5 border-b border-zinc-800 flex items-center gap-2 flex-wrap bg-zinc-800/40">
+            <span className="text-zinc-500">TP setzen (% vor Hebel):</span>
+            {quickTPs.map(v => (
+              <span key={v} className="flex items-center">
+                <button onClick={() => applyTP(v)} disabled={selectedCoins.size === 0 || tpUpdating}
+                  className="px-2 py-0.5 rounded bg-blue-700 hover:bg-blue-600 disabled:opacity-30 disabled:cursor-not-allowed text-xs font-mono">
+                  {v}%
+                </button>
+                {editingQuickTPs && (
+                  <button onClick={() => removeQuickTP(v)} title="Entfernen"
+                    className="ml-0.5 text-red-400 hover:text-red-300"><X className="w-3 h-3" /></button>
+                )}
+              </span>
+            ))}
+            {editingQuickTPs && (
+              <span className="flex items-center gap-1">
+                <input type="number" value={newQuickTP} onChange={e => setNewQuickTP(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') addQuickTP() }}
+                  placeholder="z.B. 1.5" step="0.1" min="0.01"
+                  className="w-16 bg-zinc-700 rounded px-1 py-0.5 text-xs" />
+                <button onClick={addQuickTP} className="px-1.5 py-0.5 bg-green-600 rounded text-xs">+</button>
+              </span>
+            )}
+            <button onClick={() => setEditingQuickTPs(!editingQuickTPs)} title={editingQuickTPs ? 'Fertig' : 'Werte bearbeiten'}
+              className={`ml-1 p-0.5 rounded ${editingQuickTPs ? 'text-blue-400' : 'text-zinc-500 hover:text-zinc-300'}`}>
+              <Edit2 className="w-3 h-3" />
+            </button>
+            {selectedCoins.size > 0 && (
+              <span className="text-zinc-400 ml-2">{selectedCoins.size} markiert</span>
+            )}
+            {tpMsg && <span className="text-zinc-300 ml-1">{tpMsg}</span>}
+            {selectedCoins.size > 0 && (
+              <button onClick={closeSelected} disabled={closing}
+                className="ml-auto px-3 py-1 bg-red-600 hover:bg-red-500 rounded text-xs font-semibold disabled:opacity-50">
+                {closing ? 'Schließe...' : `Close (${selectedCoins.size})`}
+              </button>
+            )}
+          </div>
           <table className="w-full">
             <thead className="sticky top-0 bg-zinc-900">
               <tr className="text-zinc-500 text-left">
-                <th className="px-2 py-1 font-normal">Coin</th>
-                <th className="px-2 py-1 font-normal text-center">Dir</th>
-                <th className="px-2 py-1 font-normal text-right">Size</th>
-                <th className="px-2 py-1 font-normal text-right">Einstieg</th>
-                <th className="px-2 py-1 font-normal text-right">Aktuell</th>
-                <th className="px-2 py-1 font-normal text-right">uPnL</th>
-                <th className="px-2 py-1 font-normal text-right">%</th>
-                <th className="px-2 py-1 font-normal text-center w-8"></th>
-                <th className="px-2 py-1 font-normal text-right">Hebel</th>
+                <th className="px-2 py-1 font-normal cursor-pointer hover:text-zinc-300" onClick={() => togglePosSort('coin')}>Coin{posSortIcon('coin')}</th>
+                <th className="px-2 py-1 font-normal text-center cursor-pointer hover:text-zinc-300" onClick={() => togglePosSort('direction')}>D/H{posSortIcon('direction')}</th>
+                <th className="px-2 py-1 font-normal text-right cursor-pointer hover:text-zinc-300" onClick={() => togglePosSort('entry_price')}>Einstieg{posSortIcon('entry_price')}</th>
+                <th className="px-2 py-1 font-normal text-right cursor-pointer hover:text-zinc-300" onClick={() => togglePosSort('peak_pct')} title="Maximale Profit-Bewegung waehrend Trade (aus Predictor-DB)">Peak{posSortIcon('peak_pct')}</th>
+                <th className="px-2 py-1 font-normal text-right cursor-pointer hover:text-zinc-300" onClick={() => togglePosSort('trough_pct')} title="Maximaler Drawdown waehrend Trade (aus Predictor-DB)">Trough{posSortIcon('trough_pct')}</th>
+                <th className="px-2 py-1 font-normal text-right cursor-pointer hover:text-zinc-300" onClick={() => togglePosSort('current_price')}>Aktuell{posSortIcon('current_price')}</th>
+                <th className="px-2 py-1 font-normal text-right cursor-pointer hover:text-zinc-300" onClick={() => togglePosSort('unrealized_pnl')}>uPnL{posSortIcon('unrealized_pnl')}</th>
+                <th className="px-2 py-1 font-normal text-right cursor-pointer hover:text-zinc-300" onClick={() => togglePosSort('pnl_pct')}>%{posSortIcon('pnl_pct')}</th>
+                <th className="px-2 py-1 font-normal text-center w-8">
+                  <input type="checkbox"
+                    ref={el => { if (el) el.indeterminate = someHlSelected && !allHlSelected }}
+                    checked={allHlSelected} onChange={toggleAllHl}
+                    className="rounded" title="Alle markieren" />
+                </th>
+                <th className="px-2 py-1 font-normal text-center w-8" title={`Timeout (${timeoutHours}h) ein/aus`}>T</th>
               </tr>
             </thead>
             <tbody>
-              {hlPositions.length === 0 ? (
-                <tr><td colSpan={9} className="text-center py-4 text-zinc-500">Keine offenen Positionen</td></tr>
-              ) : hlPositions.map((pos, i) => (
+              {sortedHlPositions.length === 0 ? (
+                <tr><td colSpan={10} className="text-center py-4 text-zinc-500">Keine offenen Positionen</td></tr>
+              ) : sortedHlPositions.map((pos, i) => (
                 <tr key={i} className="border-t border-zinc-800 hover:bg-zinc-800/50">
                   <td className="px-2 py-1 font-mono font-medium">{pos.coin}</td>
-                  <td className={`px-2 py-1 text-center font-semibold ${pos.direction === 'long' ? 'text-green-400' : 'text-red-400'}`}>
-                    {pos.direction === 'long' ? 'L' : 'S'}
+                  <td className="px-2 py-1 text-center font-semibold whitespace-nowrap">
+                    <span className={pos.direction === 'long' ? 'text-green-400' : 'text-red-400'}>
+                      {pos.direction === 'long' ? 'L' : 'S'}
+                    </span>
+                    <span className="text-amber-400 ml-1">{pos.leverage}x</span>
+                    {pos.timeout_enabled === false && (
+                      <span className="text-zinc-500 ml-0.5 line-through" title="Timeout deaktiviert">T</span>
+                    )}
                   </td>
-                  <td className="px-2 py-1 text-right font-mono">{fp(pos.size, 4)}</td>
-                  <td className="px-2 py-1 text-right font-mono">${fp(pos.entry_price, 4)}</td>
+                  <td className="px-2 py-1 text-right font-mono whitespace-nowrap">
+                    ${fp(pos.entry_price, 4)}
+                    {pos.opened_at && <span className="text-zinc-600 ml-1 text-[10px]">{fmtHM(pos.opened_at)}</span>}
+                  </td>
+                  <td className="px-2 py-1 text-right font-mono text-green-500"
+                      title="Peak: maximale Profit-Bewegung waehrend des Trades">
+                    {pos.peak_pct != null ? `+${pos.peak_pct.toFixed(2)}%` : '-'}
+                  </td>
+                  <td className="px-2 py-1 text-right font-mono text-red-500"
+                      title="Trough: maximaler Drawdown waehrend des Trades">
+                    {pos.trough_pct != null ? `${pos.trough_pct.toFixed(2)}%` : '-'}
+                  </td>
                   <td className="px-2 py-1 text-right font-mono">${fp(pos.current_price, 4)}</td>
                   <td className={`px-2 py-1 text-right font-mono ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                     {fPnl(pos.unrealized_pnl)}
                   </td>
-                  <td className={`px-2 py-1 text-right font-mono ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                    {fPct(pos.position_value ? (pos.unrealized_pnl / pos.position_value * 100) : 0)}
+                  <td className={`px-2 py-1 text-right font-mono ${(pos.roe_percent ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}
+                      title={`Margin-PnL: PnL ÷ Margin (${pos.margin_used} $) — Coin-Bewegung wäre ${pos.position_value ? (pos.unrealized_pnl / pos.position_value * 100).toFixed(2) : 0}%`}>
+                    {fPct(pos.roe_percent ?? (pos.margin_used > 0 ? pos.unrealized_pnl / pos.margin_used * 100 : 0))}
                   </td>
                   <td className="px-2 py-1 text-center">
                     <input type="checkbox" checked={selectedCoins.has(pos.coin)}
                       onChange={() => toggleCoin(pos.coin)} className="rounded" />
                   </td>
-                  <td className="px-2 py-1 text-right font-mono text-amber-400">{pos.leverage}x</td>
+                  <td className="px-2 py-1 text-center">
+                    <button onClick={() => toggleTimeout(pos.coin, pos.direction, pos.timeout_enabled !== false)}
+                      className={`text-[11px] font-semibold ${pos.timeout_enabled === false ? 'text-zinc-500 line-through hover:text-zinc-300' : 'text-amber-400 hover:text-amber-300'}`}
+                      title={pos.timeout_enabled === false ? `Timeout aus — klicken um zu aktivieren (${timeoutHours}h)` : `Timeout aktiv (${timeoutHours}h) — klicken um zu deaktivieren`}>
+                      T
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
-          {hlPositions.length > 0 && selectedCoins.size > 0 && (
+          {sortedHlPositions.length > 0 && selectedCoins.size > 0 && (
             <div className="px-2 py-2 border-t border-zinc-800 flex justify-end">
               <button onClick={closeSelected} disabled={closing}
                 className="px-3 py-1.5 bg-red-600 hover:bg-red-500 rounded text-xs font-semibold disabled:opacity-50">
@@ -482,8 +639,11 @@ export default function WalletModule() {
                     {t.side === 'long' ? 'L' : t.side === 'short' ? 'S' : t.side?.toUpperCase()}
                   </td>
                   <td className="px-2 py-1 text-right font-mono text-zinc-400">{t.leverage ? `${t.leverage}x` : '-'}</td>
-                  <td className="px-2 py-1 text-right font-mono">${fp(t.quote_amount)}</td>
-                  <td className={`px-2 py-1 text-right font-mono ${t.sold_for > t.quote_amount ? 'text-green-400' : t.sold_for < t.quote_amount ? 'text-red-400' : 'text-zinc-400'}`}>{t.sold_for ? `$${fp(t.sold_for)}` : '-'}</td>
+                  <td className="px-2 py-1 text-right font-mono"
+                      title={t.quote_amount ? `Notional: $${fp(t.quote_amount)}` : ''}>${fp(t.margin_usd ?? t.quote_amount)}</td>
+                  <td className={`px-2 py-1 text-right font-mono ${(t.pnl_usd ?? 0) > 0 ? 'text-green-400' : (t.pnl_usd ?? 0) < 0 ? 'text-red-400' : 'text-zinc-400'}`}>
+                    {(t.margin_usd ?? t.quote_amount) ? `$${fp((t.margin_usd ?? t.quote_amount) + (t.pnl_usd ?? 0))}` : '-'}
+                  </td>
                   <td className={`px-2 py-1 text-right font-mono ${t.pnl_percent > 0 ? 'text-green-400' : t.pnl_percent < 0 ? 'text-red-400' : 'text-zinc-400'}`}>
                     {t.pnl_percent != null ? `${t.pnl_percent > 0 ? '+' : ''}${fp(t.pnl_percent, 2)}%` : '-'}
                   </td>

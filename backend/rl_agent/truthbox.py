@@ -33,7 +33,7 @@ from rl_agent.env_wallet import LEVERAGE_MAP, N_FEATURES as WALLET_N_FEATURES, T
 
 # === KONFIGURATION ===
 SETTINGS_PATH = "/opt/coin/settings.json"
-MODEL_PATH = "/opt/coin/database/data/models/rl_wallet_v1.zip"
+MODEL_PATH = "/opt/training/models/rl_wallet_v1_p5_final.zip"
 OUTPUT_CSV = "/opt/coin/logs/truthbox_march2026_v2.csv"
 OUTPUT_LOG = "/opt/coin/logs/truthbox_v2.log"
 

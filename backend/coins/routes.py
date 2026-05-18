@@ -10,10 +10,10 @@ from auth.auth import get_current_user
 router = APIRouter(prefix="/api/v1/coins", tags=["coins"])
 
 @router.get("")
-async def get_coins(network: Optional[str] = None, category: Optional[str] = None, search: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+async def get_coins(network: Optional[str] = None, category: Optional[str] = None, search: Optional[str] = None, hl_only: bool = False, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
-            query = "SELECT symbol, base_asset, name, network, categories, price_precision, qty_precision, min_notional, min_qty FROM coin_info WHERE 1=1"
+            query = "SELECT symbol, base_asset, name, network, categories, price_precision, qty_precision, min_notional, min_qty, CASE WHEN hl_sz_decimals IS NOT NULL THEN true ELSE false END as is_hl FROM coin_info WHERE 1=1"
             params = []
             if network:
                 query += " AND network = %s"
@@ -24,6 +24,8 @@ async def get_coins(network: Optional[str] = None, category: Optional[str] = Non
             if search:
                 query += " AND (symbol ILIKE %s OR base_asset ILIKE %s OR name ILIKE %s)"
                 params.extend([f"%{search}%"] * 3)
+            if hl_only:
+                query += " AND hl_sz_decimals IS NOT NULL"
             query += " ORDER BY symbol"
             cur.execute(query, params)
             coins = cur.fetchall()

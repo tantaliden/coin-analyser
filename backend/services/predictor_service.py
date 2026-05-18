@@ -1,10 +1,18 @@
-"""Predictor Service v4 — Contextual Bandit (Linear Thompson Sampling).
+"""Predictor Service v5 — Multi-Head Online-Learner (River).
 
-Ein Modell, ein Ziel: maximize expected reward.
-Action-Space: skip + (long|short) × tp_buckets × sl_buckets, alle aus settings.json.
+Drei Köpfe auf gemeinsamer Feature-Basis:
+  - DirectionClassifier  (3-Klassen: long/short/skip, kalibrierte P)
+  - MagnitudeRegressor_long  (TP=Peak%, SL=Trough%)
+  - MagnitudeRegressor_short (TP=Trough%, SL=Peak%)
 
-Settings: settings.json -> 'predictor.bandit' (neu).
+Selection: max(P(long),P(short)) >= min_direction_confidence (default 0.95)
+TP/SL: aus Magnitude-Regressor × Sicherheits-Faktor (settings.json).
+Lern-Signal beim Close direkt aus realisiertem peak/trough.
+
+Settings: settings.json -> 'predictor.multi_head'.
 Tabellen unverändert: open_predictions, predictor_state, prediction_feedback.
+
+Trader-Welt (modify_bandit) bleibt unverändert (separate LinTSBandit, eigene Tabellen).
 """
 
 import json
@@ -34,6 +42,34 @@ try:
     import torch  # noqa: F401  (Trader nutzt das, Predictor nicht)
 except ImportError:
     torch = None
+
+# Multi-Head Predictor (v5) — DirectionClassifier + MagnitudeRegressor
+from services.predictor_model import MultiHeadPredictor
+
+# Feature-Module v5 (Stufe 3: A=Orderflow, B=Whale, E=Funding, F=Sektor)
+from services.feature_orderflow import compute_orderflow_features
+from services.feature_funding import (compute_funding_features,
+                                       compute_universe_funding_median)
+from services.feature_sector import (build_coin_sector_map,
+                                      compute_sector_close_pcts,
+                                      compute_sector_features)
+from services.feature_whale import compute_whale_features
+
+# Stalker (v5.1, 18.05.2026): pro-Coin Baseline + Cross-Coin + Coin-Identity
+from services.feature_baseline_dev import (
+    compute_baseline_dev_features,
+    feature_keys as stalker_baseline_keys,
+    _classify_btc_regime as stalker_classify_btc_regime,
+)
+from services.feature_cross_coin import (
+    build_reference_cache as stalker_build_ref_cache,
+    compute_cross_coin_features,
+    feature_keys as stalker_cross_keys,
+)
+from services.feature_coin_identity import (
+    compute_identity_features,
+    feature_keys as stalker_identity_keys,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger("predictor")
@@ -215,25 +251,33 @@ def _ema(values, period):
 
 def _rsi(closes, period=14):
     clean = [c for c in closes if c is not None]
-    if len(clean) < period + 1: return 50.0
+    if len(clean) < period + 1:
+        log.error("FALLBACK_TRIGGERED _rsi: zu wenig Daten (n=%d, brauche >=%d) -> None", len(clean), period+1)
+        return None
     gains = []; losses = []
     for i in range(1, len(clean)):
         diff = clean[i] - clean[i-1]
         gains.append(max(diff, 0.0))
         losses.append(max(-diff, 0.0))
-    if len(gains) < period: return 50.0
+    if len(gains) < period:
+        log.error("FALLBACK_TRIGGERED _rsi: zu wenig gains (n=%d, brauche %d) -> None", len(gains), period)
+        return None
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0: return 100.0
+    if avg_loss == 0: return 100.0  # legitimer Edge-Case: keine Verluste -> RSI=100
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
 
 
 def _macd(closes, fast=12, slow=26):
     clean = [c for c in closes if c is not None]
-    if len(clean) < slow: return 0.0
+    if len(clean) < slow:
+        log.error("FALLBACK_TRIGGERED _macd: zu wenig Daten (n=%d, brauche >=%d) -> None", len(clean), slow)
+        return None
     ef = _ema(clean, fast); es = _ema(clean, slow)
-    if ef is None or es is None: return 0.0
+    if ef is None or es is None:
+        log.error("FALLBACK_TRIGGERED _macd: _ema returnt None -> None")
+        return None
     return ef - es
 
 
@@ -253,8 +297,131 @@ def _cvd_ratio(rows_window):
     return _cvd_horizon(rows_window) / total_v
 
 
+def get_timeout_hours(s):
+    """Single Source of Truth: predictor.timeout_hours.
+    Predictor (Multi-Head) + Trader nutzen IMMER den gleichen Wert.
+    Reihenfolge: predictor.timeout_hours -> predictor.multi_head.timeout_hours
+    -> predictor.bandit.timeout_hours (legacy).
+    KEIN silent default — FALLBACK_TRIGGERED + raise wenn Setting fehlt.
+    s = volle settings.json-Struktur."""
+    p = s.get("predictor", {})
+    v = p.get("timeout_hours")
+    if v is None:
+        v = p.get("multi_head", {}).get("timeout_hours")
+    if v is None:
+        v = p.get("bandit", {}).get("timeout_hours")
+    if v is None:
+        log.error("FALLBACK_TRIGGERED get_timeout_hours: predictor.timeout_hours (oder multi_head/bandit) fehlt in settings -> raise")
+        raise RuntimeError("predictor.timeout_hours missing in settings.json")
+    return float(v)
+
+
+_FEATURE_RANGES = {
+    # name: (min, max) — wenn Werte ausserhalb -> log.warning DATA_QUALITY
+    'close_pct_1m': (-30, 30), 'close_pct_5m': (-50, 50), 'close_pct_15m': (-60, 60),
+    'close_pct_30m': (-70, 70), 'close_pct_60m': (-80, 80), 'close_pct_240m': (-100, 100),
+    'btc_close_pct_5m': (-30, 30), 'btc_close_pct_15m': (-30, 30), 'btc_close_pct_60m': (-50, 50),
+    'rel_strength_5m': (-50, 50), 'rel_strength_15m': (-60, 60), 'rel_strength_60m': (-80, 80),
+    'atr_pct_15m': (0, 10), 'atr_pct_1h': (0, 15), 'atr_pct_4h': (0, 30),
+    'rsi_14_1m': (0, 100), 'rsi_14_5m': (0, 100),
+    'spread_bps': (0, 5000), 'impact_spread_bps': (0, 1000),
+    'funding': (-0.005, 0.005), 'premium': (-0.05, 0.05),
+    'taker_buy_ratio': (0, 1), 'taker_buy_ratio_15m': (0, 1),
+    'hour_sin': (-1, 1), 'hour_cos': (-1, 1), 'weekday': (0, 6),
+    'book_imbalance_5': (-1, 1), 'book_imbalance_10': (-1, 1), 'book_imbalance_20': (-1, 1),
+    'bbo_size_ratio': (-1, 1),
+    # Position-Features (Trader)
+    'pnl_now_pct': (-100, 100), 'peak_pct_now': (0, 200), 'trough_pct_now': (-100, 0),
+    'leverage': (1, 50), 'margin_pnl_pct': (-500, 500),
+    'time_in_trade_h': (0, 48), 'time_remaining_h': (0, 48),
+    'dist_to_tp_pct': (-100, 100), 'dist_to_sl_pct': (-100, 100),
+    'original_action_idx': (-1, 200),
+}
+
+
+def data_quality_check(s, send_telegram_report=False):
+    """Periodischer Check: hat ein Feature in den letzten N Samples konstanten Wert
+    oder Out-of-Range-Werte? Schreibt DATA_QUALITY-Logs.
+    Wenn send_telegram_report: zusätzlich aggregierten Bericht via send_telegram().
+    Welt-Trennung: liest open_predictions.features (Predictor) und trader_decisions.features (Trader) separat."""
+    findings_predictor = []
+    findings_trader = []
+    N = 100  # Sample-Size
+
+    def analyse(rows, label, target_list):
+        if not rows: return
+        per_feat = {}
+        for r in rows:
+            feat = r[0] if isinstance(r, tuple) else r
+            if not isinstance(feat, dict): continue
+            for k, v in feat.items():
+                if k.startswith('_'): continue  # Diagnose-Felder ueberspringen
+                try: fv = float(v) if v is not None else None
+                except (TypeError, ValueError): continue
+                per_feat.setdefault(k, []).append(fv)
+        for k, vals in per_feat.items():
+            n = len(vals)
+            n_null = sum(1 for x in vals if x is None)
+            real = [x for x in vals if x is not None]
+            if n_null == n:
+                target_list.append(f"DATA_QUALITY {label} {k}: ALWAYS NULL ({n}/{n})")
+                continue
+            if not real: continue
+            mn = min(real); mx = max(real)
+            if mn == mx:
+                target_list.append(f"DATA_QUALITY {label} {k}: CONST {mn} ({n}/{n})")
+            elif n_null / n > 0.8:
+                target_list.append(f"DATA_QUALITY {label} {k}: NULL in {n_null}/{n} ({n_null/n*100:.0f}%)")
+            else:
+                # check for >80% gleicher Wert
+                from collections import Counter
+                c = Counter(real).most_common(1)
+                if c and c[0][1] / len(real) > 0.8:
+                    target_list.append(f"DATA_QUALITY {label} {k}: dominanter Wert {c[0][0]} in {c[0][1]}/{len(real)} ({c[0][1]/len(real)*100:.0f}%)")
+                # Range-Check
+                rng = _FEATURE_RANGES.get(k)
+                if rng:
+                    lo, hi = rng
+                    out = [x for x in real if x < lo or x > hi]
+                    if out:
+                        target_list.append(f"DATA_QUALITY {label} {k}: {len(out)} Werte ausserhalb [{lo},{hi}] (min={mn} max={mx})")
+
+    try:
+        with db_app(s) as app:
+            with app.cursor() as cur:
+                cur.execute("""SELECT features FROM open_predictions WHERE status IN ('win','loss','timeout','open')
+                              ORDER BY created_at DESC LIMIT %s""", (N,))
+                analyse(cur.fetchall(), "PREDICTOR", findings_predictor)
+                cur.execute("""SELECT features FROM trader_decisions
+                              ORDER BY decided_at DESC LIMIT %s""", (N,))
+                analyse(cur.fetchall(), "TRADER", findings_trader)
+    except Exception as e:
+        log.exception("data_quality_check DB-Fehler: %s", e)
+        return
+
+    for msg in findings_predictor + findings_trader:
+        log.warning(msg)
+
+    if send_telegram_report:
+        n_p = len(findings_predictor); n_t = len(findings_trader)
+        if n_p == 0 and n_t == 0:
+            txt = f"Daten-Quality Report 12h: alles sauber. Predictor + Trader Features OK."
+        else:
+            txt = f"Daten-Quality Report 12h: {n_p} Predictor-, {n_t} Trader-Befunde.\n"
+            for m in (findings_predictor + findings_trader)[:20]:
+                txt += "- " + m + "\n"
+            if n_p + n_t > 20:
+                txt += f"... und {n_p + n_t - 20} weitere im Log."
+        try:
+            send_telegram(s, txt)
+        except Exception as e:
+            log.warning("data_quality_check send_telegram failed: %s", e)
+    return findings_predictor, findings_trader
+
+
 def load_btc_moves(coins_conn):
-    out = {'5m': 0.0, '15m': 0.0, '60m': 0.0}
+    """Returns {'5m','15m','60m':pct} oder None bei fehlenden Daten.
+    Caller MUSS None handhaben (Scan-Pass kann ohne BTC-Referenz nicht arbeiten)."""
     try:
         with coins_conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
@@ -262,17 +429,24 @@ def load_btc_moves(coins_conn):
                 ORDER BY bucket DESC LIMIT 65
             """)
             rows = list(cur.fetchall())
-        if len(rows) < 6: return out
+        if len(rows) < 61:
+            log.error("FALLBACK_TRIGGERED load_btc_moves: nur %d BTC-Candles (brauche >=61) -> None", len(rows))
+            return None
         cl_now = f(rows[0]['close'])
-        if not cl_now: return out
+        if not cl_now:
+            log.error("FALLBACK_TRIGGERED load_btc_moves: BTC.close=NULL/0 in juengstem Bucket -> None")
+            return None
+        out = {}
         for h in (5, 15, 60):
-            if len(rows) > h:
-                c0 = f(rows[h]['close'])
-                if c0 and c0 > 0:
-                    out[f'{h}m'] = (cl_now - c0) / c0 * 100.0
+            c0 = f(rows[h]['close'])
+            if not c0 or c0 <= 0:
+                log.error("FALLBACK_TRIGGERED load_btc_moves: BTC.close vor %dm NULL/0 -> None", h)
+                return None
+            out[f'{h}m'] = (cl_now - c0) / c0 * 100.0
+        return out
     except Exception as e:
-        log.warning("load_btc_moves failed: %s", e)
-    return out
+        log.error("FALLBACK_TRIGGERED load_btc_moves: Exception '%s' -> None", e)
+        return None
 
 
 # =============================================================================
@@ -288,25 +462,39 @@ def feature_snapshot_v2(coins_conn, symbol, rule_flags=None, btc_moves=None):
                    funding, open_interest, premium,
                    spread_bps, book_imbalance_5, book_depth_5,
                    mark_px, mid_px, oracle_px, bbo_bid_sz, bbo_ask_sz
-            FROM agg_1m WHERE symbol=%s ORDER BY bucket DESC LIMIT 240
+            FROM agg_1m WHERE symbol=%s ORDER BY bucket DESC LIMIT 241
         """, (symbol,))
         rows = list(reversed(cur.fetchall()))
-        if not rows or len(rows) < 16: return None
+        # Strenge Untergrenze: 241 = exakt das was close_pct_240m braucht.
+        # Bei weniger Daten wuerden close_pct_* in 0.0-Fallback laufen und der
+        # Bandit lernt aus Datenluecken statt aus echten Marktbewegungen.
+        # Coins ohne vollstaendige 4h-Historie (frisch listed / Datenluecke)
+        # werden geskippt bis genuegend agg_1m vorhanden ist.
+        if not rows or len(rows) < 241: return None
         last = rows[-1]
         if last['close'] is None: return None
         cl = f(last['close'])
 
         for k in ("funding","open_interest","premium","spread_bps","book_imbalance_5","book_depth_5"):
             v = f(last[k])
-            feat[k] = v if v is not None else 0.0
+            if v is None:
+                log.error("FALLBACK_TRIGGERED feature_snapshot_v2 %s: %s NULL in last agg_1m -> coin skip", symbol, k)
+                return None
+            feat[k] = v
 
-        bidsz = f(last['bbo_bid_sz']) or 0
-        asksz = f(last['bbo_ask_sz']) or 0
+        bidsz = f(last['bbo_bid_sz'])
+        asksz = f(last['bbo_ask_sz'])
+        if bidsz is None or asksz is None:
+            log.error("FALLBACK_TRIGGERED feature_snapshot_v2 %s: bbo_bid_sz/bbo_ask_sz NULL -> coin skip", symbol)
+            return None
         feat['bbo_size_ratio'] = (bidsz - asksz) / (bidsz + asksz + 1e-9)
 
         mark = f(last['mark_px']); mid = f(last['mid_px']); oracle = f(last['oracle_px'])
-        feat['mark_vs_mid_bps'] = ((mark - mid) / mid * 10000) if (mark and mid) else 0.0
-        feat['mark_vs_oracle_bps'] = ((mark - oracle) / oracle * 10000) if (mark and oracle) else 0.0
+        if mark is None or mid is None or oracle is None:
+            log.error("FALLBACK_TRIGGERED feature_snapshot_v2 %s: mark/mid/oracle_px NULL -> coin skip", symbol)
+            return None
+        feat['mark_vs_mid_bps'] = (mark - mid) / mid * 10000
+        feat['mark_vs_oracle_bps'] = (mark - oracle) / oracle * 10000
 
         def close_at(ago_min):
             idx = -1 - ago_min
@@ -316,7 +504,10 @@ def feature_snapshot_v2(coins_conn, symbol, rule_flags=None, btc_moves=None):
 
         for h in (1, 5, 15, 30, 60, 240):
             c0 = close_at(h)
-            feat[f'close_pct_{h}m'] = ((cl - c0) / c0 * 100) if c0 else 0.0
+            if c0 is None:
+                log.error("FALLBACK_TRIGGERED feature_snapshot_v2 %s: close vor %dm NULL/0 -> coin skip", symbol, h)
+                return None
+            feat[f'close_pct_{h}m'] = (cl - c0) / c0 * 100
 
         vols_15m = [f(r['volume']) or 0 for r in rows[-15:]]
         vols_1h = [f(r['volume']) or 0 for r in rows[-60:]] if len(rows) >= 60 else vols_15m
@@ -424,25 +615,43 @@ def feature_snapshot_v2(coins_conn, symbol, rule_flags=None, btc_moves=None):
         feat['cvd_ratio_60m'] = _cvd_ratio(rows[-60:]) if len(rows) >= 60 else feat['cvd_ratio_15m']
 
         closes_1m = [f(r['close']) for r in rows]
-        feat['rsi_14_1m'] = _rsi(closes_1m, 14)
+        rsi_1m = _rsi(closes_1m, 14)
+        if rsi_1m is None:
+            log.error("FALLBACK_TRIGGERED feature_snapshot_v2 %s: rsi_14_1m None -> coin skip", symbol)
+            return None
+        feat['rsi_14_1m'] = rsi_1m
         closes_5m = closes_1m[::-5][::-1] if len(closes_1m) >= 70 else closes_1m
-        feat['rsi_14_5m'] = _rsi(closes_5m, 14)
-        feat['macd_line'] = _macd(closes_1m, 12, 26)
-        feat['macd_pct'] = (feat['macd_line'] / cl * 100.0) if cl else 0.0
+        rsi_5m = _rsi(closes_5m, 14)
+        if rsi_5m is None:
+            log.error("FALLBACK_TRIGGERED feature_snapshot_v2 %s: rsi_14_5m None -> coin skip", symbol)
+            return None
+        feat['rsi_14_5m'] = rsi_5m
+        macd = _macd(closes_1m, 12, 26)
+        if macd is None:
+            log.error("FALLBACK_TRIGGERED feature_snapshot_v2 %s: macd None -> coin skip", symbol)
+            return None
+        feat['macd_line'] = macd
+        if not cl:
+            log.error("FALLBACK_TRIGGERED feature_snapshot_v2 %s: cl=0/None bei macd_pct -> coin skip", symbol)
+            return None
+        feat['macd_pct'] = feat['macd_line'] / cl * 100.0
 
         cur.execute("""
             SELECT bucket, funding FROM agg_1h WHERE symbol=%s ORDER BY bucket DESC LIMIT 24
         """, (symbol,))
         f24 = [f(r['funding']) for r in cur.fetchall()]
         clean_f = [x for x in f24 if x is not None]
-        if len(clean_f) >= 6:
-            f_mean = sum(clean_f) / len(clean_f)
-            f_var = sum((x - f_mean) ** 2 for x in clean_f) / len(clean_f)
-            f_std = math.sqrt(f_var)
-            cur_f = clean_f[0]
-            feat['funding_zscore_24h'] = ((cur_f - f_mean) / f_std) if f_std > 0 else 0.0
-        else:
-            feat['funding_zscore_24h'] = 0.0
+        if len(clean_f) < 6:
+            log.error("FALLBACK_TRIGGERED feature_snapshot_v2 %s: funding_zscore_24h zu wenig Daten (n=%d) -> coin skip", symbol, len(clean_f))
+            return None
+        f_mean = sum(clean_f) / len(clean_f)
+        f_var = sum((x - f_mean) ** 2 for x in clean_f) / len(clean_f)
+        f_std = math.sqrt(f_var)
+        cur_f = clean_f[0]
+        if f_std == 0:
+            log.error("FALLBACK_TRIGGERED feature_snapshot_v2 %s: funding_std=0, ergebnis undefiniert -> coin skip", symbol)
+            return None
+        feat['funding_zscore_24h'] = (cur_f - f_mean) / f_std
         streak = 0; sign = None
         for v in f24:
             if v is None: continue
@@ -471,17 +680,25 @@ def feature_snapshot_v2(coins_conn, symbol, rule_flags=None, btc_moves=None):
             feat['vol_1h_vs_24h_ratio'] = 1.0
             feat['vol_zscore_24h'] = 0.0
 
-    if btc_moves is not None and symbol != 'BTC':
-        feat['btc_close_pct_5m'] = btc_moves.get('5m', 0.0)
-        feat['btc_close_pct_15m'] = btc_moves.get('15m', 0.0)
-        feat['btc_close_pct_60m'] = btc_moves.get('60m', 0.0)
-        feat['rel_strength_5m'] = feat.get('close_pct_5m', 0.0) - btc_moves.get('5m', 0.0)
-        feat['rel_strength_15m'] = feat.get('close_pct_15m', 0.0) - btc_moves.get('15m', 0.0)
-        feat['rel_strength_60m'] = feat.get('close_pct_60m', 0.0) - btc_moves.get('60m', 0.0)
+    if symbol == 'BTC':
+        # BTC scannt sich nicht selbst gegen BTC-Bewegung -> rel_strength immer 0,
+        # btc_close_pct = eigene close_pct
+        feat['btc_close_pct_5m'] = feat['close_pct_5m']
+        feat['btc_close_pct_15m'] = feat['close_pct_15m']
+        feat['btc_close_pct_60m'] = feat['close_pct_60m']
+        feat['rel_strength_5m'] = 0.0
+        feat['rel_strength_15m'] = 0.0
+        feat['rel_strength_60m'] = 0.0
     else:
-        for k in ('btc_close_pct_5m','btc_close_pct_15m','btc_close_pct_60m',
-                   'rel_strength_5m','rel_strength_15m','rel_strength_60m'):
-            feat[k] = 0.0
+        if btc_moves is None:
+            log.error("FALLBACK_TRIGGERED feature_snapshot_v2 %s: btc_moves None -> coin skip", symbol)
+            return None
+        feat['btc_close_pct_5m'] = btc_moves['5m']
+        feat['btc_close_pct_15m'] = btc_moves['15m']
+        feat['btc_close_pct_60m'] = btc_moves['60m']
+        feat['rel_strength_5m'] = feat['close_pct_5m'] - btc_moves['5m']
+        feat['rel_strength_15m'] = feat['close_pct_15m'] - btc_moves['15m']
+        feat['rel_strength_60m'] = feat['close_pct_60m'] - btc_moves['60m']
 
     now_utc = datetime.now(timezone.utc)
     hour = now_utc.hour + now_utc.minute / 60.0
@@ -593,9 +810,20 @@ _BASE_FEATURE_KEYS = sorted([
 
 
 def build_feature_keys(s):
-    """Liste der Feature-Keys = base + sortierte rule_<name>-Keys aus settings."""
+    """Liste der Feature-Keys = base + sortierte rule_<name>-Keys aus settings.
+
+    Mit predictor.stalker.enabled=true werden die Stalker-Features angehängt:
+    Baseline-Devs + Cross-Coin + Coin-Identity (Reihenfolge stabil, damit
+    Vector-Position deterministisch ist).
+    """
     rule_keys = sorted([f"rule_{r['name']}" for r in s.get("predictor", {}).get("rules", [])])
-    return _BASE_FEATURE_KEYS + rule_keys
+    keys = _BASE_FEATURE_KEYS + rule_keys
+    stalker_cfg = s.get("predictor", {}).get("stalker", {}) or {}
+    if stalker_cfg.get("enabled"):
+        keys = keys + stalker_baseline_keys(stalker_cfg)
+        keys = keys + stalker_cross_keys(stalker_cfg["cross_coin"])
+        keys = keys + stalker_identity_keys(stalker_cfg["coin_identity"])
+    return keys
 
 
 # Werden in main() konkret gesetzt. Bias-Term sitzt in Index 0, Features ab Index 1.
@@ -923,22 +1151,45 @@ def send_telegram(s, text):
 
 
 # =============================================================================
-# Scan-Pass v4 — Bandit entscheidet
+# Scan-Pass v5 — Multi-Head Predictor (DirectionClassifier + MagnitudeRegressor)
 # =============================================================================
 
-def scan_pass_v4(s, bandit, scaler, rng):
+def scan_pass_mh(s, mh_model, rng):
+    """Multi-Head Scan-Pass.
+
+    Pro Coin:
+      1. Features berechnen
+      2. DirectionClassifier predict_proba → P(long), P(short), P(skip)
+      3. side = argmax(long,short); confidence = P(side)
+      4. confidence < min_direction_confidence  →  skip
+      5. tp_pct = MagnitudeRegressor_<side>.tp(features) × tp_safety_factor
+      6. sl_pct = MagnitudeRegressor_<side>.sl(features) × sl_safety_factor
+      7. tp_pct < min_tp_pct  oder  sl_pct > max_sl_pct  →  skip
+      8. Kandidaten nach confidence DESC, Top-slots_free öffnen
+    """
     cfg = s["predictor"]
-    bandit_cfg = cfg.get("bandit", {})
+    mh_cfg = cfg.get("multi_head", {})
     rules = cfg.get("rules", [])
     lookback = cfg["lookback_minutes"]
     cooldown = cfg.get("cooldown_seconds_per_symbol", 300)
-    expl_floor = float(bandit_cfg.get("exploration_floor", 0.05))
-    expl_init = float(bandit_cfg.get("exploration_init", 1.0))
-    expl_decay = float(bandit_cfg.get("exploration_decay_per_trade", 0.0005))
-    n_total = sum(bandit.n_obs)
-    exploration = max(expl_floor, expl_init - expl_decay * n_total)
-    max_open = int(bandit_cfg.get("max_open_predictions", 20))
-    min_reward = float(bandit_cfg.get("min_expected_reward", 0.3))
+
+    # Threshold-Staffel je nach Modell-Reife
+    n_obs = mh_model.direction.n_obs
+    cold_start_min_n = int(mh_cfg.get("cold_start_min_n", 200))
+    cold_start_threshold = float(mh_cfg.get("cold_start_threshold", 0.50))
+    target_threshold = float(mh_cfg.get("min_direction_confidence", 0.95))
+    if n_obs < cold_start_min_n:
+        direction_threshold = cold_start_threshold
+    else:
+        direction_threshold = target_threshold
+
+    min_n_for_predict = int(mh_cfg.get("min_n_for_predict", 30))
+    tp_safety = float(mh_cfg.get("tp_safety_factor", 0.6))
+    sl_safety = float(mh_cfg.get("sl_safety_factor", 1.3))
+    min_tp_pct = float(mh_cfg.get("min_tp_pct", 0.5))
+    max_sl_pct = float(mh_cfg.get("max_sl_pct", 2.5))
+    max_open = int(mh_cfg.get("max_open_predictions", 100))
+
     matches = 0
 
     with db_coins(s) as coins, db_app(s) as app:
@@ -970,8 +1221,7 @@ def scan_pass_v4(s, bandit, scaler, rng):
             log.info("scan: %d/%d offen, keine neuen Trades", n_open, max_open)
             return 0
 
-        # Cooldown: letzten Close pro Symbol bulk-fetchen, damit wir Mindestabstand
-        # zwischen Trades am gleichen Symbol halten koennen.
+        # Cooldown: letzten Close pro Symbol bulk-fetchen.
         last_closes = {}
         if cooldown > 0 and uni:
             with app.cursor(cursor_factory=RealDictCursor) as cur_a:
@@ -984,13 +1234,43 @@ def scan_pass_v4(s, bandit, scaler, rng):
                 last_closes = {r['symbol']: r['last_close'] for r in cur_a.fetchall()}
 
         btc_moves = load_btc_moves(coins)
+        if btc_moves is None:
+            log.error("FALLBACK_TRIGGERED scan_pass_mh: load_btc_moves None -> scan-pass abgebrochen")
+            return 0
+
+        # Universe-level pre-computes für Sektor + Funding-Universe-Median
+        sector_priority = cfg.get("sector_priority", [])
+        coin_sector_map = build_coin_sector_map(app, uni, sector_priority)
+        sector_stats, coin_pcts = compute_sector_close_pcts(coins, coin_sector_map)
+        universe_funding_median = compute_universe_funding_median(coins, uni)
+        whale_enabled = bool(cfg.get("whale_tracker", {}).get("enabled", False))
+
+        # Stalker (v5.1): Reference-Cache + BTC-Regime 1× pro scan-pass
+        stalker_cfg = cfg.get("stalker", {}) or {}
+        stalker_on = bool(stalker_cfg.get("enabled"))
+        stalker_ref_cache = None
+        stalker_btc_regime = None
+        if stalker_on:
+            stalker_ref_cache = stalker_build_ref_cache(coins, stalker_cfg["cross_coin"])
+            stalker_btc_regime = stalker_classify_btc_regime(coins, stalker_cfg["btc_regime"])
+            if stalker_btc_regime is None:
+                log.error("FALLBACK_TRIGGERED scan_pass_mh: Stalker-BTC-Regime nicht ermittelbar -> Stalker für diesen scan-pass aus")
+                stalker_on = False
 
         candidates = []
+        n_cold_skip = 0
+        n_below_thresh = 0
+        n_no_magnitude = 0
+        n_filtered = 0
+        n_no_orderflow = 0
+        n_no_funding = 0
+        n_no_sector = 0
+        n_no_baseline = 0
+
         with coins.cursor(cursor_factory=RealDictCursor) as cur_c:
             for sym in uni:
                 if has_open(app, sym): continue
 
-                # Cooldown nach letztem Close
                 last_close = last_closes.get(sym)
                 if last_close is not None:
                     age = (datetime.now(timezone.utc) - last_close).total_seconds()
@@ -1008,52 +1288,156 @@ def scan_pass_v4(s, bandit, scaler, rng):
                 feat = feature_snapshot_v2(coins, sym, rule_flags=rule_flags, btc_moves=btc_moves)
                 if feat is None: continue
 
-                x_raw = vectorize(feat)
-                x = scaler.transform(x_raw)
-                idx, expected_r, _ = bandit.select(x, exploration=exploration, rng=rng)
-                action = bandit.actions[idx]
-
-                if action['side'] is None:  # skip
+                # Stufe-3-Features mergen (Orderflow + Funding-Burst + Sektor + Whale)
+                of_feat = compute_orderflow_features(coins, sym)
+                if of_feat is None:
+                    n_no_orderflow += 1
                     continue
+                feat.update(of_feat)
 
-                if expected_r < min_reward:
+                fb_feat = compute_funding_features(coins, sym, universe_funding_median)
+                if fb_feat is None:
+                    n_no_funding += 1
+                    continue
+                feat.update(fb_feat)
+
+                sec_feat = compute_sector_features(sym, coin_sector_map, sector_stats, coin_pcts)
+                if sec_feat is None:
+                    n_no_sector += 1
+                    continue
+                feat.update(sec_feat)
+
+                if whale_enabled:
+                    wh_feat = compute_whale_features(app, sym)
+                    if wh_feat:
+                        feat.update(wh_feat)
+
+                # Stalker (v5.1): Baseline-Devs + Cross-Coin + Coin-Identity
+                if stalker_on:
+                    bl_feat = compute_baseline_dev_features(
+                        coins, app, sym, stalker_cfg, btc_regime=stalker_btc_regime
+                    )
+                    if bl_feat is None:
+                        n_no_baseline += 1
+                        continue
+                    feat.update(bl_feat)
+                    cc_feat = compute_cross_coin_features(
+                        coins, sym, stalker_cfg["cross_coin"], stalker_ref_cache
+                    )
+                    feat.update(cc_feat)
+                    id_feat = compute_identity_features(
+                        sym, app, stalker_cfg["coin_identity"]
+                    )
+                    feat.update(id_feat)
+
+                # 1) Direction-Klassifikator (oder Cold-Start: random side)
+                probs = mh_model.predict_proba(feat, min_n_for_predict=min_n_for_predict)
+                cold_start_active = (n_obs < cold_start_min_n)
+
+                if probs is None:
+                    if not cold_start_active:
+                        n_cold_skip += 1
+                        continue
+                    # Cold-Start (vor min_n_for_predict): random Side mit confidence=0.5
+                    side = 'long' if rng.random() < 0.5 else 'short'
+                    confidence = 0.5
+                    p_long = 0.5; p_short = 0.5; p_skip = 0.0
+                else:
+                    p_long = probs['long']; p_short = probs['short']
+                    if p_long >= p_short:
+                        side = 'long'; confidence = p_long
+                    else:
+                        side = 'short'; confidence = p_short
+                    p_skip = probs['skip']
+                    # Threshold-Check NUR wenn nicht im Cold-Start
+                    # Cold-Start (n_obs < cold_start_min_n): immer eröffnen (argmax),
+                    # damit Modell weiter Trainingsdaten sammelt.
+                    if not cold_start_active and confidence < direction_threshold:
+                        n_below_thresh += 1
+                        continue
+
+                # 2) Magnitude-Regressoren (Cold-Start: settings-Defaults)
+                tp_raw = mh_model.predict_tp(feat, side, min_n_for_predict=min_n_for_predict)
+                sl_raw = mh_model.predict_sl(feat, side, min_n_for_predict=min_n_for_predict)
+                if tp_raw is None or sl_raw is None:
+                    if not cold_start_active:
+                        n_no_magnitude += 1
+                        continue
+                    # Cold-Start: settings-Defaults zwingend (kein silent fallback)
+                    cs_tp = mh_cfg.get("cold_start_tp_raw_pct")
+                    cs_sl = mh_cfg.get("cold_start_sl_raw_pct")
+                    if cs_tp is None or cs_sl is None:
+                        log.error("FALLBACK_TRIGGERED scan_pass_mh cold-start: "
+                                  "cold_start_tp_raw_pct/cold_start_sl_raw_pct fehlen in settings.predictor.multi_head -> abort")
+                        return 0
+                    tp_raw = float(cs_tp)
+                    sl_raw = float(cs_sl)
+
+                tp_pct = tp_raw * tp_safety
+                sl_pct = max(sl_raw * sl_safety, 0.1)
+
+                # Cold-Start: ignoriere TP/SL-Filter, sonst lernt das Modell nichts.
+                # Erzwinge aber settings-Defaults wenn Magnituden absurd klein sind.
+                if cold_start_active:
+                    cs_tp = float(mh_cfg.get("cold_start_tp_raw_pct"))
+                    cs_sl = float(mh_cfg.get("cold_start_sl_raw_pct"))
+                    if tp_pct < min_tp_pct:
+                        tp_pct = cs_tp * tp_safety
+                    if sl_pct > max_sl_pct:
+                        sl_pct = cs_sl * sl_safety
+                elif tp_pct < min_tp_pct or sl_pct > max_sl_pct:
+                    n_filtered += 1
                     continue
 
                 cur_c.execute("SELECT close FROM agg_1m WHERE symbol=%s ORDER BY bucket DESC LIMIT 1", (sym,))
                 p = cur_c.fetchone()
                 if not p or p['close'] is None: continue
                 entry = f(p['close'])
-                tp_pct = float(action['tp_pct']); sl_pct = float(action['sl_pct'])
-                if action['side'] == 'long':
+                if side == 'long':
                     tp = entry * (1 + tp_pct / 100.0)
                     sl = entry * (1 - sl_pct / 100.0)
                 else:
                     tp = entry * (1 - tp_pct / 100.0)
                     sl = entry * (1 + sl_pct / 100.0)
 
-                feat_with_action = dict(feat)
-                feat_with_action['_action_idx'] = idx
-                feat_with_action['_action_name'] = action['name']
+                feat_with_meta = dict(feat)
+                feat_with_meta['_predicted_side'] = side
+                feat_with_meta['_confidence'] = float(confidence)
+                feat_with_meta['_tp_raw_pct'] = float(tp_raw)
+                feat_with_meta['_sl_raw_pct'] = float(sl_raw)
+                feat_with_meta['_p_long'] = float(p_long)
+                feat_with_meta['_p_short'] = float(p_short)
+                feat_with_meta['_p_skip'] = float(p_skip)
 
                 candidates.append({
-                    'sym': sym, 'side': action['side'], 'entry': entry, 'sl': sl, 'tp': tp,
-                    'tp_pct': tp_pct, 'sl_pct': sl_pct, 'expected_r': expected_r,
-                    'action_name': action['name'], 'feat': feat_with_action,
+                    'sym': sym, 'side': side, 'entry': entry, 'sl': sl, 'tp': tp,
+                    'tp_pct': tp_pct, 'sl_pct': sl_pct, 'confidence': confidence,
+                    'feat': feat_with_meta,
                 })
 
-        # Sortieren nach expected_reward DESC, Top-slots_free oeffnen
-        candidates.sort(key=lambda c: c['expected_r'], reverse=True)
-        log.info("scan: %d/%d offen, %d Slots frei, %d Kandidaten >= min_reward=%.2f",
-                 n_open, max_open, slots_free, len(candidates), min_reward)
-        for c in candidates[:slots_free]:
+        candidates.sort(key=lambda c: c['confidence'], reverse=True)
+        # Cold-Start: zusätzlicher Cap pro Scan damit DB nicht überflutet wird
+        if n_obs < cold_start_min_n:
+            cold_cap = int(mh_cfg.get("cold_start_max_per_scan", 10))
+            slots_to_open = min(slots_free, cold_cap)
+        else:
+            slots_to_open = slots_free
+        log.info("scan: %d/%d offen, %d Slots frei, %d open jetzt, %d Kand. P>=%.2f"
+                 " (n_obs=%d, cold=%d, below=%d, no_mag=%d, no_of=%d, no_fb=%d, no_sec=%d, no_bl=%d, filt=%d, stalker=%s)",
+                 n_open, max_open, slots_free, slots_to_open, len(candidates), direction_threshold,
+                 n_obs, n_cold_skip, n_below_thresh, n_no_magnitude,
+                 n_no_orderflow, n_no_funding, n_no_sector, n_no_baseline, n_filtered,
+                 stalker_btc_regime if stalker_on else "off")
+        for c in candidates[:slots_to_open]:
+            action_name = f"{c['side']}_tp{c['tp_pct']:.2f}_sl{c['sl_pct']:.2f}"
             pid = open_prediction(app, c['sym'], c['side'], c['entry'], c['sl'], c['tp'],
-                                   c['expected_r'], c['action_name'], 'bandit', c['feat'],
+                                   c['confidence'], action_name, 'multi_head', c['feat'],
                                    pred_up=c['tp_pct'], pred_down=c['sl_pct'])
             if pid:
                 matches += 1
-                log.info("OPEN %s %s entry=%.6g tp=%.6g sl=%.6g action=%s exp_r=%.4f expl=%.3f",
-                         c['sym'], c['side'], c['entry'], c['tp'], c['sl'], c['action_name'],
-                         c['expected_r'], exploration)
+                log.info("OPEN %s %s entry=%.6g tp=%.6g sl=%.6g (tp%%=%.3f sl%%=%.3f) P=%.3f",
+                         c['sym'], c['side'], c['entry'], c['tp'], c['sl'],
+                         c['tp_pct'], c['sl_pct'], c['confidence'])
                 try_auto_trade(s, pid, c['sym'], c['side'], c['entry'], c['tp'], c['sl'],
                                c['tp_pct'], c['sl_pct'])
     return matches
@@ -1160,8 +1544,8 @@ def try_auto_trade(s, pid, symbol, side, predicted_entry, predicted_tp, predicte
                             INSERT INTO trader_positions
                               (prediction_id, symbol, side, entry_px, qty, leverage,
                                original_tp_px, original_sl_px, current_tp_px, current_sl_px,
-                               peak_px, trough_px, status, features_at_open)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open', %s::jsonb)
+                               peak_px, trough_px, status, features_at_open, timeout_enabled)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open', %s::jsonb, TRUE)
                             RETURNING id
                         """, (pid, symbol, side, float(predicted_entry), actual_qty, eff_lev,
                                float(actual_tp), float(actual_sl),
@@ -1177,27 +1561,16 @@ def try_auto_trade(s, pid, symbol, side, predicted_entry, predicted_tp, predicte
                 log.info("AUTO-TRADE OK %s %s pid=%s margin=$%.0f lev=%dx (notional=$%.0f) tp=%.6g sl=%.6g",
                          symbol, side, pid, size_usd, eff_lev, size_usd * eff_lev, actual_tp, actual_sl)
         else:
-            log.error("AUTO-TRADE FAIL %s %s pid=%s lev=%dx: %s",
+            # CARDINAL RULE: Auto-Trade-Fail beruehrt open_predictions NICHT.
+            # Predictor-Welt ist von HL-Realitaet entkoppelt — watch_pass_v4
+            # trackt die Prediction weiter via Klines (TP/SL/Timeout) und
+            # liefert dem Bandit ein echtes Lernsignal aus der Marktbewegung.
+            log.error("AUTO-TRADE FAIL %s %s pid=%s lev=%dx: %s (Predictor laeuft via Klines weiter)",
                       symbol, side, pid, eff_lev, res.get("error"))
-            # Failsafe-Close: HL-Position weg, DB-Row sofort markieren damit
-            # Watch-Pass nicht spaeter spurious schliesst.
-            if res.get("failsafe_closed"):
-                _mark_predict_closed(s, pid, 'auto_close_failsafe', entry_live)
-                log.info("DB pid=%s -> auto_close_failsafe (HL-Position bereits zu)", pid)
-            else:
-                # Order failed (kein Failsafe) — HL hat keine Position -> Phantom verhindern
-                _mark_predict_closed(s, pid, 'auto_trade_failed', entry_live)
-                log.info("DB pid=%s -> auto_trade_failed (Order fehlgeschlagen, keine HL-Position)", pid)
     except Exception as e:
-        # Aussere Exception (z.B. HL-API Rate-Limit 429 vor Order-Versuch).
-        # HL hat keine Position -> DB-Row sofort schliessen damit Watch-Pass
-        # sie nicht spaeter spurious schliesst (Phantom-Trade-Bug).
-        log.exception("auto-trade %s scheiterte: %s", symbol, e)
-        try:
-            _mark_predict_closed(s, pid, 'auto_trade_failed', predicted_entry)
-            log.info("DB pid=%s -> auto_trade_failed (Exception, Phantom verhindert)", pid)
-        except Exception as e2:
-            log.warning("DB-Phantom-Mark pid=%s fehlgeschlagen: %s", pid, e2)
+        # HL-API-Fehler (Rate-Limit, Timeout, etc.) beruehren die Predictor-Welt nicht.
+        # open_predictions laeuft via watch_pass_v4 mit Klines-Tracking weiter.
+        log.exception("auto-trade %s scheiterte (Predictor laeuft via Klines weiter): %s", symbol, e)
 
 
 def _mark_predict_closed(s, pid, status, exit_px):
@@ -1217,12 +1590,31 @@ def _mark_predict_closed(s, pid, status, exit_px):
 # Hindsight-Replay — Bandit lernt aus jedem Trade fuer ALLE 31 Actions
 # =============================================================================
 
+def _win_mult_from_tiers(hit_quote_pct, tiers):
+    """Bestimmt Reward-Multiplikator anhand Trefferquote (gewaehlter_TP / max_moeglich * 100).
+
+    tiers: Liste [[schwelle_pct, mult], ...] sortiert nach Schwelle aufsteigend.
+    Letzter Eintrag = "darueber". Beispiel default:
+      [[50, 0.75], [70, 1.0], [80, 1.2], [90, 1.5], [9999, 2.5]]
+    bedeutet: <=50% -> 0.75, 51-70% -> 1.0, 71-80% -> 1.2, 81-90% -> 1.5, >90% -> 2.5
+    """
+    if not tiers:
+        return 1.0
+    for threshold, mult in tiers:
+        if hit_quote_pct <= float(threshold):
+            return float(mult)
+    return float(tiers[-1][1])
+
+
 def replay_action(klines_rows, entry, side, tp_pct, sl_pct, timeout_h,
-                   time_penalty_per_h, reward_timeout_pen):
+                   time_penalty_per_h, max_possible_pct, reward_cfg):
     """Simuliert einen hypothetischen Trade durch die echte 10s-Klines-Trajectory.
 
     klines_rows: list of dict mit open_time, high, low, close (sortiert ASC)
     side: 'long' / 'short' / None (skip — wird vom Caller separat berechnet)
+    max_possible_pct: max moegliche Coin-Bewegung in % im timeout-Fenster fuer diese Side
+                     (vom Caller berechnet, gleich fuer alle Actions derselben Side).
+    reward_cfg: dict mit reward_mult_tiers, reward_timeout_mult_pos, reward_timeout_mult_neg
     Returns: dict mit status, pnl_pct, duration_h, reward.
       reward=None signalisiert "keinen Bandit-Update fuer diese Action durchfuehren"
       (skip-Platzhalter oder Daten reichen nicht aus fuer faire Bewertung).
@@ -1243,6 +1635,10 @@ def replay_action(klines_rows, entry, side, tp_pct, sl_pct, timeout_h,
 
     start_time = klines_rows[0]['open_time']
 
+    mult_tiers = reward_cfg.get('reward_mult_tiers') or [[50, 0.75], [70, 1.0], [80, 1.2], [90, 1.5], [9999, 2.5]]
+    timeout_mult_pos = float(reward_cfg.get('reward_timeout_mult_pos', 0.3))
+    timeout_mult_neg = float(reward_cfg.get('reward_timeout_mult_neg', 2.0))
+
     for r in klines_rows:
         h = r.get('high'); l = r.get('low'); c = r.get('close')
         if h is None or l is None: continue
@@ -1250,10 +1646,12 @@ def replay_action(klines_rows, entry, side, tp_pct, sl_pct, timeout_h,
 
         elapsed_h = (r['open_time'] - start_time).total_seconds() / 3600.0
         if elapsed_h >= timeout_h:
-            # Echter Timeout: Trade haengt timeout_h ohne TP/SL-Hit -> Penalty.
+            # Echter Timeout: Trade haengt timeout_h ohne TP/SL-Hit
+            # Volker-Regel (16.05.2026): pnl >=0 -> *0.3 (weniger belohnen), pnl <0 -> *2 (haerter bestrafen)
             close_v = float(c) if c is not None else entry
             pnl = ((close_v - entry) / entry * 100) if side == 'long' else ((entry - close_v) / entry * 100)
-            reward = pnl - elapsed_h * time_penalty_per_h + reward_timeout_pen
+            base = pnl - elapsed_h * time_penalty_per_h
+            reward = base * (timeout_mult_pos if pnl >= 0 else timeout_mult_neg)
             return {'status': 'timeout', 'pnl_pct': pnl, 'duration_h': elapsed_h, 'reward': reward}
 
         # TP/SL-Check pro Bucket
@@ -1271,7 +1669,14 @@ def replay_action(klines_rows, entry, side, tp_pct, sl_pct, timeout_h,
             return {'status': 'loss', 'pnl_pct': pnl, 'duration_h': elapsed_h, 'reward': reward}
         if tp_hit:
             pnl = float(tp_pct)
-            reward = pnl - elapsed_h * time_penalty_per_h
+            base = pnl - elapsed_h * time_penalty_per_h
+            # Trefferquoten-Multiplikator nur fuer positive Wins (negative bei Slippage-Edge: unveraendert)
+            if base > 0 and max_possible_pct and max_possible_pct > 0:
+                hit_quote_pct = (tp_pct / max_possible_pct) * 100.0
+                mult = _win_mult_from_tiers(hit_quote_pct, mult_tiers)
+                reward = base * mult
+            else:
+                reward = base
             return {'status': 'win', 'pnl_pct': pnl, 'duration_h': elapsed_h, 'reward': reward}
 
     # Trajectory zu Ende, kein TP/SL-Hit und kein echter Timeout (z.B. realer Trade
@@ -1298,10 +1703,21 @@ def hindsight_replay_for_prediction(coins_conn, bandit, scaler, prediction, cfg)
     Returns: (n_actions_updated, dict pro Action mit reward, dict mit chosen_action_replay)
     """
     bandit_cfg = cfg.get("bandit", {})
-    timeout_h = float(bandit_cfg.get("timeout_hours", 6))
+    # cfg ist die predictor-Sektion -> get_timeout_hours braucht volle settings:
+    timeout_h = get_timeout_hours({"predictor": cfg})
+    # Hindsight-Eval-Fenster = timeout_h + extended_minutes (sieht ob Trade in
+    # den extra Minuten noch getriggert haette -> Bandit lernt "zu frueh eroeffnet").
+    extended_min = float(bandit_cfg.get("hindsight_extended_minutes", 30))
+    eval_timeout_h = timeout_h + extended_min / 60.0
     time_penalty = float(bandit_cfg.get("reward_time_penalty_per_hour", 0.15))
     reward_skip = float(bandit_cfg.get("reward_skip", 0.1))
-    reward_timeout_pen = float(bandit_cfg.get("reward_timeout_penalty", -0.3))
+    # Reward-Multiplikator-Config (Volker-Spec 16.05.2026)
+    reward_cfg = {
+        'reward_mult_tiers': bandit_cfg.get('reward_mult_tiers',
+                                            [[50, 0.75], [70, 1.0], [80, 1.2], [90, 1.5], [9999, 2.5]]),
+        'reward_timeout_mult_pos': bandit_cfg.get('reward_timeout_mult_pos', 0.3),
+        'reward_timeout_mult_neg': bandit_cfg.get('reward_timeout_mult_neg', 2.0),
+    }
 
     feat = prediction.get('features') or {}
     if not isinstance(feat, dict) or not feat:
@@ -1310,7 +1726,7 @@ def hindsight_replay_for_prediction(coins_conn, bandit, scaler, prediction, cfg)
 
     # Volle Bewertungsspanne. min(now()) damit wir nicht in die Zukunft fragen,
     # wenn der Trade noch jung ist.
-    full_range_end = prediction['created_at'] + timedelta(hours=timeout_h)
+    full_range_end = prediction['created_at'] + timedelta(hours=eval_timeout_h)
     now_utc = datetime.now(timezone.utc)
     range_end = min(full_range_end, now_utc)
 
@@ -1325,6 +1741,18 @@ def hindsight_replay_for_prediction(coins_conn, bandit, scaler, prediction, cfg)
 
     if len(klines_rows) < 3:
         return 0, {}, None
+
+    # Max moegliche Bewegung pro Side im timeout-Fenster (global pro Prediction,
+    # gleicher Wert fuer alle Actions derselben Side -> kein Decision-Loophole).
+    max_long_pct = 0.0
+    max_short_pct = 0.0
+    for r in klines_rows:
+        h = r.get('high'); l = r.get('low')
+        if h is None or l is None: continue
+        long_move = (float(h) - entry) / entry * 100.0
+        short_move = (entry - float(l)) / entry * 100.0
+        if long_move > max_long_pct: max_long_pct = long_move
+        if short_move > max_short_pct: max_short_pct = short_move
 
     x_raw = vectorize(feat)
     scaler.update(x_raw)
@@ -1341,10 +1769,11 @@ def hindsight_replay_for_prediction(coins_conn, bandit, scaler, prediction, cfg)
         if action['side'] is None:
             skip_idx = idx
             continue
+        max_possible = max_long_pct if action['side'] == 'long' else max_short_pct
         replay = replay_action(
             klines_rows, entry,
             action['side'], action['tp_pct'] or 0.0, action['sl_pct'] or 0.0,
-            timeout_h, time_penalty, reward_timeout_pen,
+            eval_timeout_h, time_penalty, max_possible, reward_cfg,
         )
         rewards_by_action[action['name']] = replay
         if replay['reward'] is not None:
@@ -1379,6 +1808,8 @@ def backfill_hindsight(s, bandit, scaler):
     den Drawdown-Wert in jedes Features-Snapshot vor dem Bandit-Update."""
     log.info("Hindsight-Backfill startet...")
     cfg = s["predictor"]
+    bandit_cfg = cfg.get("bandit", {})
+    cutoff = bandit_cfg.get("backfill_closed_at_cutoff")  # ISO-Date z.B. '2026-05-12' fuer Soft-Restart
     vwallet_cfg = cfg.get("virtual_wallet", {})
     start_balance = float(vwallet_cfg.get("start_balance", 200.0))
     margin = float(vwallet_cfg.get("margin_per_trade", 20.0))
@@ -1394,15 +1825,21 @@ def backfill_hindsight(s, bandit, scaler):
             log.warning("reset_virtual_wallet failed: %s", e)
 
         with app.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
+            query = """
                 SELECT id, symbol, side, entry_px, sl_px, tp_px, features,
                        created_at, closed_at, rule_name, status, pnl_pct,
                        effective_leverage
                 FROM open_predictions
                 WHERE status IN ('win','loss','timeout')
                   AND closed_at IS NOT NULL AND features IS NOT NULL
-                ORDER BY closed_at
-            """)
+            """
+            params = []
+            if cutoff:
+                query += " AND closed_at >= %s"
+                params.append(cutoff)
+                log.info("Backfill-Cutoff aktiv: nur Closes ab %s", cutoff)
+            query += " ORDER BY closed_at"
+            cur.execute(query, params)
             preds = cur.fetchall()
         if not preds:
             log.info("Backfill: keine geschlossenen Predictions vorhanden")
@@ -1435,18 +1872,80 @@ def backfill_hindsight(s, bandit, scaler):
     return n_preds, n_updates
 
 
+def process_due_predictor_hindsight(s, bandit, scaler, batch_size=20):
+    """Liest faellige Eintraege aus predictor_hindsight_queue und ruft fuer
+    jeden hindsight_replay_for_prediction mit voller Klines-Range (timeout_h
+    + extended_minutes). Markiert processed nach Erfolg.
+
+    Lernsignal kommt damit ~timeout_h + extended_min nach Open — der Bandit
+    sieht ob seine Action in der GESAMTEN Bewertungsperiode getroffen
+    haette (auch wenn der reale Trade frueh Win/Loss oder Timeout war)."""
+    n_processed = 0; n_total_updates = 0
+    cfg = s["predictor"]
+    with db_app(s) as app, db_coins(s) as coins:
+        while True:
+            with app.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT q.id AS qid, q.prediction_id,
+                           p.symbol, p.side, p.entry_px, p.features, p.created_at
+                    FROM predictor_hindsight_queue q
+                    JOIN open_predictions p ON p.id = q.prediction_id
+                    WHERE q.processed_at IS NULL AND q.ready_at <= now()
+                    ORDER BY q.ready_at
+                    LIMIT %s
+                """, (batch_size,))
+                due = cur.fetchall()
+            if not due: break
+            for d in due:
+                feat = d['features'] if isinstance(d['features'], dict) else {}
+                pred_dict = {
+                    'symbol': d['symbol'], 'side': d['side'],
+                    'entry_px': d['entry_px'], 'features': feat,
+                    'created_at': d['created_at'],
+                }
+                try:
+                    n, rewards_map, chosen_replay = hindsight_replay_for_prediction(
+                        coins, bandit, scaler, pred_dict, cfg)
+                except Exception as e:
+                    log.warning("predictor-hindsight pid=%s failed: %s", d['prediction_id'], e)
+                    n = 0; rewards_map = {}; chosen_replay = None
+
+                if n > 0:
+                    chosen_name = feat.get('_action_name', '?')
+                    chosen_r = chosen_replay.get('reward') if chosen_replay else None
+                    rated = [(k, v) for k, v in rewards_map.items()
+                             if v.get('reward') is not None]
+                    top = sorted(rated, key=lambda kv: -kv[1]['reward'])[:3]
+                    log.info("HINDSIGHT %s chosen=%s r=%s | top3: %s | n_updates=%d",
+                             d['symbol'], chosen_name,
+                             f"{chosen_r:+.3f}" if chosen_r is not None else "?",
+                             ", ".join(f"{k}:{v['reward']:+.2f}" for k, v in top),
+                             n)
+                    n_total_updates += n
+                    n_processed += 1
+
+                with app.cursor() as cur2:
+                    cur2.execute("""
+                        UPDATE predictor_hindsight_queue
+                        SET processed_at=now(), n_updates=%s
+                        WHERE id=%s
+                    """, (n, d['qid']))
+                app.commit()
+            if len(due) < batch_size: break
+    return n_processed, n_total_updates
+
+
 # =============================================================================
 # Watch-Pass v4 — TP/SL/Timeout-Check + Hindsight-Update fuer ALLE Actions
 # =============================================================================
 
-def watch_pass_v4(s, bandit, scaler, state_path):
+def watch_pass_mh(s, mh_model, state_path):
+    """Watch-Pass v5: trackt peak/trough, schließt bei TP/SL/Timeout,
+    learnt Multi-Head direkt aus realisiertem peak_pct/trough_pct beim Close."""
     cfg = s["predictor"]
-    bandit_cfg = cfg.get("bandit", {})
-    timeout_h = float(bandit_cfg.get("timeout_hours", cfg.get("timeout_hours", 12)))
-    reward_skip = float(bandit_cfg.get("reward_skip", 0.1))
-    reward_timeout_pen = float(bandit_cfg.get("reward_timeout_penalty", -0.3))
-    reward_time_penalty_h = float(bandit_cfg.get("reward_time_penalty_per_hour", 0.15))
-    # Virtuelle Wallet — fuer Drawdown-Feature des Bandits
+    mh_cfg = cfg.get("multi_head", {})
+    timeout_h = get_timeout_hours(s)
+    # Virtuelle Wallet — Drawdown-Feature für Multi-Head
     vwallet_cfg = cfg.get("virtual_wallet", {})
     vwallet_margin = float(vwallet_cfg.get("margin_per_trade", 20.0))
     vwallet_slip = float(vwallet_cfg.get("slippage_pct_per_trade", 0.1))
@@ -1538,8 +2037,8 @@ def watch_pass_v4(s, bandit, scaler, state_path):
                             last_px=%s, last_check_at=now(), peak_px=%s, trough_px=%s
                         WHERE id=%s AND status='open'
                     """, (status, exit_px, pnl_pct, cur_px, peak_px, trough_px, o['id']))
-                    # Predictor-Hindsight nur fuer Bandit-Trades (keine resync_hl).
-                    if o.get('source') != 'resync_hl':
+                    # Multi-Head-Learn nur fuer multi_head-Trades (keine resync_hl).
+                    if o.get('source') == 'multi_head':
                         closes.append({
                             'id': o['id'], 'symbol': o['symbol'], 'side': side,
                             'entry': entry, 'exit': exit_px, 'pnl_pct': pnl_pct,
@@ -1559,8 +2058,8 @@ def watch_pass_v4(s, bandit, scaler, state_path):
                     new_dd = update_virtual_wallet(app, pnl_dollar)
                     log.info("WALLET %s gross=$%.2f slip=$%.2f net=$%.2f drawdown=%.2f%%",
                              o['symbol'], gross_pnl, slip_dollar, pnl_dollar, new_dd)
-                    log.info("CLOSE %s %s status=%s pnl=%.3f%% action=%s",
-                             o['symbol'], side, status, pnl_pct, o['rule_name'])
+                    log.info("CLOSE %s %s status=%s pnl=%.3f%% peak=%.2f%% trough=%.2f%%",
+                             o['symbol'], side, status, pnl_pct, peak_pct_v, trough_pct_v)
                 else:
                     cur_a.execute("""
                         UPDATE open_predictions
@@ -1571,36 +2070,39 @@ def watch_pass_v4(s, bandit, scaler, state_path):
 
     if not closes: return 0
 
-    # Hindsight-Replay: pro Close werden ALLE 31 Actions aus echter Klines-Trajectory bewertet.
-    with db_learner(s) as ldb, db_app(s) as app, db_coins(s) as coins:
+    # Multi-Head-Learn: direkt aus realisierten peak/trough beim Close lernen.
+    # Kein Queue mehr — Modell sieht echte realisierte Bewegung sofort.
+    mh_cfg = s["predictor"].get("multi_head", {})
+    flat_thresh = float(mh_cfg.get("timeout_flat_threshold_pct", 0.3))
+    to_correct_w = float(mh_cfg.get("timeout_correct_weight", 0.3))
+    to_wrong_w = float(mh_cfg.get("timeout_wrong_weight", 1.0))
+    loss_w = float(mh_cfg.get("loss_weight", 1.0))
+    win_w = float(mh_cfg.get("win_weight", 1.0))
+
+    # Extended-Hindsight: Lernen nicht direkt beim Close, sondern delayed via Queue.
+    # ready_at = created_at + timeout_h + extended_min — bis dahin sind alle relevanten
+    # klines verfuegbar, das Modell sieht die volle Bewegungs-Range (auch nach early-TP-Hit).
+    timeout_h_now = get_timeout_hours(s)
+    extended_min = float(mh_cfg.get("hindsight_extended_minutes", 30))
+
+    with db_learner(s) as ldb, db_app(s) as app:
         with ldb.cursor() as cur_l:
             for c in closes:
                 feat = c.get('features') or {}
                 if not isinstance(feat, dict): feat = {}
-                pred_dict = {
-                    'symbol': c['symbol'], 'side': c['side'],
-                    'entry_px': c['entry'], 'features': feat,
-                    'created_at': c['created_at'],
-                    'closed_at': datetime.now(timezone.utc),
-                }
+                ready_at = c['created_at'] + timedelta(hours=timeout_h_now, minutes=extended_min)
                 try:
-                    n, rewards_map, chosen_replay = hindsight_replay_for_prediction(
-                        coins, bandit, scaler, pred_dict, s["predictor"])
-                    if n > 0:
-                        chosen_name = feat.get('_action_name', '?')
-                        chosen_r = chosen_replay.get('reward') if chosen_replay else None
-                        # Top-3 Actions nach reward — nur Actions mit gueltigem Reward,
-                        # incomplete (reward=None) wird im Log uebersprungen.
-                        rated = [(k, v) for k, v in rewards_map.items()
-                                 if v.get('reward') is not None]
-                        top = sorted(rated, key=lambda kv: -kv[1]['reward'])[:3]
-                        log.info("HINDSIGHT %s chosen=%s r=%s | top3: %s | n_updates=%d",
-                                 c['symbol'], chosen_name,
-                                 f"{chosen_r:+.3f}" if chosen_r is not None else "?",
-                                 ", ".join(f"{k}:{v['reward']:+.2f}" for k, v in top),
-                                 n)
+                    with app.cursor() as cur_q:
+                        cur_q.execute("""
+                            INSERT INTO predictor_hindsight_queue
+                              (prediction_id, closed_at, ready_at)
+                            VALUES (%s, now(), %s)
+                            ON CONFLICT (prediction_id) DO NOTHING
+                        """, (c['id'], ready_at))
+                    app.commit()
                 except Exception as e:
-                    log.warning("hindsight replay %s: %s", c['symbol'], e)
+                    log.warning("hindsight-queue insert %s id=%s failed: %s",
+                                c['symbol'], c['id'], e)
 
                 duration = int((datetime.now(timezone.utc) - c['created_at']).total_seconds() / 60)
                 won = c['status'] == 'win' or (c['status'] == 'timeout' and (c.get('pnl_pct') or 0) > 0)
@@ -1619,7 +2121,6 @@ def watch_pass_v4(s, bandit, scaler, state_path):
                        c.get('peak_pct'), c.get('trough_pct')))
         ldb.commit()
 
-        # State-Counters
         with app.cursor() as cur_a:
             cur_a.execute("""
                 UPDATE predictor_state SET closed_count = COALESCE(closed_count,0) + %s,
@@ -1627,9 +2128,112 @@ def watch_pass_v4(s, bandit, scaler, state_path):
             """, (len(closes),))
         app.commit()
 
-    # Bandit-State persistieren
-    save_state({'bandit': bandit, 'scaler': scaler, 'feature_keys': FEATURE_KEYS}, state_path)
+    log.info("watch-pass: %d closes, alle in Hindsight-Queue (ready_at=open+%dh+%dmin)",
+             len(closes), int(timeout_h_now), int(extended_min))
     return len(closes)
+
+
+def process_due_mh_hindsight(s, mh_model, state_path, batch_size=20):
+    """Verarbeitet faellige Eintraege aus predictor_hindsight_queue.
+
+    Bei jedem fälligen Eintrag:
+      1. Hole prediction-Row (features, side, status, created_at, entry_px)
+      2. Hole klines im Range [created_at, created_at + timeout_h + extended_min]
+      3. Berechne echtes peak_pct + trough_pct über VOLLE Range (nicht nur bis Close!)
+      4. mh_model.learn_close mit echten Werten
+
+    Damit lernt das Modell die WIRKLICHE Coin-Bewegung — auch wenn der Trade früh
+    durch TP geschlossen wurde, sieht der Magnitude-Regressor das tatsaechliche
+    Hoch/Tief der vollen Lookahead-Range.
+    """
+    cfg = s["predictor"]
+    mh_cfg = cfg.get("multi_head", {})
+    flat_thresh = float(mh_cfg.get("timeout_flat_threshold_pct", 0.3))
+    to_correct_w = float(mh_cfg.get("timeout_correct_weight", 0.3))
+    to_wrong_w = float(mh_cfg.get("timeout_wrong_weight", 1.0))
+    loss_w = float(mh_cfg.get("loss_weight", 1.0))
+    win_w = float(mh_cfg.get("win_weight", 1.0))
+
+    n_learned = 0
+    with db_app(s) as app, db_coins(s) as coins:
+        while True:
+            with app.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT q.id AS qid, q.prediction_id,
+                           p.symbol, p.side, p.status, p.entry_px,
+                           p.features, p.created_at
+                    FROM predictor_hindsight_queue q
+                    JOIN open_predictions p ON p.id = q.prediction_id
+                    WHERE q.processed_at IS NULL AND q.ready_at <= now()
+                      AND p.source = 'multi_head'
+                    ORDER BY q.ready_at
+                    LIMIT %s
+                """, (batch_size,))
+                due = cur.fetchall()
+            if not due:
+                break
+            for d in due:
+                feat = d['features'] if isinstance(d['features'], dict) else {}
+                feat_clean = {k: v for k, v in feat.items() if not k.startswith('_')}
+                entry = float(d['entry_px'])
+                created = d['created_at']
+                end_time = created + timedelta(hours=get_timeout_hours(s),
+                                               minutes=float(mh_cfg.get("hindsight_extended_minutes", 30)))
+                with coins.cursor(cursor_factory=RealDictCursor) as cur_c:
+                    cur_c.execute("""
+                        SELECT MAX(high) AS hi, MIN(low) AS lo
+                        FROM klines
+                        WHERE symbol=%s AND interval='10s'
+                          AND open_time BETWEEN %s AND %s
+                    """, (d['symbol'], created, end_time))
+                    row = cur_c.fetchone()
+                if not row or row['hi'] is None or row['lo'] is None:
+                    log.warning("process_due_mh_hindsight %s id=%s: keine klines im Range, skip",
+                                d['symbol'], d['prediction_id'])
+                    with app.cursor() as cur_u:
+                        cur_u.execute("UPDATE predictor_hindsight_queue SET processed_at=now(), n_updates=0 WHERE id=%s",
+                                      (d['qid'],))
+                    app.commit()
+                    continue
+                peak_pct_full = (float(row['hi']) - entry) / entry * 100.0
+                trough_pct_full = (entry - float(row['lo'])) / entry * 100.0
+
+                try:
+                    mh_model.learn_close(
+                        features=feat_clean,
+                        predicted_side=d['side'],
+                        status=d['status'],
+                        peak_pct=max(0.0, peak_pct_full),
+                        trough_pct=max(0.0, trough_pct_full),
+                        timeout_flat_threshold_pct=flat_thresh,
+                        timeout_correct_weight=to_correct_w,
+                        timeout_wrong_weight=to_wrong_w,
+                        loss_weight=loss_w,
+                        win_weight=win_w,
+                    )
+                    n_learned += 1
+                    log.info("HINDSIGHT-LEARN %s id=%s side=%s status=%s "
+                             "FULL-peak=%.3f%% FULL-trough=%.3f%% (vs closed-peak=?, n_obs=%d)",
+                             d['symbol'], d['prediction_id'], d['side'], d['status'],
+                             peak_pct_full, trough_pct_full, mh_model.direction.n_obs)
+                except Exception as e:
+                    log.exception("mh_model.learn_close failed for %s id=%s: %s",
+                                  d['symbol'], d['prediction_id'], e)
+                with app.cursor() as cur_u:
+                    cur_u.execute("UPDATE predictor_hindsight_queue SET processed_at=now(), n_updates=1 WHERE id=%s",
+                                  (d['qid'],))
+                app.commit()
+            if len(due) < batch_size:
+                break
+
+    if n_learned > 0:
+        try:
+            mh_model.save(state_path)
+            log.info("mh-hindsight processed: %d trades learned (n_obs=%d)",
+                     n_learned, mh_model.direction.n_obs)
+        except Exception as e:
+            log.exception("mh_model.save failed: %s", e)
+    return n_learned
 
 
 # =============================================================================
@@ -1639,15 +2243,17 @@ def watch_pass_v4(s, bandit, scaler, state_path):
 # =============================================================================
 
 _MODIFY_POSITION_KEYS = [
-    'time_in_trade_h', 'time_remaining_h',  # 10.05.2026: time_remaining ergaenzt
+    'time_in_trade_h', 'time_remaining_h',
     'pnl_now_pct', 'peak_pct_now', 'trough_pct_now',
-    'dist_to_tp_pct', 'dist_to_sl_pct', 'modify_count', 'original_action_idx',
+    'dist_to_tp_pct', 'dist_to_sl_pct', 'original_action_idx',
     'leverage', 'margin_pnl_pct',
 ]
+# modify_count entfernt 12.05.2026: seit Reform 10.05. nur noch 2 Actions
+# (hold + close_now), keine TP/SL-Modifikationen mehr -> Feature war ALWAYS 0.
 
 
 def build_modify_feature_keys(s):
-    """Modify-Bandit Features = Open-Bandit-Features + 10 Position-Features."""
+    """Trader-Bandit Features = Open-Bandit-Features + 10 Position-Features."""
     return build_feature_keys(s) + _MODIFY_POSITION_KEYS
 
 
@@ -1678,37 +2284,49 @@ def build_modify_actions(*_args, **_kwargs):
     ]
 
 
-def position_features(trader_pos_row, mark_px, current_tp_px, current_sl_px, modify_count, timeout_h=2.0):
-    """Position-Features fuer Modify-Bandit (Trade-State + Hebel + time_remaining).
+def position_features(trader_pos_row, mark_px, current_tp_px, current_sl_px, timeout_h=2.0):
+    """Position-Features fuer Trader-Bandit (Trade-State + Hebel + time_remaining).
     Eingabe: Row aus trader_positions (NICHT open_predictions!) — saubere Trennung.
-    timeout_h kommt aus settings.predictor.bandit.timeout_hours (Predictor-Hard-Close)."""
+    timeout_h kommt aus settings.predictor.bandit.timeout_hours (Predictor-Hard-Close).
+    modify_count entfernt 12.05.2026 (seit 2-Action-Reform immer 0)."""
     entry = float(trader_pos_row['entry_px'])
     side = trader_pos_row['side']
     leverage = float(trader_pos_row.get('leverage') or 1)
     age_s = (datetime.now(timezone.utc) - trader_pos_row['opened_at']).total_seconds()
     time_in_h = age_s / 3600.0
     time_left_h = max(0.0, float(timeout_h) - time_in_h)
+    if mark_px <= 0:
+        log.error("FALLBACK_TRIGGERED position_features tid=%s: mark_px=%s ungueltig -> None", trader_pos_row.get('id'), mark_px)
+        return None
+    peak_raw = trader_pos_row.get('peak_px')
+    trough_raw = trader_pos_row.get('trough_px')
+    if peak_raw is None or trough_raw is None:
+        log.error("FALLBACK_TRIGGERED position_features tid=%s: peak_px/trough_px NULL -> None", trader_pos_row.get('id'))
+        return None
+    peak = float(peak_raw); trough = float(trough_raw)
     if side == 'long':
         pnl_now = (mark_px - entry) / entry * 100.0
-        peak = float(trader_pos_row.get('peak_px') or entry)
-        trough = float(trader_pos_row.get('trough_px') or entry)
         peak_pct = (peak - entry) / entry * 100.0
         trough_pct = (trough - entry) / entry * 100.0
-        dist_tp = (current_tp_px - mark_px) / mark_px * 100.0 if mark_px > 0 else 0.0
-        dist_sl = (mark_px - current_sl_px) / mark_px * 100.0 if mark_px > 0 else 0.0
+        dist_tp = (current_tp_px - mark_px) / mark_px * 100.0
+        dist_sl = (mark_px - current_sl_px) / mark_px * 100.0
     else:
         pnl_now = (entry - mark_px) / entry * 100.0
-        peak = float(trader_pos_row.get('peak_px') or entry)
-        trough = float(trader_pos_row.get('trough_px') or entry)
         peak_pct = (entry - trough) / entry * 100.0
         trough_pct = (entry - peak) / entry * 100.0
-        dist_tp = (mark_px - current_tp_px) / mark_px * 100.0 if mark_px > 0 else 0.0
-        dist_sl = (current_sl_px - mark_px) / mark_px * 100.0 if mark_px > 0 else 0.0
-    feat_orig = trader_pos_row.get('features_at_open') or {}
-    if not isinstance(feat_orig, dict): feat_orig = {}
-    orig_idx = feat_orig.get('_action_idx', -1)
-    try: orig_idx = float(orig_idx)
-    except (TypeError, ValueError): orig_idx = -1.0
+        dist_tp = (mark_px - current_tp_px) / mark_px * 100.0
+        dist_sl = (current_sl_px - mark_px) / mark_px * 100.0
+    feat_orig = trader_pos_row.get('features_at_open')
+    if not isinstance(feat_orig, dict) or '_action_idx' not in feat_orig:
+        log.error("FALLBACK_TRIGGERED position_features tid=%s: features_at_open fehlt _action_idx -> None",
+                  trader_pos_row.get('id'))
+        return None
+    try:
+        orig_idx = float(feat_orig['_action_idx'])
+    except (TypeError, ValueError):
+        log.error("FALLBACK_TRIGGERED position_features tid=%s: _action_idx=%r nicht numerisch -> None",
+                  trader_pos_row.get('id'), feat_orig.get('_action_idx'))
+        return None
     return {
         'time_in_trade_h': time_in_h,
         'time_remaining_h': time_left_h,
@@ -1719,7 +2337,6 @@ def position_features(trader_pos_row, mark_px, current_tp_px, current_sl_px, mod
         'dist_to_sl_pct': dist_sl,
         'leverage': leverage,
         'margin_pnl_pct': pnl_now * leverage,
-        'modify_count': float(modify_count),
         'original_action_idx': orig_idx,
     }
 
@@ -1819,7 +2436,7 @@ def modify_pass(s, modify_bandit, modify_scaler, rng):
     if not bool(cfg.get("trading", {}).get("auto_trade")):
         return 0
 
-    timeout_h = float(cfg.get("bandit", {}).get("timeout_hours", 2.0))
+    timeout_h = get_timeout_hours(s)
     min_age = float(mb_cfg.get("min_open_age_seconds", 60))
     expl_floor = float(mb_cfg.get("exploration_floor", 0.05))
     expl_init = float(mb_cfg.get("exploration_init", 1.0))
@@ -1833,7 +2450,7 @@ def modify_pass(s, modify_bandit, modify_scaler, rng):
             cur.execute("""
                 SELECT id, prediction_id, symbol, side, entry_px, qty, leverage,
                        original_tp_px, original_sl_px, current_tp_px, current_sl_px,
-                       peak_px, trough_px, opened_at, features_at_open, modify_count
+                       peak_px, trough_px, opened_at, features_at_open
                 FROM trader_positions
                 WHERE status='open'
                   AND opened_at <= now() - (%s || ' seconds')::interval
@@ -1843,6 +2460,9 @@ def modify_pass(s, modify_bandit, modify_scaler, rng):
             return 0
 
         btc_moves = load_btc_moves(coins)
+        if btc_moves is None:
+            log.error("FALLBACK_TRIGGERED modify_pass: load_btc_moves None -> modify-pass abgebrochen")
+            return 0
         symbols = list({o['symbol'] for o in opens})
         with coins.cursor(cursor_factory=RealDictCursor) as cur_c:
             cur_c.execute("""
@@ -1856,7 +2476,6 @@ def modify_pass(s, modify_bandit, modify_scaler, rng):
             if mark_px is None: continue
             current_tp = float(o['current_tp_px'])
             current_sl = float(o['current_sl_px'])
-            mod_count = int(o.get('modify_count') or 0)
 
             # peak/trough auf aktuellen Stand bringen
             new_peak = max(float(o.get('peak_px') or o['entry_px']), mark_px)
@@ -1871,7 +2490,8 @@ def modify_pass(s, modify_bandit, modify_scaler, rng):
 
             base_feat = feature_snapshot_v2(coins, o['symbol'], rule_flags={}, btc_moves=btc_moves)
             if base_feat is None: continue
-            pos_feat = position_features(o, mark_px, current_tp, current_sl, mod_count, timeout_h=timeout_h)
+            pos_feat = position_features(o, mark_px, current_tp, current_sl, timeout_h=timeout_h)
+            if pos_feat is None: continue
             full_feat = {**base_feat, **pos_feat}
 
             # Hard-Timeout-Check (Reform 10.05.2026): age >= timeout_h -> Trader close_now.
@@ -2020,45 +2640,73 @@ def replay_modify_action(klines_rows, side, entry, tp_px, sl_px):
     return 'incomplete', last_close, pnl, elapsed_h
 
 
-def compute_efficiency_reward(captured_margin, max_margin_in_box, cfg=None):
-    """Efficiency-Reward (Reform 10.05.2026).
+def pick_efficiency_multiplier(eff_pct, stairs):
+    """Stufen-Lookup: stairs sortiert nach threshold aufsteigend, returnt Mult der
+    ersten Stufe die eff_pct <= threshold erfuellt. Bei eff_pct > letzter
+    threshold -> letzter Mult."""
+    eff_pct = max(0.0, min(100.0, float(eff_pct)))
+    for thresh, mult in stairs:
+        if eff_pct <= float(thresh):
+            return float(mult)
+    return float(stairs[-1][1])
 
-    captured_margin    = realisierter PnL der Action × Hebel (Margin-PnL in %)
-    max_margin_in_box  = max(margin_pnl) im Fenster [decision .. min(close, open+timeout)]
 
-    Logik:
-    - Verlust  -> reward = captured * loss_scale  (negativer wird linear bestraft)
-    - max <= 0 -> reward = 0  (Trade konnte nicht profitabel werden, neutral)
-    - sonst    -> efficiency = captured/max in [0..1], reward = (eff-0.5)*2*profit_scale
+def compute_efficiency_reward(captured_margin, max_margin_in_box, min_margin_in_box, cfg=None, leverage=None):
+    """Stufen-Efficiency-Reward (Reform 12.05.2026, Loss-x2 + Missed-Win-x3 13.05.2026).
 
-    Der Bandit bekommt damit:
-    - Nahe Maximum erwischt = +profit_scale
-    - Halbwegs erwischt    = ~0
-    - Wenig vom Potential  = -profit_scale
-    - Verlust              = captured * loss_scale (negativ)
+    captured_margin   = Margin-PnL der Action (% inkl. Hebel, vorzeichenbehaftet)
+    max_margin_in_box = max(margin_pnl) im Fenster — bestmöglicher Profit
+    min_margin_in_box = min(margin_pnl) im Fenster — schlimmstmöglicher Drawdown
+    leverage          = Hebel der Position (fuer Coin-%-Schwelle bei Missed-Win-Strafe)
+    cfg.efficiency_stairs        = Win-Stairs [[threshold_pct, multiplier], ...]
+    cfg.efficiency_stairs_loss   = Loss-Stairs (optional, fallback auf efficiency_stairs)
+    cfg.missed_win_threshold_coin_pct = Coin-%-Schwelle ab der max_box als verpasste Chance gilt
+    cfg.missed_win_penalty_mult       = Extra-Multiplier auf Loss-Reward bei verpasster Chance
     """
     if cfg is None: cfg = {}
-    profit_scale = float(cfg.get("profit_scale", 2.0))
-    loss_scale = float(cfg.get("loss_scale", 1.5))
-    if captured_margin < 0:
-        return float(captured_margin) * loss_scale
-    if max_margin_in_box <= 0:
-        return 0.0
-    efficiency = float(captured_margin) / float(max_margin_in_box)
-    efficiency = max(0.0, min(1.0, efficiency))
-    return (efficiency - 0.5) * 2.0 * profit_scale
+    stairs = cfg.get("efficiency_stairs")
+    if not stairs or not isinstance(stairs, list) or len(stairs) == 0:
+        log.error("FALLBACK_TRIGGERED compute_efficiency_reward: efficiency_stairs fehlt in modify_bandit.reward -> raise")
+        raise RuntimeError("predictor.modify_bandit.reward.efficiency_stairs missing in settings.json")
+
+    cap = float(captured_margin)
+    mx = float(max_margin_in_box)
+    mn = float(min_margin_in_box)
+
+    if cap >= 0:
+        if mx <= 0:
+            return 0.0
+        eff_pct = cap / mx * 100.0
+        mult = pick_efficiency_multiplier(eff_pct, stairs)
+        return cap * mult
+    else:
+        stairs_loss = cfg.get("efficiency_stairs_loss") or stairs
+        missed_mult = 1.0
+        if leverage is not None and float(leverage) > 0:
+            max_coin_pct = mx / float(leverage)
+            threshold = float(cfg.get("missed_win_threshold_coin_pct", 0.5))
+            if max_coin_pct >= threshold:
+                missed_mult = float(cfg.get("missed_win_penalty_mult", 3.0))
+        if mn >= 0:
+            mult = float(stairs_loss[-1][1])
+            return cap * mult * missed_mult
+        loss_eff_pct = cap / mn * 100.0
+        mult = pick_efficiency_multiplier(loss_eff_pct, stairs_loss)
+        return cap * mult * missed_mult
 
 
 def hindsight_replay_modify_neural(coins_conn, app_conn, modify_bandit, modify_scaler,
                                      prediction, lookahead_minutes=120,
                                      reward_cfg=None, **_legacy_kwargs):
-    """Trader-Hindsight (Reform 10.05.2026) — Efficiency-Reward, 2 Actions.
+    """Trader-Hindsight — Stufen-Efficiency-Reward (Stand 12.05.2026), 2 Actions.
 
     Pro Decision werden BEIDE Actions (hold, close_now) counterfactual bewertet:
-      max_box      = max(margin_pnl) im Fenster [decided_at .. min(closed_at, open+timeout)]
+      max_box  = max(margin_pnl) im Fenster — bester moeglicher Profit
+      min_box  = min(margin_pnl) im Fenster — schlimmster moeglicher Drawdown
       captured_hold  = margin_pnl am Fenster-Ende (was wuerde Halten bringen?)
       captured_close = margin_pnl am decided_at (was wuerde sofort schliessen bringen?)
-      reward = compute_efficiency_reward(captured, max_box, reward_cfg)
+      reward = compute_efficiency_reward(captured, max_box, min_box, reward_cfg)
+              -> Stufen-Multiplier × captured (siehe Funktion).
 
     Predictor-DB (open_predictions) wird NICHT angefasst (Welt-Trennung).
     LinTSBandit.update(i, x, r) — kein Replay-Buffer, direkt-online.
@@ -2068,6 +2716,7 @@ def hindsight_replay_modify_neural(coins_conn, app_conn, modify_bandit, modify_s
     side = prediction['side']
     entry = float(prediction['entry_px'])
     closed_at = prediction['closed_at']
+    opened_at = prediction.get('opened_at')
 
     with app_conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
@@ -2084,12 +2733,15 @@ def hindsight_replay_modify_neural(coins_conn, app_conn, modify_bandit, modify_s
     end_at = base_end + timedelta(minutes=int(lookahead_minutes))
     end_at = min(end_at, datetime.now(timezone.utc))
 
+    # Klines ab opened_at (gesamter Trade-Verlauf), nicht erst ab erster Decision
+    box_start = opened_at if opened_at else decisions[0]['decided_at']
+
     with coins_conn.cursor(cursor_factory=RealDictCursor) as cur_c:
         cur_c.execute("""
             SELECT open_time, high, low, close FROM klines
             WHERE symbol=%s AND interval='10s' AND open_time BETWEEN %s AND %s
             ORDER BY open_time
-        """, (sym, decisions[0]['decided_at'], end_at))
+        """, (sym, box_start, end_at))
         klines = cur_c.fetchall()
     if not klines:
         return 0
@@ -2099,6 +2751,26 @@ def hindsight_replay_modify_neural(coins_conn, app_conn, modify_bandit, modify_s
     idx_hold = name_to_idx.get('hold')
     idx_close = name_to_idx.get('close_now')
     if idx_hold is None or idx_close is None:
+        return 0
+
+    # GLOBALE Box ueber gesamten Trade-Verlauf [opened_at, end_at] — jeder Decision-Tick
+    # wird gegen DIESELBEN max/min bewertet. Verhindert dass spaete Ticks die verpasste
+    # Peak-Chance aus der Vergangenheit "vergessen" und so der Missed-Win-Strafe entgehen.
+    max_pnl_pct_g = -1e9
+    min_pnl_pct_g = 1e9
+    for k in klines:
+        h = k.get('high'); l = k.get('low')
+        if h is None or l is None: continue
+        h = float(h); l = float(l)
+        if side == 'long':
+            pnl_high = (h - entry) / entry * 100.0  # bester Profit ueber Trade
+            pnl_low  = (l - entry) / entry * 100.0  # schlimmster Drawdown
+        else:
+            pnl_high = (entry - l) / entry * 100.0
+            pnl_low  = (entry - h) / entry * 100.0
+        if pnl_high > max_pnl_pct_g: max_pnl_pct_g = pnl_high
+        if pnl_low < min_pnl_pct_g: min_pnl_pct_g = pnl_low
+    if max_pnl_pct_g == -1e9:
         return 0
 
     n_updates = 0
@@ -2113,21 +2785,9 @@ def hindsight_replay_modify_neural(coins_conn, app_conn, modify_bandit, modify_s
         first_close = float(klines_after[0].get('close') or entry)
         last_close = float(klines_after[-1].get('close') or entry)
 
-        # Margin-PnL der einzelnen Klines im Fenster (high+low fuer max_box)
-        max_pnl_pct = -1e9
-        for k in klines_after:
-            h = k.get('high'); l = k.get('low')
-            if h is None or l is None: continue
-            h = float(h); l = float(l)
-            best = h if side == 'long' else l
-            if side == 'long':
-                pnl_pct = (best - entry) / entry * 100.0
-            else:
-                pnl_pct = (entry - best) / entry * 100.0
-            if pnl_pct > max_pnl_pct: max_pnl_pct = pnl_pct
-        if max_pnl_pct == -1e9:
-            continue
-        max_margin = max_pnl_pct * leverage
+        # Globale Box in Margin umrechnen (leverage trade-konstant)
+        max_margin = max_pnl_pct_g * leverage
+        min_margin = min_pnl_pct_g * leverage
 
         # captured_close = jetzt schliessen zum first_close
         pnl_close_pct = ((first_close - entry)/entry*100) if side == 'long' else ((entry - first_close)/entry*100)
@@ -2137,8 +2797,8 @@ def hindsight_replay_modify_neural(coins_conn, app_conn, modify_bandit, modify_s
         pnl_hold_pct = ((last_close - entry)/entry*100) if side == 'long' else ((entry - last_close)/entry*100)
         captured_hold = pnl_hold_pct * leverage
 
-        r_close = compute_efficiency_reward(captured_close, max_margin, reward_cfg)
-        r_hold = compute_efficiency_reward(captured_hold, max_margin, reward_cfg)
+        r_close = compute_efficiency_reward(captured_close, max_margin, min_margin, reward_cfg, leverage=leverage)
+        r_hold = compute_efficiency_reward(captured_hold, max_margin, min_margin, reward_cfg, leverage=leverage)
         modify_bandit.update(idx_close, x, r_close)
         modify_bandit.update(idx_hold, x, r_hold)
         n_updates += 2
@@ -2186,29 +2846,67 @@ def sync_hl_to_db(s):
     for o in fe_orders:
         orders_by_coin.setdefault(o['coin'], []).append(o)
 
+    # HL user_fills laden — Quelle der Wahrheit fuer exit_px + pnl_pct bei
+    # failsafe-Closes (TP-Hit, SL-Hit, manueller Close auf HL).
+    try:
+        hl_fills = info.user_fills(addr) or []
+    except Exception as e:
+        log.warning("sync_hl_to_db user_fills laden scheiterte: %s", e)
+        hl_fills = []
+
+    def _real_close_from_fills(coin, side, opened_at, qty):
+        """Aggregiert HL-Close-Fills im Fenster [opened_at, jetzt] fuer (coin, side).
+        Returns (exit_px, pnl_coin_pct) oder (None, None) falls keine Fills."""
+        target_dir = 'Close Long' if side == 'long' else 'Close Short'
+        opened_ms = int(opened_at.timestamp() * 1000)
+        matching = [f for f in hl_fills
+                    if f.get('coin') == coin
+                    and target_dir in str(f.get('dir', ''))
+                    and int(f.get('time', 0)) >= opened_ms
+                    and float(f.get('closedPnl', 0) or 0) != 0]
+        if not matching:
+            return None, None
+        total_sz = sum(float(f.get('sz', 0)) for f in matching)
+        if total_sz <= 0: return None, None
+        total_quote = sum(float(f.get('sz', 0)) * float(f.get('px', 0)) for f in matching)
+        total_pnl_usd = sum(float(f.get('closedPnl', 0) or 0) for f in matching)
+        avg_exit = total_quote / total_sz
+        # closedPnl ist bereits side-aware (positiv=Gewinn). Caller rechnet daraus
+        # pnl_coin_pct = total_pnl_usd / (qty_at_open * entry_px) * 100
+        return avg_exit, total_pnl_usd
+
     n_failsafe = 0; n_repaired = 0; n_orphan_cancelled = 0
     with db_app(s) as app:
         # Richtung A: trader_positions.open ohne HL-Pos -> failsafe
         with app.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT id, symbol, side, entry_px, current_tp_px, current_sl_px
+                SELECT id, symbol, side, entry_px, qty, opened_at,
+                       current_tp_px, current_sl_px
                 FROM trader_positions WHERE status='open'
             """)
             tp_rows = cur.fetchall()
         for tr in tp_rows:
             coin = tr['symbol']
             if coin in hl_pos_by_coin: continue  # HL-Pos da, alles OK
+            entry = float(tr['entry_px'])
+            qty = float(tr['qty']) if tr['qty'] else 0.0
+            side = tr['side']
+            avg_exit, pnl_usd = _real_close_from_fills(coin, side, tr['opened_at'], qty)
+            if avg_exit is None or qty <= 0 or entry <= 0:
+                log.error("FALLBACK_TRIGGERED sync_hl_to_db.failsafe %s tid=%s: keine HL-fills/qty/entry -> Row bleibt 'open' fuer naechsten Sync-Tick", coin, tr['id'])
+                continue
+            pnl_coin_pct = pnl_usd / (qty * entry) * 100.0
             with app.cursor() as cur2:
                 cur2.execute("""
                     UPDATE trader_positions
                     SET status='failsafe', closed_at=now(),
-                        exit_px=entry_px, pnl_pct=0
+                        exit_px=%s, pnl_pct=%s
                     WHERE id=%s AND status='open'
-                """, (tr['id'],))
+                """, (avg_exit, round(pnl_coin_pct, 4), tr['id']))
                 if cur2.rowcount > 0:
                     n_failsafe += 1
-                    log.info("TRADER-FAILSAFE %s trader_pid=%s (HL-Pos weg, status=failsafe)",
-                             coin, tr['id'])
+                    log.info("TRADER-FAILSAFE %s trader_pid=%s pnl_coin=%.3f%% exit=%.6g (HL-fills)",
+                             coin, tr['id'], pnl_coin_pct, avg_exit)
             app.commit()
 
         # Richtung B: HL-Pos da aber TP/SL-Orders fehlen -> Repair aus trader_positions
@@ -2323,6 +3021,70 @@ def sync_hl_to_db(s):
     return n_failsafe + n_repaired
 
 
+def timeout_watch(s):
+    """Schliesst trader_positions mit timeout_enabled=true die laenger als
+    predictor.bandit.timeout_hours offen sind. settings_reload zieht den
+    Wert live nach, kein Hardcode. Trader-Welt only.
+
+    Verhalten: HL-Position via close_position_hl schliessen, dann DB-Row
+    status='closed' mit pnl_pct aus aktuellem mark-Price und exit_px=mark."""
+    if '/opt/coin/backend' not in sys.path:
+        sys.path.insert(0, '/opt/coin/backend')
+    try:
+        from rl_agent.trader import get_hl_credentials, close_position_hl, get_hl_info
+    except Exception as e:
+        log.warning("timeout_watch trader-import fehlgeschlagen: %s", e)
+        return 0
+    timeout_h = get_timeout_hours(s)
+    creds = get_hl_credentials()
+    if not creds: return 0
+    addr = creds.get('wallet_address')
+    n_closed = 0
+    try:
+        info = get_hl_info()
+        mids = info.all_mids() or {}
+    except Exception:
+        mids = {}
+    with db_app(s) as app:
+        with app.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, symbol, side, entry_px, opened_at
+                FROM trader_positions
+                WHERE status='open' AND timeout_enabled=TRUE
+                  AND opened_at < now() - (%s || ' hours')::interval
+                ORDER BY opened_at
+            """, (str(timeout_h),))
+            due = cur.fetchall()
+        for r in due:
+            coin = r['symbol']; side = r['side']
+            entry = float(r['entry_px'])
+            mark_raw = mids.get(coin)
+            if mark_raw is None:
+                log.error("FALLBACK_TRIGGERED timeout_watch %s tid=%s: kein mark in HL.all_mids -> skip diesen Tick", coin, r['id'])
+                continue
+            mark = float(mark_raw)
+            pnl_pct = (mark - entry) / entry * 100.0 if side == 'long' else (entry - mark) / entry * 100.0
+            try:
+                close_res = close_position_hl(creds, coin, addr)
+                ok = close_res.get('success') if close_res else False
+            except Exception as e:
+                log.error("FALLBACK_TRIGGERED timeout_watch %s tid=%s: close_position_hl Exception '%s' -> Row bleibt open", coin, r['id'], e)
+                ok = False
+            if ok:
+                with app.cursor() as cur2:
+                    cur2.execute("""
+                        UPDATE trader_positions
+                        SET status='closed', closed_at=now(),
+                            exit_px=%s, pnl_pct=%s
+                        WHERE id=%s AND status='open'
+                    """, (mark, round(pnl_pct, 4), r['id']))
+                app.commit()
+                n_closed += 1
+                log.info("TIMEOUT-CLOSE %s %s trader_pid=%s pnl=%.3f%% (age>%.1fh)",
+                         coin, side, r['id'], pnl_pct, timeout_h)
+    return n_closed
+
+
 def queue_pending_hindsight(s, lookahead_minutes=120):
     """Findet frisch geschlossene trader_positions, queued sie in
     trader_hindsight_queue mit ready_at = closed_at + lookahead. Trader-eigene Welt."""
@@ -2361,7 +3123,8 @@ def backfill_trader_from_closed_trades(s, modify_bandit, modify_scaler,
     Predictor-DB nur lesend genutzt, Trader-State + Buffer werden gefuellt."""
     log.info("Trader-Backfill: starte aus closed Trades letzte %dd", days)
     n_trades = 0; n_obs_added = 0
-    lookahead_min = float(s["predictor"]["modify_bandit"].get("hindsight_delay_minutes", 120))
+    # Hindsight-Lookahead = Trade-Timeout (Single Source of Truth, predictor.bandit.timeout_hours)
+    lookahead_min = get_timeout_hours(s) * 60.0
 
     with db_app(s) as app, db_coins(s) as coins:
         with app.cursor(cursor_factory=RealDictCursor) as cur:
@@ -2433,7 +3196,7 @@ def backfill_trader_from_closed_trades(s, modify_bandit, modify_scaler,
                     'time_in_trade_h': age_h, 'pnl_now_pct': pnl_now,
                     'peak_pct_now': peak_pct, 'trough_pct_now': trough_pct,
                     'dist_to_tp_pct': dist_tp, 'dist_to_sl_pct': dist_sl,
-                    'modify_count': 0.0, 'original_action_idx': orig_idx,
+                    'original_action_idx': orig_idx,
                 })
 
                 x_raw = vectorize_modify(full_feat)
@@ -2493,7 +3256,7 @@ def process_due_hindsight(s, modify_bandit, modify_scaler, batch_size=64,
             with app.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT q.id AS queue_id, q.position_id, q.closed_at,
-                           tp.symbol, tp.side, tp.entry_px
+                           tp.symbol, tp.side, tp.entry_px, tp.opened_at
                     FROM trader_hindsight_queue q
                     JOIN trader_positions tp ON q.position_id = tp.id
                     WHERE q.processed_at IS NULL AND q.ready_at <= now()
@@ -2506,7 +3269,7 @@ def process_due_hindsight(s, modify_bandit, modify_scaler, batch_size=64,
                 pred_dict = {
                     'id': d['position_id'], 'symbol': d['symbol'],
                     'side': d['side'], 'entry_px': d['entry_px'],
-                    'closed_at': d['closed_at'],
+                    'closed_at': d['closed_at'], 'opened_at': d['opened_at'],
                 }
                 try:
                     n_u = hindsight_replay_modify_neural(
@@ -2550,56 +3313,39 @@ def main():
     FEATURE_KEYS = build_feature_keys(s)
     N_FEAT = len(FEATURE_KEYS) + 1
 
-    bandit_cfg = cfg.get("bandit", {})
-    state_path = bandit_cfg.get("state_path", "/opt/coin/database/data/models/predictor_v4_bandit.pkl")
-    tp_buckets = bandit_cfg.get("tp_buckets_pct", [1.0, 2.0, 3.0, 5.0, 8.0])
-    sl_buckets = bandit_cfg.get("sl_buckets_pct", [1.0, 2.0, 3.0])
-    alpha = float(bandit_cfg.get("prior_alpha", 1.0))
-    sigma2 = float(bandit_cfg.get("noise_sigma2", 1.0))
-    seed = int(bandit_cfg.get("seed", 42))
+    # ============= Multi-Head Predictor (v5) =============
+    mh_cfg = cfg.get("multi_head", {})
+    state_path = mh_cfg.get("state_path",
+                            "/opt/coin/database/data/models/predictor_v5_mh.pkl")
+    seed = int(mh_cfg.get("seed", 42))
+    n_models_direction = int(mh_cfg.get("n_models_direction", 10))
+    grace_period = int(mh_cfg.get("grace_period", 50))
 
-    actions = build_actions(tp_buckets, sl_buckets)
-    action_names = [a['name'] for a in actions]
-
-    # Bandit + Scaler laden oder frisch erstellen.
-    # Fresh-Start triggert wenn: kein State, Action-Names veraendert, oder
-    # Feature-Keys (z.B. neue/umbenannte Regel) veraendert.
-    state = load_state(state_path)
-    fresh_reason = None
-    if state is None:
-        fresh_reason = "no state file"
-    else:
-        st_action_names = [a['name'] for a in state.get('bandit').actions]
-        st_feature_keys = state.get('feature_keys', [])
-        if st_action_names != action_names:
-            fresh_reason = f"action-space changed ({len(st_action_names)} -> {len(action_names)} or names differ)"
-        elif st_feature_keys != FEATURE_KEYS:
-            fresh_reason = f"feature-keys changed ({len(st_feature_keys)} -> {len(FEATURE_KEYS)} or names differ)"
-
-    if fresh_reason:
-        if state is not None:
-            log.warning("Bandit fresh start — %s", fresh_reason)
-        bandit = LinTSBandit(N_FEAT, actions, alpha=alpha, sigma2=sigma2)
-        scaler = OnlineScaler(N_FEAT)
-        save_state({'bandit': bandit, 'scaler': scaler, 'feature_keys': FEATURE_KEYS}, state_path)
-        log.info("Bandit fresh start: %d actions, %d features", len(actions), N_FEAT)
-        # Bei Fresh-Start: Backfill-Flag-File loeschen damit Backfill automatisch
-        # laeuft (sonst startet Bandit komplett cold mit den ersten Trades).
-        backfill_flag_pre = state_path + '.backfill_done'
-        if os.path.exists(backfill_flag_pre):
-            try:
-                os.remove(backfill_flag_pre)
-                log.info("Backfill-Flag-File geloescht — Backfill laeuft beim Start neu durch")
-            except Exception as e:
-                log.warning("Backfill-Flag-File loeschen scheiterte: %s", e)
-    else:
-        bandit = state['bandit']; scaler = state['scaler']
-        log.info("Bandit loaded: %d actions, %d features, %d total observations",
-                 len(actions), N_FEAT, sum(bandit.n_obs))
+    mh_model = None
+    if os.path.exists(state_path):
+        try:
+            mh_model = MultiHeadPredictor.load(state_path)
+            if mh_model.version != MultiHeadPredictor.VERSION:
+                log.warning("Multi-Head state version mismatch (%s != %s), fresh start",
+                            mh_model.version, MultiHeadPredictor.VERSION)
+                mh_model = None
+            else:
+                log.info("Multi-Head loaded: stats=%s", mh_model.stats())
+        except Exception as e:
+            log.warning("Multi-Head load failed (%s), fresh start", e)
+            mh_model = None
+    if mh_model is None:
+        mh_model = MultiHeadPredictor(
+            seed=seed,
+            n_models_direction=n_models_direction,
+            grace_period=grace_period,
+        )
+        mh_model.save(state_path)
+        log.info("Multi-Head fresh start: seed=%d n_models=%d grace=%d",
+                 seed, n_models_direction, grace_period)
 
     rng = np.random.default_rng(seed)
-    log.info("Predictor %s start. tp_buckets=%s sl_buckets=%s scan=%ss watch=%ss top_n=%d",
-             ACTIVE_VERSION, tp_buckets, sl_buckets,
+    log.info("Predictor v5 (Multi-Head) start. scan=%ss watch=%ss top_n=%d",
              cfg["scan_interval_seconds"], cfg["watch_interval_seconds"], cfg["universe_top_n"])
 
     # ============= Trader-Setup (LinTSBandit, 2 Actions, eigene Welt) =============
@@ -2609,7 +3355,7 @@ def main():
     modify_scaler = None
     modify_state_path = None
     modify_interval = float(mb_cfg.get("interval_seconds", 30))
-    hindsight_delay_min = float(mb_cfg.get("hindsight_delay_minutes", 120))
+    # hindsight_delay_min wird pro Tick in der main-loop live aus get_timeout_hours(s) * 60 berechnet
     if mb_cfg.get("enabled"):
         MODIFY_FEATURE_KEYS = build_modify_feature_keys(s)
         N_FEAT_MODIFY = len(MODIFY_FEATURE_KEYS) + 1
@@ -2665,23 +3411,11 @@ def main():
     else:
         log.info("Trader disabled in settings")
 
-    # Hindsight-Backfill (einmalig). Marker ist eine flag-Datei neben dem state-file
-    # — damit modifiziert der Service NICHT settings.json. Re-run = flag-File loeschen.
-    backfill_flag = state_path + '.backfill_done'
-    if bandit_cfg.get("hindsight_backfill_on_start", False):
-        if os.path.exists(backfill_flag):
-            log.info("Backfill-Flag in settings ist true, aber %s existiert -> skip. "
-                     "Zum erneuten Ausfuehren Flag-File loeschen.", backfill_flag)
-        else:
-            try:
-                n_preds, n_updates = backfill_hindsight(s, bandit, scaler)
-                save_state({'bandit': bandit, 'scaler': scaler, 'feature_keys': FEATURE_KEYS}, state_path)
-                Path(backfill_flag).touch()
-                log.info("Hindsight-Backfill erledigt. Marker: %s", backfill_flag)
-            except Exception as e:
-                log.exception("backfill_hindsight scheiterte: %s", e)
+    # Hindsight-Backfill v4 entfällt — Multi-Head v5 lernt online beim Close,
+    # kein Backfill auf historischen Closes (Cardinal Rule 4 — kein Pretrain).
 
     last_scan = 0.0; last_watch = 0.0; last_settings_reload = 0.0; last_modify = 0.0; last_modify_hindsight_id = 0; last_hl_sync = 0.0
+    last_quality_check = 0.0; last_quality_telegram = 0.0; last_timeout_watch = 0.0
 
     while True:
         try:
@@ -2689,33 +3423,7 @@ def main():
             if now - last_settings_reload >= 60:
                 s = load_settings(); cfg = s["predictor"]
                 last_settings_reload = now
-
-                # Live-Bucket-Reload: wenn settings.json tp/sl_buckets geaendert hat
-                # → Bandit Fresh-Start + Hindsight-Backfill (ohne Service-Restart).
-                bcfg = cfg.get("bandit", {})
-                new_tp = bcfg.get("tp_buckets_pct")
-                new_sl = bcfg.get("sl_buckets_pct")
-                if new_tp and new_sl:
-                    new_actions = build_actions(new_tp, new_sl)
-                    new_names = [a["name"] for a in new_actions]
-                    cur_names = [a["name"] for a in bandit.actions]
-                    if new_names != cur_names:
-                        log.warning("Live Bucket-Aenderung erkannt: %d -> %d Actions, Fresh-Start + Backfill",
-                                    len(cur_names), len(new_names))
-                        alpha = float(bcfg.get("prior_alpha", 1.0))
-                        sigma2 = float(bcfg.get("noise_sigma2", 1.0))
-                        bandit = LinTSBandit(N_FEAT, new_actions, alpha=alpha, sigma2=sigma2)
-                        scaler = OnlineScaler(N_FEAT)
-                        save_state({'bandit': bandit, 'scaler': scaler,
-                                    'feature_keys': FEATURE_KEYS}, state_path)
-                        try:
-                            n_p, n_u = backfill_hindsight(s, bandit, scaler)
-                            save_state({'bandit': bandit, 'scaler': scaler,
-                                        'feature_keys': FEATURE_KEYS}, state_path)
-                            log.info("Live-Backfill nach Bucket-Aenderung: %d Predictions, %d Action-Updates",
-                                     n_p, n_u)
-                        except Exception as e:
-                            log.exception("Live-Backfill scheiterte: %s", e)
+                # Multi-Head hat keine TP/SL-Buckets — Live-Bucket-Reload entfällt.
 
             # HL-Sync: alle 60s pruefen ob HL-Phantom-Positionen ohne DB-Row sind
             if now - last_hl_sync >= 60:
@@ -2727,17 +3435,47 @@ def main():
                     log.exception("hl-sync failed: %s", e)
                 last_hl_sync = now
 
+            # Timeout-Watch: eigener 10s-Tick (entkoppelt von hl-sync) — Verkauf max 10s verspaetet statt bis 60s
+            if now - last_timeout_watch >= 10:
+                try:
+                    n_to = timeout_watch(s)
+                    if n_to > 0:
+                        log.info("timeout-watch: %d Positionen via Timeout geschlossen", n_to)
+                except Exception as e:
+                    log.exception("timeout-watch failed: %s", e)
+                last_timeout_watch = now
+
+            # Daten-Quality: alle 30 Min Quick-Log, alle 12h Telegram-Report
+            if now - last_quality_check >= 1800:
+                try:
+                    send_tg = (now - last_quality_telegram >= 12 * 3600)
+                    data_quality_check(s, send_telegram_report=send_tg)
+                    if send_tg:
+                        last_quality_telegram = now
+                except Exception as e:
+                    log.exception("data_quality_check failed: %s", e)
+                last_quality_check = now
+
             if now - last_scan >= cfg["scan_interval_seconds"]:
-                m = scan_pass_v4(s, bandit, scaler, rng)
+                m = scan_pass_mh(s, mh_model, rng)
                 last_scan = now
                 if m > 0:
                     log.info("scan-pass: %d new predictions", m)
 
             if now - last_watch >= cfg["watch_interval_seconds"]:
-                c = watch_pass_v4(s, bandit, scaler, state_path)
+                c = watch_pass_mh(s, mh_model, state_path)
                 last_watch = now
                 if c > 0:
                     log.info("watch-pass: %d closed", c)
+                # Extended-Hindsight: fällige Einträge aus predictor_hindsight_queue
+                # verarbeiten (delayed learning aus voller Klines-Range nach Close).
+                try:
+                    n_h = process_due_mh_hindsight(s, mh_model, state_path)
+                    if n_h > 0:
+                        log.info("mh-hindsight: %d Trades extended-learned (n_obs=%d)",
+                                 n_h, mh_model.direction.n_obs)
+                except Exception as e:
+                    log.exception("process_due_mh_hindsight failed: %s", e)
 
             # Trader-Tick alle interval_seconds (live TP/SL-Modifikation)
             if modify_bandit is not None and now - last_modify >= modify_interval:
@@ -2747,7 +3485,9 @@ def main():
                     log.exception("modify_pass failed: %s", e)
                 last_modify = now
 
-                # Hindsight-Queue: frisch geschlossene Trades fuer +120min-Hindsight einreihen
+                # Hindsight-Lookahead = aktuelles Timeout (Single Source of Truth)
+                hindsight_delay_min = get_timeout_hours(s) * 60.0
+                # Hindsight-Queue: frisch geschlossene Trades fuer Hindsight einreihen
                 try:
                     n_q = queue_pending_hindsight(s, lookahead_minutes=int(hindsight_delay_min))
                     if n_q > 0:

@@ -66,7 +66,7 @@ def _enrich_with_prices(predictions):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT DISTINCT ON (symbol) symbol, close, open_time
-                FROM klines WHERE symbol = ANY(%s) AND interval = '1m'
+                FROM klines_1m WHERE symbol = ANY(%s)
                 ORDER BY symbol, open_time DESC
             """, (symbols,))
             for row in cur.fetchall():

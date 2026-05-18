@@ -35,34 +35,40 @@ input:focus, select:focus, button:focus {
 .module-container {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
-  border-radius: 0.5rem;
+  border-radius: 0.25rem;
   height: 100%;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  position: relative;
 }
 
+/* Unsichtbare Drag-Zone: 6px oben, beim Hover minimal sichtbar */
 .module-header {
-  padding: 0.5rem 0.75rem;
-  border-bottom: 1px solid var(--color-border);
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 6px;
   cursor: move;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  background: var(--color-surface);
-  user-select: none;
+  z-index: 15;
+  background: transparent;
+  transition: background 0.1s;
+}
+.module-container:hover .module-header {
+  background: rgba(59, 130, 246, 0.15);
+}
+.module-container.react-grid-item--dragging .module-header,
+.module-header:active {
+  background: rgba(59, 130, 246, 0.4);
 }
 
-.module-header h3 {
-  margin: 0;
-  font-size: 0.875rem;
-  font-weight: 600;
-}
 
 .module-content {
   flex: 1;
   overflow: auto;
-  padding: 0.5rem;
+  padding: 2px;
+  padding-top: 8px; /* Platz fuer Drag-Zone */
 }
 
 .btn {

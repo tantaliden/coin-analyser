@@ -385,36 +385,6 @@ class TradingEnvWallet(gym.Env):
 
         return reward
 
-    def _get_replay_override(self, action):
-        """Replay-Modus: Reward aus echtem Trade-Ergebnis ableiten."""
-        if not self._replay_rewards:
-            return None
-        key = (self.symbol, self.current_time.isoformat()[:16] if self.current_time else '')
-        real = self._replay_rewards.get(key)
-        if not real:
-            return None
-
-        real_dir = real['direction']  # 'long' oder 'short'
-        real_reward = real['reward']
-        real_pnl = real['pnl_pct']
-
-        if action == 0:
-            # Skip wo ein Trade war
-            if real_pnl > 0:
-                return -abs(real_reward) * 0.3  # verpasste profitable Chance
-            return abs(real_reward) * 0.2  # Verlust-Trade vermieden = gut
-
-        agent_dir = 'long' if action <= 10 else 'short'
-
-        if agent_dir == real_dir:
-            # Gleiche Richtung wie im echten Trade
-            return real_reward  # gute oder schlechte Entscheidung bestätigen/spüren
-        else:
-            # Andere Richtung als im echten Trade
-            if real_pnl > 0:
-                return -abs(real_reward) * 0.5  # echter Trade war gut, Agent dreht falsch
-            return abs(real_reward) * 0.7  # echter Trade war Verlust, Agent korrigiert = belohnen
-
     def step(self, action):
         reward = 0.0
         terminated = False
@@ -422,12 +392,7 @@ class TradingEnvWallet(gym.Env):
 
         if not self.in_position:
             n_open = len(self._active_entries)
-            # Replay-Override: Echten Trade-Reward nutzen
-            replay_reward = self._get_replay_override(action)
-            if replay_reward is not None:
-                reward = replay_reward
-                terminated = True
-            elif action == 0:
+            if action == 0:
                 reward = 0.0
                 terminated = True
             elif action in range(1, 21):

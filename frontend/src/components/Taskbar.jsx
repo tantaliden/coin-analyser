@@ -172,7 +172,7 @@ function SettingsDialog({ onClose }) {
 
 export default function Taskbar() {
   const { user, logout } = useAuthStore()
-  const { availableModules, activeModules, openModule, saveLayout, saveLayoutAs,
+  const { availableModules, activeModules, openModule, closeModule, saveLayout, saveLayoutAs,
     switchLayout, deleteLayout, savedLayouts, activeLayoutId, activeLayoutName,
     isLocked, setLocked } = useModuleStore()
   const [showModules, setShowModules] = useState(false)
@@ -230,6 +230,23 @@ export default function Taskbar() {
           </div>
         )}
       </div>
+
+      {/* Aktive Module als Chips */}
+      <div className="flex items-center gap-1 flex-wrap">
+        {activeModules.map(id => {
+          const m = availableModules.find(mo => mo.id === id)
+          if (!m) return null
+          return (
+            <button key={id} onClick={() => closeModule(id)}
+              className="flex items-center gap-1 px-2 py-0.5 bg-blue-900/40 hover:bg-red-900/60 border border-blue-700/50 hover:border-red-600/50 rounded text-[10px] text-blue-300 hover:text-red-200 transition-colors"
+              title={`${m.label} schliessen`}>
+              {m.label}
+            </button>
+          )
+        })}
+      </div>
+
+      <div className="w-px h-4 bg-gray-600 mx-1" />
 
       {/* Layout Dropdown */}
       <div className="relative" ref={layRef}>

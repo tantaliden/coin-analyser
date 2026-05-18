@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
 import api from '../utils/api'
 
 const DEFAULT_LAYOUTS = {
@@ -18,12 +19,12 @@ const AVAILABLE_MODULES = [
   { id: 'indicators', label: 'Indikatoren' },
   { id: 'groups', label: 'Coin-Gruppen' },
   { id: 'wallet', label: 'Wallet' },
-  { id: 'bot', label: 'Trading Bot' },
   { id: 'momentum', label: 'Momentum Scanner' },
   { id: 'rlagent', label: 'RL-Agent' },
+  { id: 'predictions', label: 'Predictions' },
 ]
 
-export const useModuleStore = create((set, get) => ({
+export const useModuleStore = create(persist((set, get) => ({
   activeModules: MODULE_DEFAULTS,
   currentLayout: DEFAULT_LAYOUTS,
   availableModules: AVAILABLE_MODULES,
@@ -149,4 +150,11 @@ export const useModuleStore = create((set, get) => ({
       }
     } catch (e) { console.error('Load from backend failed:', e) }
   }
+}), {
+  name: 'module-store',
+  partialize: (state) => ({
+    activeModule: state.activeModule,
+    layouts: state.layouts,
+    enabledModules: state.enabledModules,
+  }),
 }))

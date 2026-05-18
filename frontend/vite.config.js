@@ -6,7 +6,7 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 3002,
-    allowedHosts: ['tresor.tantaliden.com', 'localhost', '217.154.192.66'],
+    allowedHosts: ['tresor.tantaliden.com', 'tradebot.tantaliden.com', 'localhost', '217.154.192.66', '82.165.236.163'],
     proxy: { '/api': { target: 'http://localhost:8002', changeOrigin: true } }
   },
   build: { outDir: 'dist', sourcemap: false }

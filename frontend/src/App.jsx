@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import { useAuthStore } from './stores/authStore'
 import { useConfigStore } from './stores/configStore'
 import { useModuleStore } from './stores/moduleStore'
+import { usePredictorSettingsStore } from './stores/predictorSettingsStore'
+import { initSessionSync } from './stores/sessionSync'
 import Login from './components/Login'
 import Dashboard from './components/Dashboard'
 
@@ -9,6 +11,7 @@ export default function App() {
   const { isAuthenticated, checkAuth } = useAuthStore()
   const { loadConfig, isLoaded, loadError } = useConfigStore()
   const { loadFromBackend } = useModuleStore()
+  const loadPredictorSettings = usePredictorSettingsStore(s => s.load)
   const [checking, setChecking] = useState(true)
   const [initError, setInitError] = useState(null)
 
@@ -19,6 +22,8 @@ export default function App() {
         const isAuth = await checkAuth()
         if (isAuth) {
           await loadFromBackend()
+          await loadPredictorSettings()
+          await initSessionSync()
         }
       } catch (error) {
         setInitError(error.message || 'Initialisierung fehlgeschlagen')

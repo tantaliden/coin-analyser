@@ -68,7 +68,7 @@ async def get_symbols(current_user: dict = Depends(get_current_user)):
     """Alle verfügbaren Symbole aus klines"""
     with get_coins_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT symbol FROM klines WHERE interval = '1m' ORDER BY symbol")
+            cur.execute("SELECT symbol FROM hl_meta ORDER BY symbol")
             symbols = [row['symbol'] for row in cur.fetchall()]
     return {"symbols": symbols, "count": len(symbols)}
 
@@ -77,9 +77,9 @@ async def get_stats(current_user: dict = Depends(get_current_user)):
     """Datenbank-Statistiken"""
     with get_coins_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(DISTINCT symbol) as symbols FROM klines WHERE interval='1m'")
+            cur.execute("SELECT COUNT(*) as symbols FROM hl_meta")
             symbols = cur.fetchone()['symbols']
-            cur.execute("SELECT MIN(open_time) as earliest, MAX(open_time) as latest FROM klines WHERE interval='1m'")
+            cur.execute("SELECT MIN(open_time) as earliest, MAX(open_time) as latest FROM klines_1m")
             times = cur.fetchone()
     return {
         "symbols": symbols, 

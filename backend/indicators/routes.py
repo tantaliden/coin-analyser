@@ -304,7 +304,7 @@ async def backsearch(set_id: int, request: CounterSearchRequest, current_user: d
                     all_matched = _check_all_indicators(cur, symbol, zero_point, prehistory, indicators)
                     if all_matched:
                         event_end = event_start + timedelta(minutes=duration_minutes)
-                        cur.execute("""SELECT open, high, low FROM klines WHERE symbol = %s AND interval = '1m'
+                        cur.execute("""SELECT open, high, low FROM klines_1m WHERE symbol = %s
                             AND open_time >= %s AND open_time < %s ORDER BY open_time""", (symbol, event_start, event_end))
                         event_candles = cur.fetchall()
                         if event_candles and len(event_candles) >= 2:
@@ -362,10 +362,10 @@ def _check_candle_pattern(cur, symbol, zero_point, ind):
     aggregator = ind.get('aggregator', '15m')
     pattern_start_dt = zero_point + timedelta(minutes=time_start)
     pattern_end_dt = zero_point + timedelta(minutes=time_end)
-    table = 'klines' if aggregator == '1m' else f'agg_{aggregator}'
-    time_col = 'open_time' if table == 'klines' else 'bucket'
-    interval_filter = "AND interval = '1m'" if table == 'klines' else ""
-    cur.execute(f"SELECT open, close FROM {table} WHERE symbol = %s {interval_filter} AND {time_col} >= %s AND {time_col} <= %s ORDER BY {time_col} ASC",
+    # Facade: klines_1m/5m/... statt nativ klines. Alle haben open_time Spalte.
+    table = f'klines_{aggregator}'
+    time_col = 'open_time'
+    cur.execute(f"SELECT open, close FROM {table} WHERE symbol = %s AND {time_col} >= %s AND {time_col} <= %s ORDER BY {time_col} ASC",
         (symbol, pattern_start_dt, pattern_end_dt))
     candles = cur.fetchall()
     if not candles:
@@ -390,11 +390,21 @@ def _check_normal_indicator(cur, symbol, zero_point, ind):
     indicator_type = ind.get('indicator_type', 'close')
     marked_start_dt = zero_point + timedelta(minutes=time_start)
     marked_end_dt = zero_point + timedelta(minutes=time_end)
-    table = 'klines' if aggregator == '1m' else f'agg_{aggregator}'
-    time_col = 'open_time' if table == 'klines' else 'bucket'
-    interval_filter = "AND interval = '1m'" if table == 'klines' else ""
-    db_column = {'close': 'close', 'volume': 'volume', 'trades': 'trades', 'high': 'high', 'low': 'low', 'open': 'open'}.get(indicator_type, 'close')
-    cur.execute(f"SELECT {db_column} as base_val FROM {table} WHERE symbol = %s {interval_filter} AND {time_col} >= %s ORDER BY {time_col} ASC LIMIT 1",
+    table = f'klines_{aggregator}'
+    time_col = 'open_time'
+    # Alle zugreifbaren Spalten aus klines_<interval>-Views
+    allowed_columns = {
+        'close', 'open', 'high', 'low', 'volume', 'trades',
+        'taker_buy_base', 'taker_buy_quote', 'quote_asset_volume',
+        'funding', 'open_interest', 'premium',
+        'oracle_px', 'mark_px', 'mid_px',
+        'bbo_bid_px', 'bbo_ask_px', 'bbo_bid_sz', 'bbo_ask_sz',
+        'spread_bps', 'book_imbalance_5', 'book_depth_5',
+    }
+    if indicator_type not in allowed_columns:
+        return False
+    db_column = indicator_type
+    cur.execute(f"SELECT {db_column} as base_val FROM {table} WHERE symbol = %s AND {time_col} >= %s ORDER BY {time_col} ASC LIMIT 1",
         (symbol, zero_point))
     base_result = cur.fetchone()
     if not base_result or not base_result['base_val']:
@@ -402,7 +412,7 @@ def _check_normal_indicator(cur, symbol, zero_point, ind):
     base_val = float(base_result['base_val'])
     if base_val == 0:
         return False
-    cur.execute(f"SELECT MIN({db_column}) as min_val, MAX({db_column}) as max_val FROM {table} WHERE symbol = %s {interval_filter} AND {time_col} >= %s AND {time_col} <= %s",
+    cur.execute(f"SELECT MIN({db_column}) as min_val, MAX({db_column}) as max_val FROM {table} WHERE symbol = %s AND {time_col} >= %s AND {time_col} <= %s",
         (symbol, marked_start_dt, marked_end_dt))
     marked_result = cur.fetchone()
     if not marked_result or marked_result['min_val'] is None:

@@ -6,26 +6,43 @@ import Taskbar from './Taskbar'
 import ModuleWrapper from './ModuleWrapper'
 import { useModuleStore } from '../stores/moduleStore'
 
-import SearchModule from '../modules/SearchModule'
-import SearchResultsModule from '../modules/SearchResultsModule'
-import ChartModule from '../modules/ChartModule'
+import SearchModule from '../modules/search/SearchModule'
+import SearchResultsModule from '../modules/results/SearchResultsModule'
+import ChartViewModule from '../modules/chartview/ChartViewModule'
 import IndicatorsModule from '../modules/indicators/IndicatorsModule'
 import GroupsModule from '../modules/groups/GroupsModule'
 import WalletModule from '../modules/wallet/WalletModule'
 import BotModule from '../modules/bot/BotModule'
 import MomentumModule from '../modules/MomentumModule'
 import RLAgentModule from '../modules/RLAgentModule'
+import PredictionsModule from '../modules/PredictionsModule'
 
 const ResponsiveGridLayout = WidthProvider(Responsive)
 
 const MODULE_COMPONENTS = {
-  search: SearchModule, searchResults: SearchResultsModule, chart: ChartModule,
-  indicators: IndicatorsModule, groups: GroupsModule, wallet: WalletModule, bot: BotModule, momentum: MomentumModule, rlagent: RLAgentModule,
+  search: SearchModule,
+  searchResults: SearchResultsModule,
+  chart: ChartViewModule,
+  indicators: IndicatorsModule,
+  groups: GroupsModule,
+  wallet: WalletModule,
+  bot: BotModule,
+  momentum: MomentumModule,
+  rlagent: RLAgentModule,
+  predictions: PredictionsModule,
 }
 
 const MODULE_TITLES = {
-  search: 'Suche', searchResults: 'Suchergebnisse', chart: 'Chart',
-  indicators: 'Indikatoren', groups: 'Coin-Gruppen', wallet: 'Wallet', bot: 'Trading Bot', momentum: 'Momentum Scanner', rlagent: 'RL-Agent',
+  search: 'Suche',
+  searchResults: 'Suchergebnisse',
+  chart: 'Chart',
+  indicators: 'Indikatoren',
+  groups: 'Coin-Gruppen',
+  wallet: 'Wallet',
+  bot: 'Trading Bot',
+  momentum: 'Momentum Scanner',
+  rlagent: 'RL-Agent',
+  predictions: 'Predictions',
 }
 
 export default function Dashboard() {
@@ -44,7 +61,7 @@ export default function Dashboard() {
   return (
     <div className="h-screen flex flex-col">
       <Taskbar />
-      <main className="flex-1 p-2 overflow-auto">
+      <main className="flex-1 overflow-auto">
         <ResponsiveGridLayout
           className="layout"
           layouts={filteredLayouts}
@@ -53,7 +70,8 @@ export default function Dashboard() {
           rowHeight={30}
           onLayoutChange={handleLayoutChange}
           draggableHandle=".module-header"
-          margin={[8, 8]}
+          margin={[0, 0]}
+          containerPadding={[0, 0]}
           isDraggable={!isLocked}
           isResizable={!isLocked}
           resizeHandles={['se', 'sw', 'ne', 'nw', 'e', 'w', 'n', 's']}
