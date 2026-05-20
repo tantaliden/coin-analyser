@@ -93,8 +93,14 @@ def get_status():
                 FROM predictor_state WHERE id=1
             """)
             st = cur.fetchone() or {}
-            cur.execute("SELECT COUNT(*) FROM open_predictions WHERE status='open'")
-            open_count = cur.fetchone()['count']
+            cur.execute("""
+                SELECT COUNT(*) AS total,
+                       COUNT(*) FILTER (WHERE NOT auto_trade_skipped) AS visible
+                FROM open_predictions WHERE status='open'
+            """)
+            _o = cur.fetchone()
+            open_count = _o['total']
+            open_count_visible = _o['visible']
             cur.execute("""
                 SELECT
                   COUNT(*) FILTER (WHERE status='win') AS wins,
@@ -126,6 +132,7 @@ def get_status():
         "universe_size": len(st.get("universe") or []),
         "universe_refreshed_at": st.get("universe_refreshed_at"),
         "open_count": open_count,
+        "open_count_visible": open_count_visible,
         "wins": stats['wins'] if stats else 0,
         "losses": stats['losses'] if stats else 0,
         "timeouts": stats['timeouts'] if stats else 0,
@@ -143,23 +150,30 @@ _LIGHT_FIELDS = ("id, symbol, side, entry_px, sl_px, tp_px, score, rule_name, so
 
 
 @router.get("/predictions")
-def list_predictions(scope: str = "visible", limit: int = 200):
+def list_predictions(scope: str = "visible", limit: int = 200, include_skipped: bool = False):
     """scope: 'visible' = open + < hide_after_hours; 'open' = alle offenen;
     'closed' = echte Closes (win/loss/timeout, OHNE Phantoms);
     'all' = alle echten (open + win/loss/timeout, OHNE Phantoms);
-    'errors' = nur Phantoms (auto_trade_failed, auto_close_failsafe)."""
+    'errors' = nur Phantoms (auto_trade_failed, auto_close_failsafe).
+
+    include_skipped (default False): wenn False, Predictions mit auto_trade_skipped=TRUE
+    werden in 'visible' und 'all' versteckt. 'open' zeigt sie immer (das ist der
+    „alle offen"-Tab im Frontend).
+    """
     cfg = _load_settings().get("predictor", {})
     hide_h = float(cfg.get("hide_after_hours", 1))
     PHANTOM = ('auto_trade_failed', 'auto_close_failsafe')
+    skip_filter = "" if include_skipped else " AND NOT auto_trade_skipped"
     with _db_app() as app:
         with app.cursor(cursor_factory=RealDictCursor) as cur:
             if scope == "visible":
-                cur.execute("""
+                cur.execute(f"""
                     SELECT * FROM open_predictions
-                    WHERE status='open' AND created_at >= now() - (%s || ' hours')::interval
+                    WHERE status='open'{skip_filter} AND created_at >= now() - (%s || ' hours')::interval
                     ORDER BY created_at DESC LIMIT %s
                 """, (hide_h, limit))
             elif scope == "open":
+                # 'open' zeigt ALLE offenen Predictions inkl. skipped (= „alle offen"-Tab)
                 cur.execute("SELECT * FROM open_predictions WHERE status='open' ORDER BY created_at DESC LIMIT %s", (limit,))
             elif scope == "closed":
                 cur.execute(f"""
@@ -176,7 +190,7 @@ def list_predictions(scope: str = "visible", limit: int = 200):
             else:  # all
                 cur.execute(f"""
                     SELECT {_LIGHT_FIELDS} FROM open_predictions
-                    WHERE status NOT IN ('auto_trade_failed','auto_close_failsafe')
+                    WHERE status NOT IN ('auto_trade_failed','auto_close_failsafe'){skip_filter}
                     ORDER BY created_at DESC LIMIT %s
                 """, (limit,))
             rows = cur.fetchall()

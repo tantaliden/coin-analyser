@@ -60,6 +60,8 @@ from services.feature_baseline_dev import (
     compute_baseline_dev_features,
     feature_keys as stalker_baseline_keys,
     _classify_btc_regime as stalker_classify_btc_regime,
+    get_data_days as stalker_data_days,
+    get_effective_min_samples as stalker_effective_min_samples,
 )
 from services.feature_cross_coin import (
     build_reference_cache as stalker_build_ref_cache,
@@ -1154,7 +1156,7 @@ def send_telegram(s, text):
 # Scan-Pass v5 — Multi-Head Predictor (DirectionClassifier + MagnitudeRegressor)
 # =============================================================================
 
-def scan_pass_mh(s, mh_model, rng):
+def scan_pass_mh(s, mh_model, rng, mh_model_lock):
     """Multi-Head Scan-Pass.
 
     Pro Coin:
@@ -1188,6 +1190,11 @@ def scan_pass_mh(s, mh_model, rng):
     sl_safety = float(mh_cfg.get("sl_safety_factor", 1.3))
     min_tp_pct = float(mh_cfg.get("min_tp_pct", 0.5))
     max_sl_pct = float(mh_cfg.get("max_sl_pct", 2.5))
+    _mtp = mh_cfg.get("max_tp_pct")  # Sanity-Cap gegen Magnitude-Regressor-Explosion (Billionen %)
+    if _mtp is None:
+        log.error("FALLBACK_TRIGGERED scan_pass_mh: predictor.multi_head.max_tp_pct fehlt -> abort")
+        return 0
+    max_tp_pct = float(_mtp)
     max_open = int(mh_cfg.get("max_open_predictions", 100))
 
     matches = 0
@@ -1212,14 +1219,22 @@ def scan_pass_mh(s, mh_model, rng):
         else:
             uni = st['universe']
 
-        # Quality-Gate: wieviele Slots frei?
+        # Slot-Logik (Volker 19.05.): Predictions immer in DB, HL-Trade nur
+        # solange offene trader_positions < max_open. Predictions die wegen
+        # Slot-Limit nicht getradet werden bekommen direkt auto_trade_skipped=TRUE
+        # (UI hidet, Predictor lernt trotzdem aus Klines).
         with app.cursor() as cur_a:
             cur_a.execute("SELECT COUNT(*) FROM open_predictions WHERE status='open'")
             n_open = cur_a.fetchone()[0]
-        slots_free = max(0, max_open - n_open)
-        if slots_free == 0:
-            log.info("scan: %d/%d offen, keine neuen Trades", n_open, max_open)
-            return 0
+            cur_a.execute("SELECT COUNT(*) FROM trader_positions WHERE status='open'")
+            hl_open_at_start = cur_a.fetchone()[0]
+        auto_trade_active = bool(cfg.get("trading", {}).get("auto_trade"))
+        if n_obs < cold_start_min_n:
+            cold_cap = int(mh_cfg.get("cold_start_max_per_scan", 10))
+            hl_quota_this_scan = min(max(0, max_open - hl_open_at_start), cold_cap)
+        else:
+            hl_quota_this_scan = max(0, max_open - hl_open_at_start)
+        hl_traded_this_scan = 0
 
         # Cooldown: letzten Close pro Symbol bulk-fetchen.
         last_closes = {}
@@ -1245,201 +1260,226 @@ def scan_pass_mh(s, mh_model, rng):
         universe_funding_median = compute_universe_funding_median(coins, uni)
         whale_enabled = bool(cfg.get("whale_tracker", {}).get("enabled", False))
 
-        # Stalker (v5.1): Reference-Cache + BTC-Regime 1× pro scan-pass
+        # Stalker (v5.1): Reference-Cache + BTC-Regime + effective min_samples 1× pro scan-pass
         stalker_cfg = cfg.get("stalker", {}) or {}
         stalker_on = bool(stalker_cfg.get("enabled"))
         stalker_ref_cache = None
         stalker_btc_regime = None
+        stalker_eff_min_samples = None
         if stalker_on:
             stalker_ref_cache = stalker_build_ref_cache(coins, stalker_cfg["cross_coin"])
             stalker_btc_regime = stalker_classify_btc_regime(coins, stalker_cfg["btc_regime"])
             if stalker_btc_regime is None:
                 log.error("FALLBACK_TRIGGERED scan_pass_mh: Stalker-BTC-Regime nicht ermittelbar -> Stalker für diesen scan-pass aus")
                 stalker_on = False
+            else:
+                _dd = stalker_data_days(coins)
+                stalker_eff_min_samples = stalker_effective_min_samples(stalker_cfg, _dd)
 
-        candidates = []
-        n_cold_skip = 0
-        n_below_thresh = 0
-        n_no_magnitude = 0
-        n_filtered = 0
-        n_no_orderflow = 0
-        n_no_funding = 0
-        n_no_sector = 0
-        n_no_baseline = 0
+        # === Worker-Pool: Features parallel, KI/HL seriell ===
+        # Volker-Direktive 19.05.2026: „nach dem Prinzip dass Daten aufbereitet werden,
+        # damit der prediktor schneller entscheiden kann, und die aktuellsten Daten
+        # verwendet werden". Worker-Anzahl aus settings.predictor.multi_head.scan_workers.
+        import threading as _th
+        from concurrent.futures import ThreadPoolExecutor as _Pool
+        _n_w = mh_cfg.get("scan_workers")
+        if _n_w is None:
+            log.error("FALLBACK_TRIGGERED scan_pass_mh: predictor.multi_head.scan_workers fehlt -> abort")
+            return 0
+        n_workers = int(_n_w)
+        stats_lock = _th.Lock()
+        slot_lock = _th.Lock()
+        stats = {"cold_skip":0,"below":0,"no_mag":0,"filt":0,
+                 "no_of":0,"no_fb":0,"no_sec":0,"no_bl":0,
+                 "hl_traded":0,"matches":0}
+        cold_start_active = (n_obs < cold_start_min_n)
 
-        with coins.cursor(cursor_factory=RealDictCursor) as cur_c:
-            for sym in uni:
-                if has_open(app, sym): continue
+        def _bump(key, n=1):
+            with stats_lock:
+                stats[key] += n
 
-                last_close = last_closes.get(sym)
-                if last_close is not None:
-                    age = (datetime.now(timezone.utc) - last_close).total_seconds()
-                    if age < cooldown:
-                        continue
+        def _process_one(sym):
+            try:
+                with db_coins(s) as coins_w, db_app(s) as app_w:
+                    if has_open(app_w, sym): return
+                    last_close = last_closes.get(sym)
+                    if last_close is not None:
+                        age = (datetime.now(timezone.utc) - last_close).total_seconds()
+                        if age < cooldown:
+                            return
 
-                rule_flags = {}
-                for rule in rules:
-                    try:
-                        ok = evaluate_rule(cur_c, sym, rule, lookback)["ok"]
-                    except Exception:
-                        ok = False
-                    rule_flags[rule['name']] = 1 if ok else 0
+                    rule_flags = {}
+                    with coins_w.cursor(cursor_factory=RealDictCursor) as cur_w:
+                        for rule in rules:
+                            try:
+                                ok = evaluate_rule(cur_w, sym, rule, lookback)["ok"]
+                            except Exception:
+                                ok = False
+                            rule_flags[rule['name']] = 1 if ok else 0
 
-                feat = feature_snapshot_v2(coins, sym, rule_flags=rule_flags, btc_moves=btc_moves)
-                if feat is None: continue
+                    feat = feature_snapshot_v2(coins_w, sym, rule_flags=rule_flags, btc_moves=btc_moves)
+                    if feat is None: return
 
-                # Stufe-3-Features mergen (Orderflow + Funding-Burst + Sektor + Whale)
-                of_feat = compute_orderflow_features(coins, sym)
-                if of_feat is None:
-                    n_no_orderflow += 1
-                    continue
-                feat.update(of_feat)
+                    of_feat = compute_orderflow_features(coins_w, sym)
+                    if of_feat is None: _bump("no_of"); return
+                    feat.update(of_feat)
 
-                fb_feat = compute_funding_features(coins, sym, universe_funding_median)
-                if fb_feat is None:
-                    n_no_funding += 1
-                    continue
-                feat.update(fb_feat)
+                    fb_feat = compute_funding_features(coins_w, sym, universe_funding_median)
+                    if fb_feat is None: _bump("no_fb"); return
+                    feat.update(fb_feat)
 
-                sec_feat = compute_sector_features(sym, coin_sector_map, sector_stats, coin_pcts)
-                if sec_feat is None:
-                    n_no_sector += 1
-                    continue
-                feat.update(sec_feat)
+                    sec_feat = compute_sector_features(sym, coin_sector_map, sector_stats, coin_pcts)
+                    if sec_feat is None: _bump("no_sec"); return
+                    feat.update(sec_feat)
 
-                if whale_enabled:
-                    wh_feat = compute_whale_features(app, sym)
-                    if wh_feat:
-                        feat.update(wh_feat)
+                    if whale_enabled:
+                        wh_feat = compute_whale_features(app_w, sym)
+                        if wh_feat: feat.update(wh_feat)
 
-                # Stalker (v5.1): Baseline-Devs + Cross-Coin + Coin-Identity
-                if stalker_on:
-                    bl_feat = compute_baseline_dev_features(
-                        coins, app, sym, stalker_cfg, btc_regime=stalker_btc_regime
-                    )
-                    if bl_feat is None:
-                        n_no_baseline += 1
-                        continue
-                    feat.update(bl_feat)
-                    cc_feat = compute_cross_coin_features(
-                        coins, sym, stalker_cfg["cross_coin"], stalker_ref_cache
-                    )
-                    feat.update(cc_feat)
-                    id_feat = compute_identity_features(
-                        sym, app, stalker_cfg["coin_identity"]
-                    )
-                    feat.update(id_feat)
+                    if stalker_on:
+                        bl_feat = compute_baseline_dev_features(
+                            coins_w, app_w, sym, stalker_cfg,
+                            btc_regime=stalker_btc_regime,
+                            effective_min_samples=stalker_eff_min_samples,
+                        )
+                        if bl_feat is None: _bump("no_bl"); return
+                        feat.update(bl_feat)
+                        cc_feat = compute_cross_coin_features(coins_w, sym, stalker_cfg["cross_coin"], stalker_ref_cache)
+                        feat.update(cc_feat)
+                        id_feat = compute_identity_features(sym, app_w, stalker_cfg["coin_identity"])
+                        feat.update(id_feat)
 
-                # 1) Direction-Klassifikator (oder Cold-Start: random side)
-                probs = mh_model.predict_proba(feat, min_n_for_predict=min_n_for_predict)
-                cold_start_active = (n_obs < cold_start_min_n)
+                    # KI-Calls — River nicht thread-safe → mh_model_lock
+                    with mh_model_lock:
+                        probs = mh_model.predict_proba(feat, min_n_for_predict=min_n_for_predict)
+                    _process_after_predict(sym, feat, probs, coins_w, app_w)
+            except Exception as e:
+                log.exception("worker %s failed: %s", sym, e)
 
-                if probs is None:
-                    if not cold_start_active:
-                        n_cold_skip += 1
-                        continue
-                    # Cold-Start (vor min_n_for_predict): random Side mit confidence=0.5
-                    side = 'long' if rng.random() < 0.5 else 'short'
-                    confidence = 0.5
-                    p_long = 0.5; p_short = 0.5; p_skip = 0.0
+        def _process_after_predict(sym, feat, probs, coins_w, app_w):
+            # Direction-Klassifikator (oder Cold-Start: random side)
+            if probs is None:
+                if not cold_start_active:
+                    _bump("cold_skip"); return
+                side = 'long' if rng.random() < 0.5 else 'short'
+                confidence = 0.5
+                p_long = 0.5; p_short = 0.5; p_skip = 0.0
+            else:
+                p_long = probs['long']; p_short = probs['short']
+                if p_long >= p_short:
+                    side = 'long'; confidence = p_long
                 else:
-                    p_long = probs['long']; p_short = probs['short']
-                    if p_long >= p_short:
-                        side = 'long'; confidence = p_long
-                    else:
-                        side = 'short'; confidence = p_short
-                    p_skip = probs['skip']
-                    # Threshold-Check NUR wenn nicht im Cold-Start
-                    # Cold-Start (n_obs < cold_start_min_n): immer eröffnen (argmax),
-                    # damit Modell weiter Trainingsdaten sammelt.
-                    if not cold_start_active and confidence < direction_threshold:
-                        n_below_thresh += 1
-                        continue
+                    side = 'short'; confidence = p_short
+                p_skip = probs['skip']
+                if not cold_start_active and confidence < direction_threshold:
+                    _bump("below"); return
 
-                # 2) Magnitude-Regressoren (Cold-Start: settings-Defaults)
+            # Magnitude-Regressoren mit Lock
+            with mh_model_lock:
                 tp_raw = mh_model.predict_tp(feat, side, min_n_for_predict=min_n_for_predict)
                 sl_raw = mh_model.predict_sl(feat, side, min_n_for_predict=min_n_for_predict)
-                if tp_raw is None or sl_raw is None:
-                    if not cold_start_active:
-                        n_no_magnitude += 1
-                        continue
-                    # Cold-Start: settings-Defaults zwingend (kein silent fallback)
-                    cs_tp = mh_cfg.get("cold_start_tp_raw_pct")
-                    cs_sl = mh_cfg.get("cold_start_sl_raw_pct")
-                    if cs_tp is None or cs_sl is None:
-                        log.error("FALLBACK_TRIGGERED scan_pass_mh cold-start: "
-                                  "cold_start_tp_raw_pct/cold_start_sl_raw_pct fehlen in settings.predictor.multi_head -> abort")
-                        return 0
-                    tp_raw = float(cs_tp)
-                    sl_raw = float(cs_sl)
+            if tp_raw is None or sl_raw is None:
+                if not cold_start_active:
+                    _bump("no_mag"); return
+                cs_tp = mh_cfg.get("cold_start_tp_raw_pct")
+                cs_sl = mh_cfg.get("cold_start_sl_raw_pct")
+                if cs_tp is None or cs_sl is None:
+                    log.error("FALLBACK_TRIGGERED scan_pass_mh cold-start: cold_start_tp_raw_pct/cold_start_sl_raw_pct fehlen")
+                    return
+                tp_raw = float(cs_tp); sl_raw = float(cs_sl)
 
-                tp_pct = tp_raw * tp_safety
-                sl_pct = max(sl_raw * sl_safety, 0.1)
+            tp_pct = tp_raw * tp_safety
+            sl_pct = max(sl_raw * sl_safety, 0.1)
 
-                # Cold-Start: ignoriere TP/SL-Filter, sonst lernt das Modell nichts.
-                # Erzwinge aber settings-Defaults wenn Magnituden absurd klein sind.
-                if cold_start_active:
-                    cs_tp = float(mh_cfg.get("cold_start_tp_raw_pct"))
-                    cs_sl = float(mh_cfg.get("cold_start_sl_raw_pct"))
-                    if tp_pct < min_tp_pct:
-                        tp_pct = cs_tp * tp_safety
-                    if sl_pct > max_sl_pct:
-                        sl_pct = cs_sl * sl_safety
-                elif tp_pct < min_tp_pct or sl_pct > max_sl_pct:
-                    n_filtered += 1
-                    continue
+            if cold_start_active:
+                cs_tp = float(mh_cfg.get("cold_start_tp_raw_pct"))
+                cs_sl = float(mh_cfg.get("cold_start_sl_raw_pct"))
+                if tp_pct < min_tp_pct: tp_pct = cs_tp * tp_safety
+                if sl_pct > max_sl_pct: sl_pct = cs_sl * sl_safety
+                if tp_pct > max_tp_pct: tp_pct = cs_tp * tp_safety
+            elif tp_pct < min_tp_pct or tp_pct > max_tp_pct or sl_pct > max_sl_pct:
+                _bump("filt"); return
 
-                cur_c.execute("SELECT close FROM agg_1m WHERE symbol=%s ORDER BY bucket DESC LIMIT 1", (sym,))
-                p = cur_c.fetchone()
-                if not p or p['close'] is None: continue
-                entry = f(p['close'])
-                if side == 'long':
-                    tp = entry * (1 + tp_pct / 100.0)
-                    sl = entry * (1 - sl_pct / 100.0)
+            with coins_w.cursor(cursor_factory=RealDictCursor) as cur_w:
+                cur_w.execute("SELECT close FROM agg_1m WHERE symbol=%s ORDER BY bucket DESC LIMIT 1", (sym,))
+                p = cur_w.fetchone()
+            if not p or p['close'] is None: return
+            entry = f(p['close'])
+            if side == 'long':
+                tp = entry * (1 + tp_pct / 100.0); sl = entry * (1 - sl_pct / 100.0)
+            else:
+                tp = entry * (1 - tp_pct / 100.0); sl = entry * (1 + sl_pct / 100.0)
+
+            feat_with_meta = dict(feat)
+            feat_with_meta['_predicted_side'] = side
+            feat_with_meta['_confidence'] = float(confidence)
+            feat_with_meta['_tp_raw_pct'] = float(tp_raw); feat_with_meta['_sl_raw_pct'] = float(sl_raw)
+            feat_with_meta['_p_long'] = float(p_long); feat_with_meta['_p_short'] = float(p_short); feat_with_meta['_p_skip'] = float(p_skip)
+
+            action_name = f"{side}_tp{tp_pct:.2f}_sl{sl_pct:.2f}"
+            pid = open_prediction(app_w, sym, side, entry, sl, tp,
+                                   confidence, action_name, 'multi_head', feat_with_meta,
+                                   pred_up=tp_pct, pred_down=sl_pct)
+            if not pid: return
+            _bump("matches")
+
+            # Slot-Frage + HL-Trade unter slot_lock (HL-API hat eigenes Rate-Limit,
+            # nur ein HL-Open zur Zeit damit Slot-Counter konsistent bleibt)
+            # Slot-Reservierung NUR im Lock (Millisekunden). try_auto_trade (HL-API,
+            # kann hängen) läuft AUSSERHALB des Locks — sonst blockiert ein HL-Hang
+            # alle anderen Worker (Deadlock, 20.05.2026).
+            cold_burst_max = mh_cfg.get("cold_start_max_per_scan")
+            if cold_burst_max is None:
+                log.error("FALLBACK_TRIGGERED scan_pass_mh: predictor.multi_head.cold_start_max_per_scan fehlt")
+                return
+            do_trade = False
+            hl_now = hl_open_at_start
+            with slot_lock:
+                if auto_trade_active:
+                    with app_w.cursor() as cur_sl:
+                        cur_sl.execute("SELECT COUNT(*) FROM trader_positions WHERE status='open'")
+                        hl_now = cur_sl.fetchone()[0]
+                # effektiv = echte offene + in diesem Scan reservierte (noch nicht in DB)
+                hl_effective = hl_now + stats.get("hl_reserved", 0)
+                cold_burst_ok = (n_obs >= cold_start_min_n) or (stats["hl_traded"] < int(cold_burst_max))
+                if auto_trade_active and hl_effective < max_open and cold_burst_ok:
+                    stats["hl_reserved"] = stats.get("hl_reserved", 0) + 1
+                    do_trade = True
+
+            if do_trade:
+                log.info("OPEN %s %s entry=%.6g tp=%.6g sl=%.6g (tp%%=%.3f sl%%=%.3f) P=%.3f [%d/%d HL-open]",
+                         sym, side, entry, tp, sl, tp_pct, sl_pct, confidence, hl_now, max_open)
+                try:
+                    try_auto_trade(s, pid, sym, side, entry, tp, sl, tp_pct, sl_pct)
+                finally:
+                    with slot_lock:
+                        stats["hl_reserved"] = max(0, stats.get("hl_reserved", 0) - 1)
+                        stats["hl_traded"] += 1
+            else:
+                with app_w.cursor() as cur_sk:
+                    cur_sk.execute("UPDATE open_predictions SET auto_trade_skipped=TRUE WHERE id=%s", (pid,))
+                app_w.commit()
+                if not auto_trade_active:
+                    reason = "auto_trade_off"
+                elif hl_now >= max_open:
+                    reason = f"slot_full({hl_now}/{max_open})"
                 else:
-                    tp = entry * (1 - tp_pct / 100.0)
-                    sl = entry * (1 + sl_pct / 100.0)
+                    reason = "cold_burst_cap"
+                log.info("OPEN+SKIP %s %s pid=%s (%s) entry=%.6g P=%.3f",
+                         sym, side, pid, reason, entry, confidence)
 
-                feat_with_meta = dict(feat)
-                feat_with_meta['_predicted_side'] = side
-                feat_with_meta['_confidence'] = float(confidence)
-                feat_with_meta['_tp_raw_pct'] = float(tp_raw)
-                feat_with_meta['_sl_raw_pct'] = float(sl_raw)
-                feat_with_meta['_p_long'] = float(p_long)
-                feat_with_meta['_p_short'] = float(p_short)
-                feat_with_meta['_p_skip'] = float(p_skip)
+        # === Worker-Pool starten ===
+        with _Pool(max_workers=n_workers) as pool:
+            list(pool.map(_process_one, uni))
 
-                candidates.append({
-                    'sym': sym, 'side': side, 'entry': entry, 'sl': sl, 'tp': tp,
-                    'tp_pct': tp_pct, 'sl_pct': sl_pct, 'confidence': confidence,
-                    'feat': feat_with_meta,
-                })
-
-        candidates.sort(key=lambda c: c['confidence'], reverse=True)
-        # Cold-Start: zusätzlicher Cap pro Scan damit DB nicht überflutet wird
-        if n_obs < cold_start_min_n:
-            cold_cap = int(mh_cfg.get("cold_start_max_per_scan", 10))
-            slots_to_open = min(slots_free, cold_cap)
-        else:
-            slots_to_open = slots_free
-        log.info("scan: %d/%d offen, %d Slots frei, %d open jetzt, %d Kand. P>=%.2f"
-                 " (n_obs=%d, cold=%d, below=%d, no_mag=%d, no_of=%d, no_fb=%d, no_sec=%d, no_bl=%d, filt=%d, stalker=%s)",
-                 n_open, max_open, slots_free, slots_to_open, len(candidates), direction_threshold,
-                 n_obs, n_cold_skip, n_below_thresh, n_no_magnitude,
-                 n_no_orderflow, n_no_funding, n_no_sector, n_no_baseline, n_filtered,
-                 stalker_btc_regime if stalker_on else "off")
-        for c in candidates[:slots_to_open]:
-            action_name = f"{c['side']}_tp{c['tp_pct']:.2f}_sl{c['sl_pct']:.2f}"
-            pid = open_prediction(app, c['sym'], c['side'], c['entry'], c['sl'], c['tp'],
-                                   c['confidence'], action_name, 'multi_head', c['feat'],
-                                   pred_up=c['tp_pct'], pred_down=c['sl_pct'])
-            if pid:
-                matches += 1
-                log.info("OPEN %s %s entry=%.6g tp=%.6g sl=%.6g (tp%%=%.3f sl%%=%.3f) P=%.3f",
-                         c['sym'], c['side'], c['entry'], c['tp'], c['sl'],
-                         c['tp_pct'], c['sl_pct'], c['confidence'])
-                try_auto_trade(s, pid, c['sym'], c['side'], c['entry'], c['tp'], c['sl'],
-                               c['tp_pct'], c['sl_pct'])
+        log.info("scan: hl_open=%d max=%d quota_this_scan=%d traded=%d, %d preds geöffnet "
+                 "(n_obs=%d, workers=%d, cold=%d, below=%d, no_mag=%d, no_of=%d, no_fb=%d, no_sec=%d, no_bl=%d, filt=%d, stalker=%s min_s=%s)",
+                 hl_open_at_start, max_open, hl_quota_this_scan, stats["hl_traded"], stats["matches"],
+                 n_obs, n_workers, stats["cold_skip"], stats["below"], stats["no_mag"],
+                 stats["no_of"], stats["no_fb"], stats["no_sec"], stats["no_bl"], stats["filt"],
+                 stalker_btc_regime if stalker_on else "off",
+                 stalker_eff_min_samples if stalker_on else "-")
+        matches = stats["matches"]
     return matches
 
 
@@ -1489,28 +1529,33 @@ def try_auto_trade(s, pid, symbol, side, predicted_entry, predicted_tp, predicte
     size_usd = float(t.get("default_size_usd", 20))
     slippage_pct = float(t.get("order_slippage_pct", 1.0))
 
+    # Order-Strategie: Limit-Order zum predicted_entry direkt (oder besser).
+    # skip_mid_lookup=true spart den HL-/all-mids-Roundtrip vor jedem Auto-Trade
+    # (~200-500ms) — der Predictor-Entry IST der Soll-Preis, alles schlechter als
+    # max_slippage_pct wird abgelehnt → Prediction bleibt 'open' aber
+    # auto_trade_skipped=TRUE (UI hidet, Klines-Tracking + Hindsight-Lernen bleibt).
+    skip_mid = bool(t.get("skip_mid_lookup", True))
+    max_slip = float(t.get("max_slippage_pct"))  # NO-FALLBACK: settings.predictor.trading.max_slippage_pct
     try:
-        # Live-Mid als Entry-Anker (nicht der DB-close, der ist evtl. paar Sekunden alt)
         from rl_agent.trader import get_current_prices_hl, get_hl_credentials
         from predictor.order_executor import execute_order_with_failsafe
         creds = get_hl_credentials(user_id=1)
         if not creds:
             log.warning("auto-trade %s: keine HL-Creds", symbol); return
-        mids = get_current_prices_hl()
-        live_px = mids.get(symbol) if mids else None
-        if not live_px:
-            log.warning("auto-trade %s: kein Live-Preis von HL", symbol); return
-        entry_live = float(live_px)
-        # tp_pct/sl_pct werden an execute_order_with_failsafe weitergegeben
-        # — der rechnet TP/SL gegen den TATSAECHLICHEN Fill-Preis neu (verhindert
-        # dass Slippage zwischen Mid und Order-Execution die TP/SL verfaelscht).
-        # Bei use_predictor_targets=True keine Recompute (Bandit-Levels absolut).
+        if skip_mid:
+            entry_live = float(predicted_entry)
+        else:
+            mids = get_current_prices_hl()
+            live_px = mids.get(symbol) if mids else None
+            if not live_px:
+                log.warning("auto-trade %s: kein Live-Preis von HL", symbol); return
+            entry_live = float(live_px)
         res = execute_order_with_failsafe(
             creds, symbol, is_long=(side == "long"),
             leverage=leverage, size_usd=size_usd,
             tp_px=tp_px, sl_px=sl_px,
-            entry_px=entry_live, slippage_pct=slippage_pct,
-            tp_pct=tp_pct, sl_pct=sl_pct,  # None wenn use_predictor_targets
+            entry_px=entry_live, slippage_pct=max_slip,
+            tp_pct=tp_pct, sl_pct=sl_pct,
         )
         eff_lev = res.get("effective_leverage", leverage)
         if res["success"]:
@@ -1561,16 +1606,36 @@ def try_auto_trade(s, pid, symbol, side, predicted_entry, predicted_tp, predicte
                 log.info("AUTO-TRADE OK %s %s pid=%s margin=$%.0f lev=%dx (notional=$%.0f) tp=%.6g sl=%.6g",
                          symbol, side, pid, size_usd, eff_lev, size_usd * eff_lev, actual_tp, actual_sl)
         else:
-            # CARDINAL RULE: Auto-Trade-Fail beruehrt open_predictions NICHT.
-            # Predictor-Welt ist von HL-Realitaet entkoppelt — watch_pass_v4
-            # trackt die Prediction weiter via Klines (TP/SL/Timeout) und
-            # liefert dem Bandit ein echtes Lernsignal aus der Marktbewegung.
-            log.error("AUTO-TRADE FAIL %s %s pid=%s lev=%dx: %s (Predictor laeuft via Klines weiter)",
+            # CARDINAL RULE_1b: status bleibt 'open' — Predictor lernt weiter aus Klines.
+            # ZUSATZ-Flag auto_trade_skipped=TRUE → UI hidet die Prediction im Default-View,
+            # aber watch_pass + Hindsight + Bandit-Lernen laufen unverändert weiter.
+            try:
+                with db_app(s) as app:
+                    with app.cursor() as cur:
+                        cur.execute(
+                            "UPDATE open_predictions SET auto_trade_skipped=TRUE WHERE id=%s",
+                            (pid,),
+                        )
+                    app.commit()
+            except Exception as e:
+                log.warning("set auto_trade_skipped pid=%s failed: %s", pid, e)
+            log.error("AUTO-TRADE SKIPPED %s %s pid=%s lev=%dx: %s (status='open', UI hidden, Klines-Tracking weiter)",
                       symbol, side, pid, eff_lev, res.get("error"))
     except Exception as e:
         # HL-API-Fehler (Rate-Limit, Timeout, etc.) beruehren die Predictor-Welt nicht.
         # open_predictions laeuft via watch_pass_v4 mit Klines-Tracking weiter.
-        log.exception("auto-trade %s scheiterte (Predictor laeuft via Klines weiter): %s", symbol, e)
+        # Auch hier: skipped-Flag setzen damit UI konsistent ist.
+        try:
+            with db_app(s) as app:
+                with app.cursor() as cur:
+                    cur.execute(
+                        "UPDATE open_predictions SET auto_trade_skipped=TRUE WHERE id=%s",
+                        (pid,),
+                    )
+                app.commit()
+        except Exception:
+            pass
+        log.exception("auto-trade %s scheiterte (UI hidden, Predictor laeuft via Klines weiter): %s", symbol, e)
 
 
 def _mark_predict_closed(s, pid, status, exit_px):
@@ -3348,6 +3413,59 @@ def main():
     log.info("Predictor v5 (Multi-Head) start. scan=%ss watch=%ss top_n=%d",
              cfg["scan_interval_seconds"], cfg["watch_interval_seconds"], cfg["universe_top_n"])
 
+    # ============= Watch-Thread =============
+    # Watch_pass läuft eigenständig (sekündlich) damit TP/SL-Hits nicht durch
+    # langsame scan-passes (8-10min mit Stalker) verzögert werden.
+    # mh_model-Schreibzugriffe (learn_close, save) sind via mh_model_lock serialisiert.
+    import threading
+    mh_model_lock = threading.Lock()
+
+    def _watch_thread_loop():
+        watch_interval = float(cfg["watch_interval_seconds"])
+        last_timeout_watch_local = 0.0
+        last_hl_sync_local = 0.0
+        while True:
+            try:
+                s_local = load_settings()
+                with mh_model_lock:
+                    c = watch_pass_mh(s_local, mh_model, state_path)
+                if c > 0:
+                    log.info("watch-pass: %d closed", c)
+                # timeout_watch (Trader-Welt): 10s-Tick, entkoppelt vom scan_pass.
+                # Verkauf max 10s verspaetet statt bis 9-min-scan_pass durch ist.
+                now_inner = time.time()
+                if now_inner - last_timeout_watch_local >= 10:
+                    try:
+                        n_to = timeout_watch(s_local)
+                        if n_to > 0:
+                            log.info("timeout-watch: %d Positionen via Timeout geschlossen", n_to)
+                    except Exception as e:
+                        log.exception("timeout-watch (in watch-thread) failed: %s", e)
+                    last_timeout_watch_local = now_inner
+                # HL-Sync: trader_positions ↔ echte HL-Realität abgleichen (auch hier
+                # entkoppelt vom scan_pass — sonst weiß Wallet erst nach 9 min was HL
+                # tatsächlich gemacht hat, z.B. SL-Trigger).
+                if now_inner - last_hl_sync_local >= 30:
+                    try:
+                        n_sync = sync_hl_to_db(s_local)
+                        if n_sync > 0:
+                            log.info("hl-sync: %d Phantom-Positionen reaktiviert", n_sync)
+                    except Exception as e:
+                        log.exception("hl-sync (in watch-thread) failed: %s", e)
+                    last_hl_sync_local = now_inner
+                with mh_model_lock:
+                    n_h = process_due_mh_hindsight(s_local, mh_model, state_path)
+                if n_h > 0:
+                    log.info("mh-hindsight: %d Trades extended-learned (n_obs=%d)",
+                             n_h, mh_model.direction.n_obs)
+            except Exception as e:
+                log.exception("watch-thread error: %s", e)
+            time.sleep(watch_interval)
+
+    watch_thread = threading.Thread(target=_watch_thread_loop, name="watch_thread", daemon=True)
+    watch_thread.start()
+    log.info("watch-thread started (interval=%ss)", cfg["watch_interval_seconds"])
+
     # ============= Trader-Setup (LinTSBandit, 2 Actions, eigene Welt) =============
     # Reform 10.05.2026: NeuralBandit -> LinTSBandit, 102 Actions -> 2 Actions
     mb_cfg = cfg.get("modify_bandit", {})
@@ -3425,25 +3543,8 @@ def main():
                 last_settings_reload = now
                 # Multi-Head hat keine TP/SL-Buckets — Live-Bucket-Reload entfällt.
 
-            # HL-Sync: alle 60s pruefen ob HL-Phantom-Positionen ohne DB-Row sind
-            if now - last_hl_sync >= 60:
-                try:
-                    n_sync = sync_hl_to_db(s)
-                    if n_sync > 0:
-                        log.info("hl-sync: %d Phantom-Positionen reaktiviert", n_sync)
-                except Exception as e:
-                    log.exception("hl-sync failed: %s", e)
-                last_hl_sync = now
-
-            # Timeout-Watch: eigener 10s-Tick (entkoppelt von hl-sync) — Verkauf max 10s verspaetet statt bis 60s
-            if now - last_timeout_watch >= 10:
-                try:
-                    n_to = timeout_watch(s)
-                    if n_to > 0:
-                        log.info("timeout-watch: %d Positionen via Timeout geschlossen", n_to)
-                except Exception as e:
-                    log.exception("timeout-watch failed: %s", e)
-                last_timeout_watch = now
+            # HL-Sync + Timeout-Watch laufen jetzt im watch-thread (entkoppelt
+            # vom scan_pass). Im Main-Loop NUR noch scan_pass + modify_pass + quality_check.
 
             # Daten-Quality: alle 30 Min Quick-Log, alle 12h Telegram-Report
             if now - last_quality_check >= 1800:
@@ -3457,25 +3558,16 @@ def main():
                 last_quality_check = now
 
             if now - last_scan >= cfg["scan_interval_seconds"]:
-                m = scan_pass_mh(s, mh_model, rng)
+                # scan_pass macht nur predict_* (read-only auf mh_model) -> kein Lock,
+                # sonst blockt 8-min scan den sekündlichen watch-thread komplett.
+                # watch_pass (writes via learn_close) hält den Lock alleine.
+                m = scan_pass_mh(s, mh_model, rng, mh_model_lock)
                 last_scan = now
                 if m > 0:
                     log.info("scan-pass: %d new predictions", m)
 
-            if now - last_watch >= cfg["watch_interval_seconds"]:
-                c = watch_pass_mh(s, mh_model, state_path)
-                last_watch = now
-                if c > 0:
-                    log.info("watch-pass: %d closed", c)
-                # Extended-Hindsight: fällige Einträge aus predictor_hindsight_queue
-                # verarbeiten (delayed learning aus voller Klines-Range nach Close).
-                try:
-                    n_h = process_due_mh_hindsight(s, mh_model, state_path)
-                    if n_h > 0:
-                        log.info("mh-hindsight: %d Trades extended-learned (n_obs=%d)",
-                                 n_h, mh_model.direction.n_obs)
-                except Exception as e:
-                    log.exception("process_due_mh_hindsight failed: %s", e)
+            # watch_pass + extended-hindsight laufen in eigenem Thread (sekündlich) —
+            # nicht mehr im main-loop.
 
             # Trader-Tick alle interval_seconds (live TP/SL-Modifikation)
             if modify_bandit is not None and now - last_modify >= modify_interval:

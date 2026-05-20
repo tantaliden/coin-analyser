@@ -304,6 +304,86 @@ def place_limit_order_hl(creds: dict, coin: str, is_buy: bool, size_usd: float,
         return {"success": False, "error": str(e)}
 
 
+def place_limit_ioc_order_hl(creds: dict, coin: str, is_buy: bool, size_usd: float,
+                              limit_px: float, leverage: int = 1) -> dict:
+    """Echte Limit-IOC-Order (Immediate-or-Cancel) zum übergebenen Preis.
+
+    Im Unterschied zu place_limit_order_hl (das intern market_open mit
+    Slippage-Cap vom AKTUELLEN mid macht und unseren `price` ignoriert):
+
+      - HL versucht zum exakten limit_px (oder besser) zu fillen
+      - matched nichts → unfilled, nichts geöffnet, keine Fees
+      - matched → filled mit avg_price, behalten
+
+    Volker-Direktive 19.05.2026: „kaufen zum Predictor-Preis oder besser,
+    sonst gar nicht — sonst zahle ich für nichts" (Open+Close-Fees bei
+    Post-Slippage-Close).
+    """
+    try:
+        coin_info = _get_hl_coin_info(coin)
+        if coin_info is None:
+            return {"success": False, "error": f"Coin {coin} nicht in coin_info"}
+        sz_decimals = coin_info["sz_decimals"]
+        price_decimals = coin_info.get("price_decimals", 6)
+        quantity = round(size_usd / limit_px, sz_decimals)
+        if quantity <= 0:
+            return {"success": False, "error": f"Quantity zu klein: {quantity}"}
+
+        exchange = HLExchange(
+            wallet=_hl_account(creds),
+            base_url=hl_constants.MAINNET_API_URL,
+            account_address=creds["wallet_address"],
+        )
+
+        max_lev = coin_info.get("max_leverage")
+        if max_lev is None:
+            return {"success": False,
+                    "error": f"FALLBACK_TRIGGERED place_limit_ioc_order_hl {coin}: max_leverage fehlt"}
+        leverage = min(leverage, int(max_lev))
+        _maybe_update_leverage(exchange, coin, leverage, creds.get("wallet_address", ""))
+
+        # HL-konforme Preis-Rundung (tick size + max 5 sig figs), NICHT simples
+        # round(px, decimals) — sonst "Price must be divisible by tick size".
+        rounded_px = round_hl_price(float(limit_px), sz_decimals)
+        order_result = exchange.order(
+            coin, is_buy, quantity, rounded_px,
+            {"limit": {"tif": "Ioc"}}, reduce_only=False,
+        )
+
+        if order_result.get("status") != "ok":
+            return {"success": False, "error": str(order_result)}
+        statuses = order_result.get("response", {}).get("data", {}).get("statuses", [])
+        if not statuses:
+            return {"success": False, "error": "empty statuses"}
+        st0 = statuses[0]
+        if "filled" in st0:
+            fill = st0["filled"]
+            # quantity = echte gefüllte Größe (totalSz), aber Plausibilitäts-Check:
+            # totalSz muss nahe der berechneten quantity sein. Sonst (HL-Format-Eigenheit
+            # oder kumulativer Wert) -> berechnete quantity nutzen, sonst landet eine
+            # absurd große qty in der TP-Order -> "Order value too large".
+            ts = fill.get("totalSz")
+            try:
+                q_fill = float(ts)
+            except (TypeError, ValueError):
+                q_fill = None
+            if q_fill is None or q_fill <= 0 or q_fill > quantity * 1.5:
+                print(f"[RL-TRADER] place_limit_ioc {coin}: totalSz={ts!r} unplausibel "
+                      f"(calc={quantity}) -> nutze calc")
+                q_final = quantity
+            else:
+                q_final = q_fill
+            return {"success": True, "order_id": fill.get("oid"), "quantity": q_final,
+                    "avg_price": float(fill.get("avgPx", rounded_px)), "status": "filled"}
+        if "error" in st0:
+            return {"success": False, "error": st0["error"], "status": "rejected"}
+        # IOC: alles was nicht gefilled wird ist auto-cancelled von HL Seite, also resting heißt eher "partial cancelled"
+        return {"success": False, "error": f"unfilled: {st0}", "status": "unfilled"}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def cancel_order_hl(creds: dict, coin: str, order_id: int) -> dict:
     """Storniert eine Order auf Hyperliquid."""
     try:

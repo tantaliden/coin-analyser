@@ -218,7 +218,8 @@ export default function PredictionsModule() {
         </div>
 
         <div className="grid grid-cols-5 gap-2">
-          <Stat label="Offen" value={status?.open_count ?? 0} />
+          <Stat label="Offen (sichtbar/gesamt)"
+                value={`${status?.open_count_visible ?? 0}/${status?.open_count ?? 0}`} />
           <Stat label="Wins" value={status?.wins ?? 0} color="text-green-400" />
           <Stat label="Losses" value={status?.losses ?? 0} color="text-red-400" />
           <Stat label="WR" value={status?.winrate_pct != null ? status.winrate_pct + '%' : '-'} />
@@ -487,9 +488,17 @@ function SettingsModal({ onClose, onSaved }) {
             <NumInput value={num('stalker.baseline_lookback_days', 14)} step="1" min="3" max="90"
               onChange={v => set('stalker.baseline_lookback_days', parseInt(v))} />
           </Field>
-          <Field label="Min. Samples pro Bucket (sonst skip)">
-            <NumInput value={num('stalker.baseline_min_samples_per_bucket', 5)} step="1" min="1" max="500"
-              onChange={v => set('stalker.baseline_min_samples_per_bucket', parseInt(v))} />
+          <Field label="Min-Samples Schedule (Format: Tage:Wert — Komma-Liste, z.B. 0:2, 7:3, 14:5, 30:10)">
+            <input type="text"
+              defaultValue={(stalker.baseline_min_samples_schedule || []).map(s => `${s.after_days_data}:${s.value}`).join(', ')}
+              onBlur={e => {
+                const items = e.target.value.split(',').map(s => s.trim()).filter(Boolean).map(s => {
+                  const [d, v] = s.split(':').map(p => parseInt(p.trim()))
+                  return (isNaN(d) || isNaN(v)) ? null : { after_days_data: d, value: v }
+                }).filter(Boolean)
+                set('stalker.baseline_min_samples_schedule', items)
+              }}
+              className="w-full bg-gray-800 px-2 py-1.5 rounded border border-gray-600 text-xs"/>
           </Field>
           <Field label="BTC-Regime Fenster (h)">
             <NumInput value={num('stalker.btc_regime.source_window_hours', 4)} step="1" min="1" max="48"
@@ -785,6 +794,12 @@ function PredictionRow({ p, coinMeta, onOrder }) {
               p.status === 'auto_close_failsafe' ? 'HL-Position eröffnet aber TP/SL-Setup gescheitert → Failsafe-Auto-Close' : ''
             }>{p.status} {pnl != null && p.status !== 'auto_trade_failed' && p.status !== 'auto_close_failsafe' ? pnl.toFixed(2) + '%' : ''}</span>
           </>
+        )}
+        {isOpen && p.auto_trade_skipped && (
+          <span className="px-1.5 py-0.5 rounded text-[10px] bg-amber-900/40 text-amber-300"
+                title="Auto-Trade übersprungen — Slippage > Limit oder Order nicht gefüllt. Predictor trackt weiter via Klines.">
+            skipped
+          </span>
         )}
         {isOpen && (
           <button onClick={onOrder} className="px-2 py-1 bg-blue-600 hover:bg-blue-500 rounded text-[10px] flex items-center gap-1">

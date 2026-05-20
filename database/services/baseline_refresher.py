@@ -211,13 +211,20 @@ def refresh_coin(coins_conn, app_conn, symbol, lookback_days, min_samples,
 
 def refresh_all(s, cfg):
     lookback_days = must(cfg, "baseline_lookback_days")
-    min_samples = must(cfg, "baseline_min_samples_per_bucket")
     metrics_wanted = must(cfg, "metrics")
     regime_cfg = must(cfg, "btc_regime")
 
     coins_conn = db_coins(s)
     app_conn = db_app(s)
     try:
+        # Effective min_samples per Schedule basierend auf tatsächlicher data_days
+        import sys
+        sys.path.insert(0, "/opt/coin/backend")
+        from services.feature_baseline_dev import get_data_days, get_effective_min_samples
+        data_days = get_data_days(coins_conn)
+        min_samples = get_effective_min_samples(cfg, data_days)
+        log.info(f"data_days={data_days:.2f} → effective min_samples={min_samples} (via schedule)")
+
         regime_map = load_btc_regime_map(coins_conn, lookback_days, regime_cfg)
         log.info(f"BTC-regime map: {len(regime_map)} hourly buckets")
 
