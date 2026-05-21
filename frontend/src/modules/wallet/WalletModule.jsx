@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Wallet, RefreshCw, TrendingUp, TrendingDown, AlertCircle, X, Edit2, Trash2, Bot, DollarSign, Check, Tag, Filter, ArrowRightLeft, Loader2, BarChart2 } from 'lucide-react'
 import api from '../../utils/api'
 import { useSearchStore } from '../../stores/searchStore'
@@ -16,6 +16,9 @@ export default function WalletModule() {
   const [hlOrders, setHlOrders] = useState([])
   const [paperWallet, setPaperWallet] = useState(null)
   const [paperPositions, setPaperPositions] = useState([])
+  const [paperHistory, setPaperHistory] = useState([])
+  const [walletMode, setWalletMode] = useState('live') // 'live' | 'paper'
+  const modeInitRef = useRef(false)
   const [history, setHistory] = useState([])
   const [realizedPnl, setRealizedPnl] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -91,12 +94,19 @@ export default function WalletModule() {
       setHlOrders(hlOrdRes?.data?.orders || [])
       // Paper-Wallet (virtuelle Engine) — immer laden, leicht
       try {
-        const [pw, pp] = await Promise.all([
+        const [pw, pp, ph] = await Promise.all([
           api.get('/api/v1/predictor/paper/wallet'),
           api.get('/api/v1/predictor/paper/positions?scope=open'),
+          api.get('/api/v1/predictor/paper/positions?scope=closed'),
         ])
         setPaperWallet(pw.data || null)
         setPaperPositions(pp.data?.positions || [])
+        setPaperHistory(ph.data?.positions || [])
+        // Initial walletMode aus paper_mode ableiten — nur EINMAL (danach manuell)
+        if (!modeInitRef.current) {
+          modeInitRef.current = true
+          if (pw.data?.paper_mode) { setWalletMode('paper'); setPosSource('paper') }
+        }
       } catch { /* paper optional */ }
     } catch (err) { setError('Fehler beim Laden') }
     finally { setLoading(false) }
@@ -298,10 +308,29 @@ export default function WalletModule() {
 
   return (
     <div className="h-full flex flex-col overflow-hidden text-xs">
+      {/* Globaler Modus-Schalter LIVE / PAPER */}
+      <div className="flex items-center gap-2 px-2 py-1 border-b border-zinc-700/50 bg-zinc-900 flex-shrink-0">
+        <span className="text-zinc-500 text-[10px]">Wallet:</span>
+        <div className="flex gap-0.5 bg-zinc-800 rounded p-0.5">
+          <button onClick={() => { setWalletMode('live'); setPosSource('hyperliquid') }}
+            className={`px-3 py-0.5 rounded text-[11px] font-bold ${walletMode === 'live' ? 'bg-emerald-600 text-white' : 'text-zinc-400 hover:text-zinc-200'}`}>
+            LIVE
+          </button>
+          <button onClick={() => { setWalletMode('paper'); setPosSource('paper') }}
+            className={`px-3 py-0.5 rounded text-[11px] font-bold ${walletMode === 'paper' ? 'bg-indigo-600 text-white' : 'text-zinc-400 hover:text-zinc-200'}`}>
+            PAPER
+          </button>
+        </div>
+        {walletMode === 'paper' && paperWallet && (
+          <span className="text-[10px] text-zinc-500">
+            Pseudogeld · {paperWallet.paper_mode ? 'Auto-Trade auf Paper' : 'Auto-Trade auf LIVE (Anzeige manuell)'}
+          </span>
+        )}
+      </div>
       {/* Balance Bar */}
       {(balance || hlBalance || paperWallet) && (
         <div className="flex items-center gap-3 px-2 py-1.5 border-b border-zinc-700/50 bg-zinc-800/30 flex-shrink-0 flex-wrap">
-          {balance && (
+          {balance && walletMode === 'live' && (
             <>
               <div><span className="text-yellow-500 font-semibold">BIN</span> <span className="font-mono">${fp(binanceTotal)}</span></div>
               {balance.usdc_balance > 0 && (
@@ -317,8 +346,8 @@ export default function WalletModule() {
               <div className={totalUPnl >= 0 ? 'text-green-400' : 'text-red-400'}>{fPnl(totalUPnl)}</div>
             </>
           )}
-          {balance && hlBalance && <span className="text-zinc-600">|</span>}
-          {hlBalance && (
+          {balance && hlBalance && walletMode === 'live' && <span className="text-zinc-600">|</span>}
+          {hlBalance && walletMode === 'live' && (
             <>
               <div><span className="text-emerald-500 font-semibold">HL</span> <span className="font-mono">${fp(hlTotal)}</span></div>
               {hlAvail > 0 && (
@@ -330,19 +359,20 @@ export default function WalletModule() {
               {hlUPnl !== 0 && <div className={hlUPnl >= 0 ? 'text-green-400' : 'text-red-400'}>{fPnl(hlUPnl)}</div>}
             </>
           )}
-          {paperWallet && (
+          {paperWallet && walletMode === 'paper' && (
             <>
-              <span className="text-zinc-600">|</span>
-              <div><span className="text-indigo-400 font-semibold">PAPER{paperWallet.paper_mode ? '' : '*'}</span> <span className="font-mono">${fp(paperWallet.balance)}</span></div>
+              <div><span className="text-indigo-400 font-semibold">PAPER</span> <span className="font-mono">${fp(paperWallet.balance)}</span> <span className="text-zinc-600">/ ${fp(paperWallet.start_balance)}</span></div>
               <div className={paperWallet.total_return_pct >= 0 ? 'text-green-400' : 'text-red-400'}>
                 {paperWallet.total_return_pct >= 0 ? '+' : ''}{paperWallet.total_return_pct}%
               </div>
+              {paperWallet.drawdown_pct < 0 && <div className="text-red-400 text-[10px]">DD {paperWallet.drawdown_pct}%</div>}
               <div className="text-zinc-500 text-[10px]">W/L/TO {paperWallet.wins}/{paperWallet.losses}/{paperWallet.timeouts}</div>
+              <div className="text-zinc-500 text-[10px]">{paperWallet.n_trades} Trades</div>
             </>
           )}
-          {balance && hlBalance && <span className="text-zinc-600">|</span>}
-          <div><span className="text-zinc-500">Gesamt</span> <span className="font-mono font-semibold">${fp(grandTotal)}</span></div>
-          <div className={(realizedPnl?.realized_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}><span className="text-zinc-500">7d</span> {fPnl(realizedPnl?.realized_pnl)}</div>
+          {walletMode === 'live' && <span className="text-zinc-600">|</span>}
+          {walletMode === 'live' && <div><span className="text-zinc-500">Gesamt</span> <span className="font-mono font-semibold">${fp(grandTotal)}</span></div>}
+          {walletMode === 'live' && <div className={(realizedPnl?.realized_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}><span className="text-zinc-500">7d</span> {fPnl(realizedPnl?.realized_pnl)}</div>}
           <span className="ml-auto flex items-center gap-1 text-[10px] text-zinc-500">
             <span className={`w-1.5 h-1.5 rounded-full ${loading ? 'bg-yellow-400 animate-pulse' : 'bg-green-400'}`}></span>
             live
@@ -360,16 +390,13 @@ export default function WalletModule() {
           <button key={t.id} onClick={() => setActiveTab(t.id)}
             className={`px-2 py-0.5 rounded ${activeTab === t.id ? 'bg-blue-600 text-white' : 'text-zinc-400 hover:text-white'}`}>{t.label}</button>
         ))}
-        {(activeTab === 'positions' || activeTab === 'orders') && hlStatus.configured && (
+        {/* BIN/HL Sub-Toggle nur im Live-Modus (Paper steuert der globale Schalter oben) */}
+        {walletMode === 'live' && (activeTab === 'positions' || activeTab === 'orders') && hlStatus.configured && (
           <div className="ml-2 flex items-center gap-0.5 bg-zinc-800 rounded px-0.5">
             <button onClick={() => activeTab === 'positions' ? setPosSource('binance') : setOrdSource('binance')}
               className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${(activeTab === 'positions' ? posSource : ordSource) === 'binance' ? 'bg-yellow-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>BIN</button>
             <button onClick={() => activeTab === 'positions' ? setPosSource('hyperliquid') : setOrdSource('hyperliquid')}
               className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${(activeTab === 'positions' ? posSource : ordSource) === 'hyperliquid' ? 'bg-emerald-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>HL</button>
-            {activeTab === 'positions' && (
-              <button onClick={() => setPosSource('paper')}
-                className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${posSource === 'paper' ? 'bg-indigo-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>PAPER</button>
-            )}
           </div>
         )}
         {activeTab === 'positions' && posSource === 'binance' && (
@@ -674,7 +701,39 @@ export default function WalletModule() {
           </div>
         )}
 
-        {activeTab === 'history' && (
+        {activeTab === 'history' && walletMode === 'paper' && (
+          <table className="w-full">
+            <thead className="sticky top-0 bg-zinc-900">
+              <tr className="text-zinc-500 text-left">
+                <th className="px-2 py-1 font-normal">Symbol</th>
+                <th className="px-2 py-1 font-normal">Dir</th>
+                <th className="px-2 py-1 font-normal text-right">Lev</th>
+                <th className="px-2 py-1 font-normal text-right">Margin</th>
+                <th className="px-2 py-1 font-normal text-right">PnL %</th>
+                <th className="px-2 py-1 font-normal text-right">PnL $</th>
+                <th className="px-2 py-1 font-normal">Exit</th>
+                <th className="px-2 py-1 font-normal text-right">Datum</th>
+              </tr>
+            </thead>
+            <tbody>
+              {paperHistory.length === 0 ? (
+                <tr><td colSpan={8} className="text-center py-4 text-zinc-500">Keine Paper-Trades</td></tr>
+              ) : paperHistory.map((t, i) => (
+                <tr key={i} className="border-t border-zinc-800 hover:bg-zinc-800/50">
+                  <td className="px-2 py-1 font-mono font-medium">{t.symbol}</td>
+                  <td className={`px-2 py-1 ${t.side === 'long' ? 'text-green-400' : 'text-red-400'}`}>{t.side === 'long' ? 'L' : 'S'}</td>
+                  <td className="px-2 py-1 text-right font-mono text-zinc-400">{t.leverage}x</td>
+                  <td className="px-2 py-1 text-right font-mono">${fp(t.margin_usd, 2)}</td>
+                  <td className={`px-2 py-1 text-right font-mono ${(t.pnl_pct ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{(t.pnl_pct ?? 0) >= 0 ? '+' : ''}{fp(t.pnl_pct, 2)}%</td>
+                  <td className={`px-2 py-1 text-right font-mono ${(t.pnl_usd ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>${fp(t.pnl_usd, 2)}</td>
+                  <td className={`px-2 py-1 text-[10px] ${t.status === 'win' ? 'text-green-400' : t.status === 'loss' ? 'text-red-400' : 'text-zinc-400'}`}>{t.close_reason || t.status}</td>
+                  <td className="px-2 py-1 text-right font-mono text-zinc-500 text-[10px]">{t.closed_at ? new Date(t.closed_at).toLocaleString('de-DE', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : '-'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {activeTab === 'history' && walletMode !== 'paper' && (
           <table className="w-full">
             <thead className="sticky top-0 bg-zinc-900">
               <tr className="text-zinc-500 text-left">
