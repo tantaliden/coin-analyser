@@ -392,7 +392,8 @@ export default function WalletModule() {
       <div className="flex items-center gap-1 px-2 py-1 border-b border-zinc-700/50 flex-shrink-0">
         {[
           { id: 'positions', label: `Pos (${posSource === 'binance' ? (hideWithOrders ? positions.filter(p => !getOrderForPosition(p.symbol)).length : positions.length) : posSource === 'paper' ? paperPositions.length : hlPositions.length})` },
-          { id: 'orders', label: `Orders (${ordSource === 'binance' ? orders.length : hlOrders.length})` },
+          // Paper: 2 Orders je offener Position (TP + SL, reduce-only) wie bei HL.
+          { id: 'orders', label: `Orders (${walletMode === 'paper' ? paperPositions.length * 2 : (ordSource === 'binance' ? orders.length : hlOrders.length)})` },
           { id: 'history', label: 'Hist' }
         ].map(t => (
           <button key={t.id} onClick={() => setActiveTab(t.id)}
@@ -631,7 +632,45 @@ export default function WalletModule() {
           )}
         </>)}
 
-        {activeTab === 'orders' && ordSource === 'binance' && (
+        {activeTab === 'orders' && walletMode === 'paper' && (
+          <table className="w-full">
+            <thead className="sticky top-0 bg-zinc-900">
+              <tr className="text-zinc-500 text-left">
+                <th className="px-2 py-1 font-normal">Symbol</th>
+                <th className="px-2 py-1 font-normal">Typ</th>
+                <th className="px-2 py-1 font-normal">Side</th>
+                <th className="px-2 py-1 font-normal text-right">Preis</th>
+                <th className="px-2 py-1 font-normal text-right">Size</th>
+              </tr>
+            </thead>
+            <tbody>
+              {paperPositions.length === 0 ? (
+                <tr><td colSpan={5} className="text-center py-4 text-zinc-500">Keine offenen Paper-Orders</td></tr>
+              ) : paperPositions.flatMap((p, i) => {
+                const reduceSide = p.side === 'long' ? 'SELL' : 'BUY'  // reduce-only Gegenseite
+                const sideCls = reduceSide === 'BUY' ? 'text-green-400' : 'text-red-400'
+                return [
+                  <tr key={`tp${i}`} className="border-t border-zinc-800 hover:bg-zinc-800/50">
+                    <td className="px-2 py-1 font-mono font-medium">{p.symbol}</td>
+                    <td className="px-2 py-1 text-emerald-300">TP</td>
+                    <td className={`px-2 py-1 ${sideCls}`}>{reduceSide}</td>
+                    <td className="px-2 py-1 text-right font-mono text-emerald-300">${fp(p.tp_px, 6)}</td>
+                    <td className="px-2 py-1 text-right font-mono">{fp(p.qty, 4)}</td>
+                  </tr>,
+                  <tr key={`sl${i}`} className="border-t border-zinc-800/40 hover:bg-zinc-800/50">
+                    <td className="px-2 py-1 font-mono font-medium">{p.symbol}</td>
+                    <td className="px-2 py-1 text-red-300">SL</td>
+                    <td className={`px-2 py-1 ${sideCls}`}>{reduceSide}</td>
+                    <td className="px-2 py-1 text-right font-mono text-red-300">${fp(p.sl_px, 6)}</td>
+                    <td className="px-2 py-1 text-right font-mono">{fp(p.qty, 4)}</td>
+                  </tr>
+                ]
+              })}
+            </tbody>
+          </table>
+        )}
+
+        {activeTab === 'orders' && walletMode === 'live' && ordSource === 'binance' && (
           <table className="w-full">
             <thead className="sticky top-0 bg-zinc-900">
               <tr className="text-zinc-500 text-left">
@@ -674,7 +713,7 @@ export default function WalletModule() {
           </table>
         )}
 
-        {activeTab === 'orders' && ordSource === 'hyperliquid' && (
+        {activeTab === 'orders' && walletMode === 'live' && ordSource === 'hyperliquid' && (
           <table className="w-full">
             <thead className="sticky top-0 bg-zinc-900">
               <tr className="text-zinc-500 text-left">
