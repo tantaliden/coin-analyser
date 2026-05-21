@@ -73,6 +73,9 @@ from services.feature_coin_identity import (
     feature_keys as stalker_identity_keys,
 )
 
+# Paper-Trading-Engine (Variante B, 20.05.2026)
+from services.paper_engine import paper_open, paper_count_open, paper_watch
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger("predictor")
 
@@ -1229,6 +1232,7 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
             cur_a.execute("SELECT COUNT(*) FROM trader_positions WHERE status='open'")
             hl_open_at_start = cur_a.fetchone()[0]
         auto_trade_active = bool(cfg.get("trading", {}).get("auto_trade"))
+        paper_mode = bool(cfg.get("trading", {}).get("paper_mode"))
         if n_obs < cold_start_min_n:
             cold_cap = int(mh_cfg.get("cold_start_max_per_scan", 10))
             hl_quota_this_scan = min(max(0, max_open - hl_open_at_start), cold_cap)
@@ -1423,30 +1427,40 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
             if not pid: return
             _bump("matches")
 
-            # Slot-Frage + HL-Trade unter slot_lock (HL-API hat eigenes Rate-Limit,
-            # nur ein HL-Open zur Zeit damit Slot-Counter konsistent bleibt)
-            # Slot-Reservierung NUR im Lock (Millisekunden). try_auto_trade (HL-API,
-            # kann hängen) läuft AUSSERHALB des Locks — sonst blockiert ein HL-Hang
-            # alle anderen Worker (Deadlock, 20.05.2026).
+            # Slot-Frage + Trade unter slot_lock. Reservierung NUR im Lock (ms);
+            # Order-Ausführung (HL-API / Paper) AUSSERHALB — sonst blockiert ein
+            # HL-Hang alle Worker (Deadlock, 20.05.2026).
+            # paper_mode: Paper-Position (paper_positions) statt HL, Slot = max_open
+            # paper_positions. Sonst echte HL-Order. Gleiche Slot/Hebel/Size-Regeln.
             cold_burst_max = mh_cfg.get("cold_start_max_per_scan")
             if cold_burst_max is None:
                 log.error("FALLBACK_TRIGGERED scan_pass_mh: predictor.multi_head.cold_start_max_per_scan fehlt")
                 return
+            active_world = paper_mode or auto_trade_active  # öffnet diese Welt überhaupt Trades?
             do_trade = False
             hl_now = hl_open_at_start
             with slot_lock:
-                if auto_trade_active:
+                if paper_mode:
+                    hl_now = paper_count_open(app_w)
+                elif auto_trade_active:
                     with app_w.cursor() as cur_sl:
                         cur_sl.execute("SELECT COUNT(*) FROM trader_positions WHERE status='open'")
                         hl_now = cur_sl.fetchone()[0]
-                # effektiv = echte offene + in diesem Scan reservierte (noch nicht in DB)
                 hl_effective = hl_now + stats.get("hl_reserved", 0)
                 cold_burst_ok = (n_obs >= cold_start_min_n) or (stats["hl_traded"] < int(cold_burst_max))
-                if auto_trade_active and hl_effective < max_open and cold_burst_ok:
+                if active_world and hl_effective < max_open and cold_burst_ok:
                     stats["hl_reserved"] = stats.get("hl_reserved", 0) + 1
                     do_trade = True
 
-            if do_trade:
+            if do_trade and paper_mode:
+                # Paper: Entry = frischer Preis (entry wurde gerade aus agg_1m geholt)
+                try:
+                    paper_open(app_w, coins_w, pid, sym, side, entry, tp, sl, cfg)
+                finally:
+                    with slot_lock:
+                        stats["hl_reserved"] = max(0, stats.get("hl_reserved", 0) - 1)
+                        stats["hl_traded"] += 1
+            elif do_trade:
                 log.info("OPEN %s %s entry=%.6g tp=%.6g sl=%.6g (tp%%=%.3f sl%%=%.3f) P=%.3f [%d/%d HL-open]",
                          sym, side, entry, tp, sl, tp_pct, sl_pct, confidence, hl_now, max_open)
                 try:
@@ -1455,18 +1469,16 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
                     with slot_lock:
                         stats["hl_reserved"] = max(0, stats.get("hl_reserved", 0) - 1)
                         stats["hl_traded"] += 1
-            else:
+            elif active_world:
+                # Slot voll / cold-burst → skipped (nur wenn diese Welt überhaupt tradet)
                 with app_w.cursor() as cur_sk:
                     cur_sk.execute("UPDATE open_predictions SET auto_trade_skipped=TRUE WHERE id=%s", (pid,))
                 app_w.commit()
-                if not auto_trade_active:
-                    reason = "auto_trade_off"
-                elif hl_now >= max_open:
-                    reason = f"slot_full({hl_now}/{max_open})"
-                else:
-                    reason = "cold_burst_cap"
+                reason = f"slot_full({hl_now}/{max_open})" if hl_now >= max_open else "cold_burst_cap"
                 log.info("OPEN+SKIP %s %s pid=%s (%s) entry=%.6g P=%.3f",
                          sym, side, pid, reason, entry, confidence)
+            # else (kein paper, kein auto_trade): manuelle Welt — Prediction bleibt
+            # sichtbar (kein skip), Volker traded selbst.
 
         # === Worker-Pool starten ===
         with _Pool(max_workers=n_workers) as pool:
@@ -3453,6 +3465,17 @@ def main():
                     except Exception as e:
                         log.exception("hl-sync (in watch-thread) failed: %s", e)
                     last_hl_sync_local = now_inner
+
+                # Paper-Watcher: virtuelle paper_positions auf TP/SL/Timeout prüfen
+                # (nur wenn paper_mode aktiv — sonst no-op). Sekündlich wie watch_pass.
+                if bool(s_local.get("predictor", {}).get("trading", {}).get("paper_mode")):
+                    try:
+                        with db_coins(s_local) as _pc, db_app(s_local) as _pa:
+                            n_pc = paper_watch(_pa, _pc, s_local["predictor"], get_timeout_hours(s_local))
+                        if n_pc > 0:
+                            log.info("paper-watch: %d Paper-Positionen geschlossen", n_pc)
+                    except Exception as e:
+                        log.exception("paper-watch failed: %s", e)
                 with mh_model_lock:
                     n_h = process_due_mh_hindsight(s_local, mh_model, state_path)
                 if n_h > 0:

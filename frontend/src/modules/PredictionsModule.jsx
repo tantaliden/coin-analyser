@@ -1005,9 +1005,14 @@ function AutoTradeModal({ onClose, onSaved }) {
   const [cfg, setCfg] = useState(null)
   const [err, setErr] = useState(null)
   const [saving, setSaving] = useState(false)
+  const [paperW, setPaperW] = useState(null)
 
+  const loadPaper = () => api.get('/api/v1/predictor/paper/wallet').then(r => setPaperW(r.data)).catch(() => {})
   useEffect(() => {
     api.get('/api/v1/predictor/config').then(r => setCfg(r.data)).catch(e => setErr(e.message))
+    loadPaper()
+    const iv = setInterval(loadPaper, 5000)
+    return () => clearInterval(iv)
   }, [])
 
   if (!cfg) {
@@ -1056,7 +1061,37 @@ function AutoTradeModal({ onClose, onSaved }) {
         </div>
         {err && <div className="bg-red-900/40 text-red-300 p-2 rounded mb-2 text-sm">{err}</div>}
 
+        {paperW && (
+          <div className="bg-blue-900/20 border border-blue-700/40 rounded p-2 mb-3 text-xs">
+            <div className="flex items-center justify-between mb-1">
+              <span className="font-semibold text-blue-300">Paper-Wallet {t.paper_mode ? '(AKTIV)' : '(inaktiv)'}</span>
+              <button type="button" onClick={async () => { if(confirm('Paper-Wallet zurücksetzen?')){ await api.post('/api/v1/predictor/paper/reset'); loadPaper() } }}
+                className="px-2 py-0.5 bg-gray-700 hover:bg-gray-600 rounded text-[10px]">Reset</button>
+            </div>
+            <div className="grid grid-cols-4 gap-2">
+              <div>Balance<br/><span className={`font-bold ${paperW.balance>=paperW.start_balance?'text-green-400':'text-red-400'}`}>${paperW.balance}</span></div>
+              <div>Return<br/><span className={paperW.total_return_pct>=0?'text-green-400':'text-red-400'}>{paperW.total_return_pct>=0?'+':''}{paperW.total_return_pct}%</span></div>
+              <div>W/L/TO<br/><span className="text-gray-300">{paperW.wins}/{paperW.losses}/{paperW.timeouts}</span></div>
+              <div>offen<br/><span className="text-gray-300">{paperW.open_positions}</span></div>
+            </div>
+          </div>
+        )}
+
         <Section title="Aktivierung">
+          <Field label="Modus">
+            <div className="flex gap-2">
+              <button type="button"
+                onClick={() => set('paper_mode', false)}
+                className={`px-3 py-1 rounded text-xs font-semibold ${!t.paper_mode ? 'bg-red-700 text-white' : 'bg-gray-700 text-gray-300'}`}>
+                LIVE (echtes HL)
+              </button>
+              <button type="button"
+                onClick={() => set('paper_mode', true)}
+                className={`px-3 py-1 rounded text-xs font-semibold ${t.paper_mode ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300'}`}>
+                PAPER (virtuell)
+              </button>
+            </div>
+          </Field>
           <Field label="Auto-Trade aktiv">
             <input type="checkbox" checked={!!t.auto_trade}
               onChange={e => set('auto_trade', e.target.checked)} />

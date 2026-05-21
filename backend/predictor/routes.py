@@ -295,6 +295,63 @@ def control_service(action: str):
         raise HTTPException(504, f"systemctl {action} timeout")
 
 
+@router.get("/paper/wallet")
+def paper_wallet():
+    """Paper-Trading-Wallet-Stand (virtuelle Engine, Variante B)."""
+    with _db_app() as app:
+        with app.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT balance, peak_balance, start_balance, n_trades, updated_at FROM paper_wallet_state WHERE id=1")
+            w = cur.fetchone() or {}
+            cur.execute("SELECT COUNT(*) AS n FROM paper_positions WHERE status='open'")
+            n_open = cur.fetchone()['n']
+            cur.execute("""
+                SELECT COUNT(*) FILTER (WHERE status='win') AS wins,
+                       COUNT(*) FILTER (WHERE status='loss') AS losses,
+                       COUNT(*) FILTER (WHERE status='timeout') AS timeouts,
+                       COALESCE(SUM(pnl_usd),0) AS realized_usd
+                FROM paper_positions WHERE status IN ('win','loss','timeout')
+            """)
+            st = cur.fetchone()
+    bal = float(w.get('balance') or 0); start = float(w.get('start_balance') or 1)
+    peak = float(w.get('peak_balance') or bal)
+    return {
+        "balance": round(bal, 2),
+        "start_balance": round(start, 2),
+        "peak_balance": round(peak, 2),
+        "total_return_pct": round((bal - start) / start * 100, 2) if start else 0,
+        "drawdown_pct": round((bal - peak) / peak * 100, 2) if peak else 0,
+        "n_trades": w.get('n_trades') or 0,
+        "open_positions": n_open,
+        "wins": st['wins'], "losses": st['losses'], "timeouts": st['timeouts'],
+        "realized_usd": round(float(st['realized_usd']), 2),
+        "paper_mode": _load_settings().get("predictor", {}).get("trading", {}).get("paper_mode", False),
+    }
+
+
+@router.get("/paper/positions")
+def paper_positions(scope: str = "open", limit: int = 100):
+    with _db_app() as app:
+        with app.cursor(cursor_factory=RealDictCursor) as cur:
+            if scope == "open":
+                cur.execute("SELECT * FROM paper_positions WHERE status='open' ORDER BY opened_at DESC LIMIT %s", (limit,))
+            else:
+                cur.execute("SELECT * FROM paper_positions WHERE status IN ('win','loss','timeout') ORDER BY closed_at DESC NULLS LAST LIMIT %s", (limit,))
+            rows = cur.fetchall()
+    return {"positions": rows, "scope": scope, "count": len(rows)}
+
+
+@router.post("/paper/reset")
+def paper_reset():
+    """Paper-Wallet auf start_balance zurücksetzen + offene Paper-Positionen schließen."""
+    start = float(_load_settings().get("predictor", {}).get("paper_wallet", {}).get("start_balance", 1000))
+    with _db_app() as app:
+        with app.cursor() as cur:
+            cur.execute("UPDATE paper_wallet_state SET balance=%s, peak_balance=%s, start_balance=%s, n_trades=0, updated_at=now() WHERE id=1", (start, start, start))
+            cur.execute("DELETE FROM paper_positions")
+        app.commit()
+    return {"status": "ok", "balance": start}
+
+
 @router.get("/config")
 def get_config():
     s = _load_settings()
