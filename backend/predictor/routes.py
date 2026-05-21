@@ -337,6 +337,32 @@ def paper_positions(scope: str = "open", limit: int = 100):
             else:
                 cur.execute("SELECT * FROM paper_positions WHERE status IN ('win','loss','timeout') ORDER BY closed_at DESC NULLS LAST LIMIT %s", (limit,))
             rows = cur.fetchall()
+    # Für offene: aktuellen Preis holen + live margin-PnL% (nach Hebel) berechnen
+    if scope == "open" and rows:
+        symbols = list({r['symbol'] for r in rows})
+        prices = {}
+        try:
+            with _db_coins() as coins:
+                with coins.cursor(cursor_factory=RealDictCursor) as cur_c:
+                    cur_c.execute("""
+                        SELECT DISTINCT ON (symbol) symbol, mid_px, close
+                        FROM klines WHERE symbol = ANY(%s) AND interval='10s'
+                        ORDER BY symbol, open_time DESC
+                    """, (symbols,))
+                    prices = {r['symbol']: (r['mid_px'] or r['close']) for r in cur_c.fetchall()}
+        except Exception:
+            prices = {}
+        for r in rows:
+            cur_px = prices.get(r['symbol'])
+            entry = float(r['entry_px']); lev = int(r['leverage'])
+            if cur_px and entry:
+                cur_px = float(cur_px)
+                move = (cur_px - entry)/entry if r['side'] == 'long' else (entry - cur_px)/entry
+                r['current_px'] = cur_px
+                r['live_pnl_pct'] = round(move * 100.0 * lev, 3)  # nach Hebel (margin-%)
+            else:
+                r['current_px'] = None
+                r['live_pnl_pct'] = None
     return {"positions": rows, "scope": scope, "count": len(rows)}
 
 

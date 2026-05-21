@@ -472,30 +472,31 @@ export default function WalletModule() {
             <thead className="sticky top-0 bg-zinc-900">
               <tr className="text-zinc-500 text-left">
                 <th className="px-2 py-1 font-normal">Symbol</th>
-                <th className="px-2 py-1 font-normal">Side</th>
-                <th className="px-2 py-1 font-normal text-right">Hebel</th>
+                <th className="px-2 py-1 font-normal">Side/Hebel</th>
+                <th className="px-2 py-1 font-normal text-right">P/L %</th>
                 <th className="px-2 py-1 font-normal text-right">Einstieg</th>
                 <th className="px-2 py-1 font-normal text-right">TP</th>
                 <th className="px-2 py-1 font-normal text-right">SL</th>
-                <th className="px-2 py-1 font-normal text-right">Margin</th>
                 <th className="px-2 py-1 font-normal text-right">Alter</th>
               </tr>
             </thead>
             <tbody>
               {paperPositions.length === 0 && (
-                <tr><td colSpan={8} className="px-2 py-4 text-center text-zinc-600">Keine offenen Paper-Positionen</td></tr>
+                <tr><td colSpan={7} className="px-2 py-4 text-center text-zinc-600">Keine offenen Paper-Positionen</td></tr>
               )}
               {paperPositions.map((pos, i) => {
                 const ageMin = pos.opened_at ? Math.round((Date.now() - new Date(pos.opened_at).getTime())/60000) : 0
+                const pnl = pos.live_pnl_pct
                 return (
                   <tr key={i} className="border-t border-zinc-800 hover:bg-zinc-800/50">
                     <td className="px-2 py-1 font-mono font-medium">{pos.symbol}</td>
-                    <td className={`px-2 py-1 font-semibold ${pos.side==='long'?'text-emerald-400':'text-red-400'}`}>{pos.side==='long'?'L':'S'}</td>
-                    <td className="px-2 py-1 text-right font-mono">{pos.leverage}x</td>
+                    <td className={`px-2 py-1 font-semibold ${pos.side==='long'?'text-emerald-400':'text-red-400'}`}>{pos.side==='long'?'L':'S'} {pos.leverage}x</td>
+                    <td className={`px-2 py-1 text-right font-mono font-semibold ${pnl==null?'text-zinc-500':pnl>=0?'text-green-400':'text-red-400'}`}>
+                      {pnl==null ? '—' : `${pnl>=0?'+':''}${fp(pnl,2)}%`}
+                    </td>
                     <td className="px-2 py-1 text-right font-mono">${fp(pos.entry_px, 6)}</td>
                     <td className="px-2 py-1 text-right font-mono text-emerald-300">${fp(pos.tp_px, 6)}</td>
                     <td className="px-2 py-1 text-right font-mono text-red-300">${fp(pos.sl_px, 6)}</td>
-                    <td className="px-2 py-1 text-right font-mono">${fp(pos.margin_usd, 2)}</td>
                     <td className="px-2 py-1 text-right font-mono text-zinc-400">{ageMin}m</td>
                   </tr>
                 )
