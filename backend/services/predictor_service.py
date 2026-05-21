@@ -1441,23 +1441,17 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
                 log.error("FALLBACK_TRIGGERED scan_pass_mh: predictor.multi_head.cold_start_max_per_scan fehlt")
                 return
 
-            # === PAPER-Welt: laeuft IMMER (Slot vs paper_count_open) ===
-            do_paper = False
-            with slot_lock:
-                pn = paper_count_open(app_w)
-                pn_eff = pn + stats.get("paper_reserved", 0)
-                cold_burst_ok_p = (n_obs >= cold_start_min_n) or (stats["paper_traded"] < int(cold_burst_max))
-                if pn_eff < max_open and cold_burst_ok_p:
-                    stats["paper_reserved"] = stats.get("paper_reserved", 0) + 1
-                    do_paper = True
-            if do_paper:
-                # Paper: Entry = frischer Preis (entry wurde gerade aus agg_1m geholt)
-                try:
-                    paper_open(app_w, coins_w, pid, sym, side, entry, tp, sl, cfg)
-                finally:
-                    with slot_lock:
-                        stats["paper_reserved"] = max(0, stats.get("paper_reserved", 0) - 1)
-                        stats["paper_traded"] += 1
+            # === PAPER-Welt: laeuft IMMER, KEIN Slot-Cap (Volker 21.05., Variante A):
+            # Paper spiegelt JEDE selektierte Prediction 1:1 → ehrliche, ungedeckelte
+            # Predictor-Equity-Kurve (deckungsgleich mit open_predictions).
+            # Entry = frischer Preis (entry wurde gerade aus agg_1m geholt).
+            # Echtgeld unten bleibt auf max_open begrenzt.
+            try:
+                paper_open(app_w, coins_w, pid, sym, side, entry, tp, sl, cfg)
+                with slot_lock:
+                    stats["paper_traded"] += 1
+            except Exception as e:
+                log.warning("paper_open %s failed: %s", sym, e)
 
             # === ECHTGELD-Welt: nur wenn auto_trade (Slot vs trader_positions) ===
             if auto_trade_active:
