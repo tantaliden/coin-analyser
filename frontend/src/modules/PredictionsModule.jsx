@@ -1064,12 +1064,12 @@ function AutoTradeModal({ onClose, onSaved }) {
         {paperW && (
           <div className="bg-blue-900/20 border border-blue-700/40 rounded p-2 mb-3 text-xs">
             <div className="flex items-center justify-between mb-1">
-              <span className="font-semibold text-blue-300">Paper-Wallet {t.paper_mode ? '(AKTIV)' : '(inaktiv)'}</span>
+              <span className="font-semibold text-blue-300">Paper-Wallet (läuft immer)</span>
               <button type="button" onClick={async () => { if(confirm('Paper-Wallet zurücksetzen?')){ await api.post('/api/v1/predictor/paper/reset'); loadPaper() } }}
                 className="px-2 py-0.5 bg-gray-700 hover:bg-gray-600 rounded text-[10px]">Reset</button>
             </div>
             <div className="grid grid-cols-4 gap-2">
-              <div>Balance<br/><span className={`font-bold ${paperW.balance>=paperW.start_balance?'text-green-400':'text-red-400'}`}>${paperW.balance}</span></div>
+              <div>Equity<br/><span className={`font-bold ${paperW.equity>=paperW.start_balance?'text-green-400':'text-red-400'}`}>${paperW.equity}</span></div>
               <div>Return<br/><span className={paperW.total_return_pct>=0?'text-green-400':'text-red-400'}>{paperW.total_return_pct>=0?'+':''}{paperW.total_return_pct}%</span></div>
               <div>W/L/TO<br/><span className="text-gray-300">{paperW.wins}/{paperW.losses}/{paperW.timeouts}</span></div>
               <div>offen<br/><span className="text-gray-300">{paperW.open_positions}</span></div>
@@ -1078,21 +1078,11 @@ function AutoTradeModal({ onClose, onSaved }) {
         )}
 
         <Section title="Aktivierung">
-          <Field label="Modus">
-            <div className="flex gap-2">
-              <button type="button"
-                onClick={() => set('paper_mode', false)}
-                className={`px-3 py-1 rounded text-xs font-semibold ${!t.paper_mode ? 'bg-red-700 text-white' : 'bg-gray-700 text-gray-300'}`}>
-                LIVE (echtes HL)
-              </button>
-              <button type="button"
-                onClick={() => set('paper_mode', true)}
-                className={`px-3 py-1 rounded text-xs font-semibold ${t.paper_mode ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300'}`}>
-                PAPER (virtuell)
-              </button>
-            </div>
-          </Field>
-          <Field label="Auto-Trade aktiv">
+          <div className="text-[11px] text-gray-400 mb-2 leading-snug">
+            Paper-Wallet läuft <span className="text-blue-300 font-semibold">immer</span> mit (jede Prediction wird virtuell verbucht).
+            Der Schalter <span className="font-semibold">Auto-Trade</span> steuert allein das <span className="text-red-300 font-semibold">Echtgeld</span> auf HL.
+          </div>
+          <Field label="Auto-Trade (Echtgeld HL)">
             <input type="checkbox" checked={!!t.auto_trade}
               onChange={e => set('auto_trade', e.target.checked)} />
           </Field>

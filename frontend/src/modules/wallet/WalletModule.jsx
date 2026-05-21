@@ -102,10 +102,12 @@ export default function WalletModule() {
         setPaperWallet(pw.data || null)
         setPaperPositions(pp.data?.positions || [])
         setPaperHistory(ph.data?.positions || [])
-        // Initial walletMode aus paper_mode ableiten — nur EINMAL (danach manuell)
+        // Initial-Anzeige an auto_trade gekoppelt — nur EINMAL (danach manuell).
+        // Paper laeuft IMMER mit; der Schalter ist reine Anzeige. auto_trade aus →
+        // standardmaessig Paper zeigen, auto_trade an → LIVE.
         if (!modeInitRef.current) {
           modeInitRef.current = true
-          if (pw.data?.paper_mode) { setWalletMode('paper'); setPosSource('paper') }
+          if (!pw.data?.auto_trade) { setWalletMode('paper'); setPosSource('paper') }
         }
       } catch { /* paper optional */ }
     } catch (err) { setError('Fehler beim Laden') }
@@ -323,7 +325,7 @@ export default function WalletModule() {
         </div>
         {walletMode === 'paper' && paperWallet && (
           <span className="text-[10px] text-zinc-500">
-            Pseudogeld · {paperWallet.paper_mode ? 'Auto-Trade auf Paper' : 'Auto-Trade auf LIVE (Anzeige manuell)'}
+            Pseudogeld · läuft immer mit (Anzeige) · Echtgeld nur per Auto-Trade
           </span>
         )}
       </div>
@@ -361,13 +363,19 @@ export default function WalletModule() {
           )}
           {paperWallet && walletMode === 'paper' && (
             <>
-              <div><span className="text-indigo-400 font-semibold">PAPER</span> <span className="font-mono">${fp(paperWallet.balance)}</span> <span className="text-zinc-600">/ ${fp(paperWallet.start_balance)}</span></div>
+              <div><span className="text-indigo-400 font-semibold">PAPER</span> <span className="font-mono">${fp(paperWallet.equity)}</span> <span className="text-zinc-600">/ ${fp(paperWallet.start_balance)}</span></div>
               <div className={paperWallet.total_return_pct >= 0 ? 'text-green-400' : 'text-red-400'}>
                 {paperWallet.total_return_pct >= 0 ? '+' : ''}{paperWallet.total_return_pct}%
               </div>
+              <div className="flex items-center gap-1 text-[10px]"><span className="text-zinc-500">real</span> <span className="font-mono text-zinc-300">${fp(paperWallet.balance)}</span></div>
+              {paperWallet.unrealized_usd !== 0 && (
+                <div className={`text-[10px] ${paperWallet.unrealized_usd >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  offen {paperWallet.unrealized_usd >= 0 ? '+' : ''}${fp(paperWallet.unrealized_usd)}
+                </div>
+              )}
               {paperWallet.drawdown_pct < 0 && <div className="text-red-400 text-[10px]">DD {paperWallet.drawdown_pct}%</div>}
               <div className="text-zinc-500 text-[10px]">W/L/TO {paperWallet.wins}/{paperWallet.losses}/{paperWallet.timeouts}</div>
-              <div className="text-zinc-500 text-[10px]">{paperWallet.n_trades} Trades</div>
+              <div className="text-zinc-500 text-[10px]">{paperWallet.n_trades} Trades · {paperWallet.open_positions} offen</div>
             </>
           )}
           {walletMode === 'live' && <span className="text-zinc-600">|</span>}

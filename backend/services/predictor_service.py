@@ -1294,8 +1294,9 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
         stats_lock = _th.Lock()
         slot_lock = _th.Lock()
         stats = {"cold_skip":0,"below":0,"no_mag":0,"filt":0,
-                 "no_of":0,"no_fb":0,"no_sec":0,"no_bl":0,
-                 "hl_traded":0,"matches":0}
+                 "no_of":0,"no_fb":0,"no_sec":0,"no_bl":0,"matches":0,
+                 "paper_traded":0,"paper_reserved":0,
+                 "live_traded":0,"live_reserved":0}
         cold_start_active = (n_obs < cold_start_min_n)
 
         def _bump(key, n=1):
@@ -1430,63 +1431,73 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
             # Slot-Frage + Trade unter slot_lock. Reservierung NUR im Lock (ms);
             # Order-Ausführung (HL-API / Paper) AUSSERHALB — sonst blockiert ein
             # HL-Hang alle Worker (Deadlock, 20.05.2026).
-            # paper_mode: Paper-Position (paper_positions) statt HL, Slot = max_open
-            # paper_positions. Sonst echte HL-Order. Gleiche Slot/Hebel/Size-Regeln.
+            #
+            # Zwei UNABHAENGIGE Welten (Volker 21.05.): Paper laeuft IMMER (jede
+            # selektierte Prediction fuellt die Pseudo-Wallet — ehrliche, durchgaengige
+            # Predictor-Equity-Kurve), Echtgeld zusaetzlich NUR bei auto_trade. Beide
+            # eigener Slot (Paper vs trader_positions), eigener cold-burst-Zaehler.
             cold_burst_max = mh_cfg.get("cold_start_max_per_scan")
             if cold_burst_max is None:
                 log.error("FALLBACK_TRIGGERED scan_pass_mh: predictor.multi_head.cold_start_max_per_scan fehlt")
                 return
-            active_world = paper_mode or auto_trade_active  # öffnet diese Welt überhaupt Trades?
-            do_trade = False
-            hl_now = hl_open_at_start
-            with slot_lock:
-                if paper_mode:
-                    hl_now = paper_count_open(app_w)
-                elif auto_trade_active:
-                    with app_w.cursor() as cur_sl:
-                        cur_sl.execute("SELECT COUNT(*) FROM trader_positions WHERE status='open'")
-                        hl_now = cur_sl.fetchone()[0]
-                hl_effective = hl_now + stats.get("hl_reserved", 0)
-                cold_burst_ok = (n_obs >= cold_start_min_n) or (stats["hl_traded"] < int(cold_burst_max))
-                if active_world and hl_effective < max_open and cold_burst_ok:
-                    stats["hl_reserved"] = stats.get("hl_reserved", 0) + 1
-                    do_trade = True
 
-            if do_trade and paper_mode:
+            # === PAPER-Welt: laeuft IMMER (Slot vs paper_count_open) ===
+            do_paper = False
+            with slot_lock:
+                pn = paper_count_open(app_w)
+                pn_eff = pn + stats.get("paper_reserved", 0)
+                cold_burst_ok_p = (n_obs >= cold_start_min_n) or (stats["paper_traded"] < int(cold_burst_max))
+                if pn_eff < max_open and cold_burst_ok_p:
+                    stats["paper_reserved"] = stats.get("paper_reserved", 0) + 1
+                    do_paper = True
+            if do_paper:
                 # Paper: Entry = frischer Preis (entry wurde gerade aus agg_1m geholt)
                 try:
                     paper_open(app_w, coins_w, pid, sym, side, entry, tp, sl, cfg)
                 finally:
                     with slot_lock:
-                        stats["hl_reserved"] = max(0, stats.get("hl_reserved", 0) - 1)
-                        stats["hl_traded"] += 1
-            elif do_trade:
-                log.info("OPEN %s %s entry=%.6g tp=%.6g sl=%.6g (tp%%=%.3f sl%%=%.3f) P=%.3f [%d/%d HL-open]",
-                         sym, side, entry, tp, sl, tp_pct, sl_pct, confidence, hl_now, max_open)
-                try:
-                    try_auto_trade(s, pid, sym, side, entry, tp, sl, tp_pct, sl_pct)
-                finally:
-                    with slot_lock:
-                        stats["hl_reserved"] = max(0, stats.get("hl_reserved", 0) - 1)
-                        stats["hl_traded"] += 1
-            elif active_world:
-                # Slot voll / cold-burst → skipped (nur wenn diese Welt überhaupt tradet)
-                with app_w.cursor() as cur_sk:
-                    cur_sk.execute("UPDATE open_predictions SET auto_trade_skipped=TRUE WHERE id=%s", (pid,))
-                app_w.commit()
-                reason = f"slot_full({hl_now}/{max_open})" if hl_now >= max_open else "cold_burst_cap"
-                log.info("OPEN+SKIP %s %s pid=%s (%s) entry=%.6g P=%.3f",
-                         sym, side, pid, reason, entry, confidence)
-            # else (kein paper, kein auto_trade): manuelle Welt — Prediction bleibt
-            # sichtbar (kein skip), Volker traded selbst.
+                        stats["paper_reserved"] = max(0, stats.get("paper_reserved", 0) - 1)
+                        stats["paper_traded"] += 1
+
+            # === ECHTGELD-Welt: nur wenn auto_trade (Slot vs trader_positions) ===
+            if auto_trade_active:
+                do_live = False
+                with slot_lock:
+                    with app_w.cursor() as cur_sl:
+                        cur_sl.execute("SELECT COUNT(*) FROM trader_positions WHERE status='open'")
+                        tn = cur_sl.fetchone()[0]
+                    tn_eff = tn + stats.get("live_reserved", 0)
+                    cold_burst_ok_l = (n_obs >= cold_start_min_n) or (stats["live_traded"] < int(cold_burst_max))
+                    if tn_eff < max_open and cold_burst_ok_l:
+                        stats["live_reserved"] = stats.get("live_reserved", 0) + 1
+                        do_live = True
+                if do_live:
+                    log.info("OPEN %s %s entry=%.6g tp=%.6g sl=%.6g (tp%%=%.3f sl%%=%.3f) P=%.3f [%d/%d HL-open]",
+                             sym, side, entry, tp, sl, tp_pct, sl_pct, confidence, tn, max_open)
+                    try:
+                        try_auto_trade(s, pid, sym, side, entry, tp, sl, tp_pct, sl_pct)
+                    finally:
+                        with slot_lock:
+                            stats["live_reserved"] = max(0, stats.get("live_reserved", 0) - 1)
+                            stats["live_traded"] += 1
+                else:
+                    # Slot voll / cold-burst → Echtgeld-Welt hidet (Predictor lernt trotzdem)
+                    with app_w.cursor() as cur_sk:
+                        cur_sk.execute("UPDATE open_predictions SET auto_trade_skipped=TRUE WHERE id=%s", (pid,))
+                    app_w.commit()
+                    reason = f"slot_full({tn}/{max_open})" if tn >= max_open else "cold_burst_cap"
+                    log.info("OPEN+SKIP(live) %s %s pid=%s (%s) entry=%.6g P=%.3f",
+                             sym, side, pid, reason, entry, confidence)
+            # auto_trade aus: Echtgeld ruehrt nichts an (Volker traded ggf. manuell),
+            # Prediction bleibt sichtbar + lernt; Paper hat sie oben verbucht.
 
         # === Worker-Pool starten ===
         with _Pool(max_workers=n_workers) as pool:
             list(pool.map(_process_one, uni))
 
-        log.info("scan: hl_open=%d max=%d quota_this_scan=%d traded=%d, %d preds geöffnet "
+        log.info("scan: hl_open=%d max=%d quota_this_scan=%d paper_traded=%d live_traded=%d, %d preds geöffnet "
                  "(n_obs=%d, workers=%d, cold=%d, below=%d, no_mag=%d, no_of=%d, no_fb=%d, no_sec=%d, no_bl=%d, filt=%d, stalker=%s min_s=%s)",
-                 hl_open_at_start, max_open, hl_quota_this_scan, stats["hl_traded"], stats["matches"],
+                 hl_open_at_start, max_open, hl_quota_this_scan, stats["paper_traded"], stats["live_traded"], stats["matches"],
                  n_obs, n_workers, stats["cold_skip"], stats["below"], stats["no_mag"],
                  stats["no_of"], stats["no_fb"], stats["no_sec"], stats["no_bl"], stats["filt"],
                  stalker_btc_regime if stalker_on else "off",
@@ -3402,6 +3413,98 @@ def detect_market_shift(coins, obs_cfg):
     return None
 
 
+def _median(vals):
+    v = sorted(x for x in vals if x is not None)
+    n = len(v)
+    if n == 0:
+        return None
+    m = n // 2
+    return v[m] if n % 2 else (v[m-1] + v[m]) / 2.0
+
+
+def detect_coin_drop(coins, symbol, side, drop_cfg, of_feat):
+    """Per-Coin-Vorboten-Trigger (alles VOR Hebel). True wenn der Coin GEGEN die
+    Position laeuft (long: faellt, short: steigt) um mind. price_move_pct in
+    window_minutes UND mind. min_signals Vorboten feuern. Vorboten:
+      - Sell-/Buy-Dominanz (taker_buy/volume)
+      - Volumen-Spike (vs Median ueber baseline_window_minutes)
+      - Book-Imbalance kippt gegen Position (book_imbalance_5)
+      - Sweeps (of_sweep_bid/ask_per_min_5m aus Orderflow-Features)
+      - Spread-Spike (vs Median)
+    of_feat = compute_orderflow_features(symbol) (kann None sein).
+    Returnt dict {move_pct, adverse_pct, n_signals, signals} oder None."""
+    if not drop_cfg.get("enabled"):
+        return None
+    win = int(drop_cfg["window_minutes"])
+    base_win = int(drop_cfg["baseline_window_minutes"])
+    move_thr = float(drop_cfg["price_move_pct"])
+    min_signals = int(drop_cfg["min_signals"])
+    taker_ratio_thr = float(drop_cfg["taker_sell_ratio"])
+    vol_mult = float(drop_cfg["volume_spike_mult"])
+    imb_thr = float(drop_cfg["book_imbalance_thr"])
+    sweep_thr = float(drop_cfg["sweep_per_min_thr"])
+    spread_mult = float(drop_cfg["spread_spike_mult"])
+
+    with coins.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT bucket, close, volume, taker_buy_base, spread_bps, book_imbalance_5
+            FROM agg_1m WHERE symbol=%s ORDER BY bucket DESC LIMIT %s
+        """, (symbol, base_win + 1))
+        rows = cur.fetchall()
+    if len(rows) < win + 1:
+        return None
+    now_px = rows[0]['close']; old_px = rows[win]['close']
+    if not now_px or not old_px:
+        return None
+    raw_move = (now_px - old_px) / old_px * 100.0          # + = hoch, - = runter
+    adverse = (-raw_move) if side == 'long' else raw_move  # >0 = laeuft gegen Position
+    if adverse < move_thr:
+        return None
+
+    cur_row = rows[0]
+    base = rows[1:]  # Baseline ohne aktuellen Bucket
+    signals = []
+
+    # 1) Sell-/Buy-Dominanz (Taker)
+    vol = cur_row['volume']; tbb = cur_row['taker_buy_base']
+    if vol and tbb is not None and vol > 0:
+        buy_ratio = tbb / vol
+        if side == 'long' and buy_ratio < taker_ratio_thr:
+            signals.append('sell_dominanz')
+        elif side == 'short' and buy_ratio > (1.0 - taker_ratio_thr):
+            signals.append('buy_dominanz')
+
+    # 2) Volumen-Spike
+    vmed = _median([r['volume'] for r in base])
+    if vol is not None and vmed and vmed > 0 and vol > vol_mult * vmed:
+        signals.append('volumen_spike')
+
+    # 3) Book-Imbalance kippt gegen Position
+    imb = cur_row['book_imbalance_5']
+    if imb is not None:
+        if side == 'long' and imb < -imb_thr:
+            signals.append('imbalance_kipp')
+        elif side == 'short' and imb > imb_thr:
+            signals.append('imbalance_kipp')
+
+    # 4) Sweeps (vor Hebel, aus Orderflow-Features)
+    if of_feat:
+        sweep_key = 'of_sweep_bid_per_min_5m' if side == 'long' else 'of_sweep_ask_per_min_5m'
+        sw = of_feat.get(sweep_key)
+        if sw is not None and sw >= sweep_thr:
+            signals.append('sweep')
+
+    # 5) Spread-Spike
+    sp = cur_row['spread_bps']; spmed = _median([r['spread_bps'] for r in base])
+    if sp is not None and spmed and spmed > 0 and sp > spread_mult * spmed:
+        signals.append('spread_spike')
+
+    if len(signals) >= min_signals:
+        return {"move_pct": raw_move, "adverse_pct": adverse,
+                "n_signals": len(signals), "signals": signals}
+    return None
+
+
 def _evaluate_coin_reeval(coins, app, sym, cfg, mh_model, mh_model_lock, btc_moves, uni_ctx):
     """Berechnet für EINEN Coin die aktuellen Features + Predictor-Bewertung.
     Identische compute_*-Pipeline wie scan_pass_mh (geteilte Feature-Module).
@@ -3461,92 +3564,209 @@ def _evaluate_coin_reeval(coins, app, sym, cfg, mh_model, mh_model_lock, btc_mov
     return {"side": side, "confidence": float(confidence), "tp_pct": tp_pct, "sl_pct": sl_pct}
 
 
+def _build_observer_uni_ctx(coins, app, cfg, symbols):
+    """Universe-Kontext fuer die Re-Eval (Sektor/Funding/Stalker) — 1x pro Tick."""
+    sector_priority = cfg.get("sector_priority", [])
+    sector_map = build_coin_sector_map(app, symbols, sector_priority)
+    sector_stats, coin_pcts = compute_sector_close_pcts(coins, sector_map)
+    uni_ctx = {
+        "sector_map": sector_map, "sector_stats": sector_stats, "coin_pcts": coin_pcts,
+        "funding_median": compute_universe_funding_median(coins, symbols),
+        "whale_enabled": bool(cfg.get("whale_tracker", {}).get("enabled", False)),
+        "stalker_ref_cache": None, "stalker_btc_regime": None, "stalker_eff_min_samples": None,
+    }
+    stalker_cfg = cfg.get("stalker", {}) or {}
+    if stalker_cfg.get("enabled"):
+        try:
+            uni_ctx["stalker_ref_cache"] = stalker_build_ref_cache(coins, stalker_cfg["cross_coin"])
+            uni_ctx["stalker_btc_regime"] = stalker_classify_btc_regime(coins, stalker_cfg["btc_regime"])
+            uni_ctx["stalker_eff_min_samples"] = stalker_effective_min_samples(stalker_cfg, stalker_data_days(coins))
+        except Exception as e:
+            log.warning("observer stalker-ctx failed: %s", e)
+    return uni_ctx
+
+
+def _observer_hl_creds():
+    if '/opt/coin/backend' not in sys.path:
+        sys.path.insert(0, '/opt/coin/backend')
+    from rl_agent.trader import get_hl_credentials
+    return get_hl_credentials()
+
+
+def _observer_apply_targets(app, pid, side, new_tp_px, new_sl_px, only_sl):
+    """Variante B: korrigierte TP/SL in ALLE Welten der prediction_id.
+    only_sl=True → nur SL anpassen (Reissleine), TP unveraendert.
+      1) open_predictions (Predictor-Welt, lernt)
+      2) paper_positions (Pseudo-Wallet)
+      3) trader_positions (Echtgeld) + HL-Order cancel/replace (getestete Trader-Funktionen)"""
+    # 1) open_predictions
+    with app.cursor() as cu:
+        if only_sl:
+            cu.execute("UPDATE open_predictions SET sl_px=%s WHERE id=%s AND status='open'", (new_sl_px, pid))
+        else:
+            cu.execute("UPDATE open_predictions SET tp_px=%s, sl_px=%s WHERE id=%s AND status='open'", (new_tp_px, new_sl_px, pid))
+    app.commit()
+    # 2) paper_positions
+    with app.cursor() as cu:
+        if only_sl:
+            cu.execute("UPDATE paper_positions SET sl_px=%s WHERE prediction_id=%s AND status='open'", (new_sl_px, pid))
+        else:
+            cu.execute("UPDATE paper_positions SET tp_px=%s, sl_px=%s WHERE prediction_id=%s AND status='open'", (new_tp_px, new_sl_px, pid))
+    app.commit()
+    # 3) trader_positions (Echtgeld) — nur falls echte Position existiert
+    with app.cursor(cursor_factory=RealDictCursor) as cu:
+        cu.execute("SELECT id, symbol, side, qty, current_tp_px FROM trader_positions WHERE prediction_id=%s AND status='open'", (pid,))
+        tps = cu.fetchall()
+    for tp in tps:
+        eff_tp = new_tp_px if (not only_sl and new_tp_px is not None) else float(tp['current_tp_px'])
+        with app.cursor() as cu:
+            cu.execute("UPDATE trader_positions SET current_tp_px=%s, current_sl_px=%s WHERE id=%s AND status='open'",
+                       (eff_tp, new_sl_px, tp['id']))
+        app.commit()
+        try:
+            from rl_agent.trader import cancel_all_orders_for_coin_hl, place_tp_sl_hl
+            creds = _observer_hl_creds()
+            cancel_all_orders_for_coin_hl(creds, tp['symbol'])
+            place_tp_sl_hl(creds, tp['symbol'], tp['side'] == 'long', float(tp['qty']), eff_tp, new_sl_px)
+            log.info("OBSERVER-HL %s trader_pid=%s TP/SL neu gesetzt (tp=%.6g sl=%.6g)",
+                     tp['symbol'], tp['id'], eff_tp, new_sl_px)
+        except Exception as e:
+            log.warning("OBSERVER-HL %s trader_pid=%s modify failed: %s", tp['symbol'], tp['id'], e)
+
+
+def _observer_exit(app, pid, sym, side, mark_px):
+    """Notausstieg (kein Flip): Position in allen Welten schliessen.
+      - open_predictions + paper_positions: SL an aktuellen Preis → Watcher schliesst
+        als Loss (Predictor lernt aus dem Notausstieg ueber finalen Close).
+      - trader_positions: sofort safe_close (Echtgeld, getestete Funktion)."""
+    with app.cursor() as cu:
+        cu.execute("UPDATE open_predictions SET sl_px=%s WHERE id=%s AND status='open'", (mark_px, pid))
+    app.commit()
+    with app.cursor() as cu:
+        cu.execute("UPDATE paper_positions SET sl_px=%s WHERE prediction_id=%s AND status='open'", (mark_px, pid))
+    app.commit()
+    with app.cursor(cursor_factory=RealDictCursor) as cu:
+        cu.execute("SELECT id, symbol, side, entry_px FROM trader_positions WHERE prediction_id=%s AND status='open'", (pid,))
+        tps = cu.fetchall()
+    for tp in tps:
+        try:
+            creds = _observer_hl_creds()
+            sc = safe_close_position_hl(creds, tp['symbol'], creds['wallet_address'])
+            if sc.get('success'):
+                entry = float(tp['entry_px']); exit_px = float(sc.get('avg_price') or mark_px)
+                pnl = ((exit_px-entry)/entry*100) if tp['side']=='long' else ((entry-exit_px)/entry*100)
+                with app.cursor() as cu2:
+                    cu2.execute("UPDATE trader_positions SET status='closed', closed_at=now(), exit_px=%s, pnl_pct=%s WHERE id=%s AND status='open'",
+                                (exit_px, pnl, tp['id']))
+                app.commit()
+                log.info("OBSERVER-EXIT(live) %s trader_pid=%s pnl=%.3f%%", tp['symbol'], tp['id'], pnl)
+            else:
+                log.warning("OBSERVER-EXIT(live) %s safe_close failed: %s", tp['symbol'], sc.get('error'))
+        except Exception as e:
+            log.warning("OBSERVER-EXIT(live) %s exception: %s", tp['symbol'], e)
+
+
 def observer_reeval(s, mh_model, mh_model_lock):
-    """Bei Marktshift: offene Paper-Positionen am Predictor neu bewerten.
-    Wenn der Predictor die Richtung der Position noch bestätigt → TP/SL an die
-    aktuellen Magnituden anpassen (Endlosrutsche kappen). Wenn der Predictor
-    die GEGEN-Richtung sieht → SL enger ziehen (auf aktuelle Magnitude).
-    v1: nur paper_positions (Live ist Paper). Lernen über finalen Close."""
+    """Observer v2 (21.05.): triggert Predictor-Re-Eval offener Predictions
+    (open_predictions, NICHT mehr wallet-gebunden) bei
+      (a) globalem BTC-Shift (detect_market_shift) ODER
+      (b) Coin-Vorboten (detect_coin_drop — Sell/Volumen/Imbalance/Sweep/Spread, vor Hebel).
+    Re-Eval läuft am Predictor mit AKTUELLEN Features. Ergebnis wird via Variante B in
+    alle Welten propagiert (open_predictions + paper_positions + trader_positions+HL):
+      - Richtung haelt           → TP/SL an aktuelle Magnitude (Endlosrutsche kappen)
+      - leicht dagegen           → SL eng (Reissleine)
+      - klar Gegenrichtung (>=exit_confidence) → Notausstieg (KEIN Flip; Gegen-Trade
+        kommt ggf. ueber den normalen Scan als frische Prediction)
+    Anti-Loop: observer_last_adj_at + reeval_cooldown_minutes (eine Position wird pro
+    Ruhephase nur 1x angefasst). Lernen ueber finalen Close."""
     cfg = s["predictor"]
     obs_cfg = cfg.get("observer", {})
     if not obs_cfg.get("enabled"):
         return 0
-    paper_mode = bool(cfg.get("trading", {}).get("paper_mode"))
-    if not paper_mode:
-        return 0  # v1: nur Paper-Welt
     min_age = float(obs_cfg.get("reeval_min_age_minutes", 3))
+    cooldown_min = float(obs_cfg.get("reeval_cooldown_minutes", 10))
+    exit_conf = float(obs_cfg.get("exit_confidence", 0.6))
+    drop_cfg = obs_cfg.get("coin_drop", {})
 
     with db_coins(s) as coins, db_app(s) as app:
-        shift = detect_market_shift(coins, obs_cfg)
-        if not shift:
-            return 0
         with app.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT id, symbol, side, entry_px, tp_px, sl_px,
-                                  EXTRACT(EPOCH FROM (now()-opened_at))/60.0 AS age_min
-                           FROM paper_positions WHERE status='open'
-                             AND EXTRACT(EPOCH FROM (now()-opened_at))/60.0 >= %s""", (min_age,))
+            cur.execute("""
+                SELECT id, symbol, side, entry_px, tp_px, sl_px,
+                       EXTRACT(EPOCH FROM (now()-created_at))/60.0 AS age_min,
+                       EXTRACT(EPOCH FROM (now()-observer_last_adj_at))/60.0 AS since_adj_min
+                FROM open_predictions
+                WHERE status='open'
+                  AND EXTRACT(EPOCH FROM (now()-created_at))/60.0 >= %s
+            """, (min_age,))
             opens = cur.fetchall()
         if not opens:
             return 0
 
-        # Universe-Kontext 1× bauen
-        symbols = list({o['symbol'] for o in opens})
-        sector_priority = cfg.get("sector_priority", [])
-        sector_map = build_coin_sector_map(app, symbols, sector_priority)
-        sector_stats, coin_pcts = compute_sector_close_pcts(coins, sector_map)
-        uni_ctx = {
-            "sector_map": sector_map, "sector_stats": sector_stats, "coin_pcts": coin_pcts,
-            "funding_median": compute_universe_funding_median(coins, symbols),
-            "whale_enabled": bool(cfg.get("whale_tracker", {}).get("enabled", False)),
-            "stalker_ref_cache": None, "stalker_btc_regime": None, "stalker_eff_min_samples": None,
-        }
-        stalker_cfg = cfg.get("stalker", {}) or {}
-        if stalker_cfg.get("enabled"):
-            try:
-                uni_ctx["stalker_ref_cache"] = stalker_build_ref_cache(coins, stalker_cfg["cross_coin"])
-                uni_ctx["stalker_btc_regime"] = stalker_classify_btc_regime(coins, stalker_cfg["btc_regime"])
-                uni_ctx["stalker_eff_min_samples"] = stalker_effective_min_samples(stalker_cfg, stalker_data_days(coins))
-            except Exception as e:
-                log.warning("observer stalker-ctx failed: %s", e)
-        btc_moves = load_btc_moves(coins)
-
+        shift = detect_market_shift(coins, obs_cfg)   # globaler Trigger (1x)
+        uni_ctx = None
+        btc_moves = None
         n_adj = 0
+
         for o in opens:
+            # Anti-Loop: schon angefasst und noch in Ruhe → skip
+            if o['since_adj_min'] is not None and o['since_adj_min'] < cooldown_min:
+                continue
+            sym = o['symbol']; side = o['side']
             try:
-                ev = _evaluate_coin_reeval(coins, app, o['symbol'], cfg, mh_model, mh_model_lock, btc_moves, uni_ctx)
+                # Trigger: globaler Shift ODER Coin-Vorboten (vor Hebel)
+                trigger = None
+                if shift:
+                    trigger = f"btc_shift {shift['move_pct']:+.2f}%"
+                else:
+                    of_feat = compute_orderflow_features(coins, sym)
+                    drop = detect_coin_drop(coins, sym, side, drop_cfg, of_feat)
+                    if drop:
+                        trigger = f"coin_drop {drop['adverse_pct']:.2f}% [{','.join(drop['signals'])}]"
+                if trigger is None:
+                    continue
+
+                if uni_ctx is None:   # lazy: nur bauen wenn mind. 1 Trigger feuert
+                    btc_moves = load_btc_moves(coins)
+                    uni_ctx = _build_observer_uni_ctx(coins, app, cfg, [r['symbol'] for r in opens])
+
+                ev = _evaluate_coin_reeval(coins, app, sym, cfg, mh_model, mh_model_lock, btc_moves, uni_ctx)
                 if ev is None:
                     continue
-                entry = float(o['entry_px']); side = o['side']
-                # Neue TP/SL gegen ENTRY der bestehenden Position (Position bleibt offen)
-                if side == 'long':
-                    new_tp = entry * (1 + ev['tp_pct']/100.0)
-                    new_sl = entry * (1 - ev['sl_pct']/100.0)
-                else:
-                    new_tp = entry * (1 - ev['tp_pct']/100.0)
-                    new_sl = entry * (1 + ev['sl_pct']/100.0)
-                # Nur anpassen wenn der Predictor die Richtung der Position noch hält.
-                # Sieht er die Gegenrichtung → SL eng an aktuellen Preis (Reißleine).
+
+                entry = float(o['entry_px'])
+                with coins.cursor() as curp:
+                    curp.execute("SELECT close FROM agg_1m WHERE symbol=%s ORDER BY bucket DESC LIMIT 1", (sym,))
+                    rp = curp.fetchone()
+                mark_px = float(rp[0]) if rp and rp[0] else entry
+
                 same_dir = (ev['side'] == side)
-                if not same_dir:
-                    # Gegenrichtung erkannt → SL auf aktuelle Magnitude (enger), TP lassen
-                    with app.cursor() as cu:
-                        cu.execute("UPDATE paper_positions SET sl_px=%s WHERE id=%s AND status='open'", (new_sl, o['id']))
-                    app.commit()
-                    log.info("OBSERVER %s ppid=%s GEGENRICHTUNG (%s→%s) SL→%.6g (shift %.2f%%)",
-                             o['symbol'], o['id'], side, ev['side'], new_sl, shift['move_pct'])
-                    n_adj += 1
+                if (not same_dir) and ev['confidence'] >= exit_conf:
+                    _observer_exit(app, o['id'], sym, side, mark_px)
+                    log.info("OBSERVER NOTAUSSTIEG %s pid=%s %s→%s P=%.3f (%s)",
+                             sym, o['id'], side, ev['side'], ev['confidence'], trigger)
+                elif not same_dir:
+                    new_sl = entry * (1 - ev['sl_pct']/100.0) if side=='long' else entry * (1 + ev['sl_pct']/100.0)
+                    _observer_apply_targets(app, o['id'], side, None, new_sl, only_sl=True)
+                    log.info("OBSERVER REISSLEINE %s pid=%s SL→%.6g P=%.3f (%s)",
+                             sym, o['id'], new_sl, ev['confidence'], trigger)
                 else:
-                    with app.cursor() as cu:
-                        cu.execute("UPDATE paper_positions SET tp_px=%s, sl_px=%s WHERE id=%s AND status='open'", (new_tp, new_sl, o['id']))
-                    app.commit()
-                    log.info("OBSERVER %s ppid=%s bestätigt %s TP→%.6g SL→%.6g (shift %.2f%%)",
-                             o['symbol'], o['id'], side, new_tp, new_sl, shift['move_pct'])
-                    n_adj += 1
+                    new_tp = entry * (1 + ev['tp_pct']/100.0) if side=='long' else entry * (1 - ev['tp_pct']/100.0)
+                    new_sl = entry * (1 - ev['sl_pct']/100.0) if side=='long' else entry * (1 + ev['sl_pct']/100.0)
+                    _observer_apply_targets(app, o['id'], side, new_tp, new_sl, only_sl=False)
+                    log.info("OBSERVER BESTAETIGT %s pid=%s TP→%.6g SL→%.6g P=%.3f (%s)",
+                             sym, o['id'], new_tp, new_sl, ev['confidence'], trigger)
+
+                with app.cursor() as cu:
+                    cu.execute("UPDATE open_predictions SET observer_adj_count=observer_adj_count+1, observer_last_adj_at=now() WHERE id=%s", (o['id'],))
+                app.commit()
+                n_adj += 1
             except Exception as e:
-                log.warning("observer reeval %s failed: %s", o['symbol'], e)
+                log.warning("observer reeval %s failed: %s", sym, e)
+                try: app.rollback()
+                except Exception: pass
         if n_adj > 0:
-            log.info("OBSERVER market-shift %.2f%% (%s): %d Paper-Positionen neu bewertet",
-                     shift['move_pct'], shift['direction'], n_adj)
+            log.info("OBSERVER: %d Predictions re-evaluiert (shift=%s)",
+                     n_adj, f"{shift['move_pct']:+.2f}%" if shift else "kein")
         return n_adj
 
 
@@ -3642,16 +3862,16 @@ def main():
                         log.exception("hl-sync (in watch-thread) failed: %s", e)
                     last_hl_sync_local = now_inner
 
-                # Paper-Watcher: virtuelle paper_positions auf TP/SL/Timeout prüfen
-                # (nur wenn paper_mode aktiv — sonst no-op). Sekündlich wie watch_pass.
-                if bool(s_local.get("predictor", {}).get("trading", {}).get("paper_mode")):
-                    try:
-                        with db_coins(s_local) as _pc, db_app(s_local) as _pa:
-                            n_pc = paper_watch(_pa, _pc, s_local["predictor"], get_timeout_hours(s_local))
-                        if n_pc > 0:
-                            log.info("paper-watch: %d Paper-Positionen geschlossen", n_pc)
-                    except Exception as e:
-                        log.exception("paper-watch failed: %s", e)
+                # Paper-Watcher: virtuelle paper_positions auf TP/SL/Timeout prüfen.
+                # Laeuft IMMER (Paper ist durchgaengig an, unabhaengig vom Echtgeld-
+                # Schalter). Sekündlich wie watch_pass.
+                try:
+                    with db_coins(s_local) as _pc, db_app(s_local) as _pa:
+                        n_pc = paper_watch(_pa, _pc, s_local["predictor"], get_timeout_hours(s_local))
+                    if n_pc > 0:
+                        log.info("paper-watch: %d Paper-Positionen geschlossen", n_pc)
+                except Exception as e:
+                    log.exception("paper-watch failed: %s", e)
 
                 # Observer: bei Marktshift offene Positionen neu bewerten + TP/SL anpassen.
                 # Eigener Tick (check_interval_seconds), nutzt mh_model_lock via _evaluate_coin_reeval.

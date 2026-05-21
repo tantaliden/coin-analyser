@@ -297,13 +297,15 @@ def control_service(action: str):
 
 @router.get("/paper/wallet")
 def paper_wallet():
-    """Paper-Trading-Wallet-Stand (virtuelle Engine, Variante B)."""
+    """Paper-Trading-Wallet-Stand (virtuelle Engine, Variante B).
+    equity = realisierte balance + unrealisierter PnL aller offenen Positionen
+    (= tatsaechlicher Stand, analog HL-equity)."""
     with _db_app() as app:
         with app.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT balance, peak_balance, start_balance, n_trades, updated_at FROM paper_wallet_state WHERE id=1")
             w = cur.fetchone() or {}
-            cur.execute("SELECT COUNT(*) AS n FROM paper_positions WHERE status='open'")
-            n_open = cur.fetchone()['n']
+            cur.execute("SELECT id, symbol, side, entry_px, margin_usd, leverage FROM paper_positions WHERE status='open'")
+            opens = cur.fetchall()
             cur.execute("""
                 SELECT COUNT(*) FILTER (WHERE status='win') AS wins,
                        COUNT(*) FILTER (WHERE status='loss') AS losses,
@@ -312,19 +314,45 @@ def paper_wallet():
                 FROM paper_positions WHERE status IN ('win','loss','timeout')
             """)
             st = cur.fetchone()
+    n_open = len(opens)
+    # Unrealisierter PnL der offenen Positionen (in Dollar, vor Slippage)
+    unrealized = 0.0
+    if opens:
+        symbols = list({o['symbol'] for o in opens})
+        prices = {}
+        try:
+            with _db_coins() as coins:
+                with coins.cursor(cursor_factory=RealDictCursor) as cur_c:
+                    cur_c.execute("""SELECT DISTINCT ON (symbol) symbol, mid_px, close
+                                     FROM klines WHERE symbol = ANY(%s) AND interval='10s'
+                                     ORDER BY symbol, open_time DESC""", (symbols,))
+                    prices = {r['symbol']: (r['mid_px'] or r['close']) for r in cur_c.fetchall()}
+        except Exception:
+            prices = {}
+        for o in opens:
+            cur_px = prices.get(o['symbol']); entry = float(o['entry_px'])
+            if cur_px and entry:
+                cur_px = float(cur_px)
+                move = (cur_px - entry)/entry if o['side'] == 'long' else (entry - cur_px)/entry
+                notional = float(o['margin_usd']) * int(o['leverage'])
+                unrealized += move * notional
     bal = float(w.get('balance') or 0); start = float(w.get('start_balance') or 1)
     peak = float(w.get('peak_balance') or bal)
+    equity = bal + unrealized
     return {
         "balance": round(bal, 2),
+        "equity": round(equity, 2),
+        "unrealized_usd": round(unrealized, 2),
         "start_balance": round(start, 2),
         "peak_balance": round(peak, 2),
-        "total_return_pct": round((bal - start) / start * 100, 2) if start else 0,
+        "total_return_pct": round((equity - start) / start * 100, 2) if start else 0,
         "drawdown_pct": round((bal - peak) / peak * 100, 2) if peak else 0,
         "n_trades": w.get('n_trades') or 0,
         "open_positions": n_open,
         "wins": st['wins'], "losses": st['losses'], "timeouts": st['timeouts'],
         "realized_usd": round(float(st['realized_usd']), 2),
         "paper_mode": _load_settings().get("predictor", {}).get("trading", {}).get("paper_mode", False),
+        "auto_trade": _load_settings().get("predictor", {}).get("trading", {}).get("auto_trade", False),
     }
 
 
