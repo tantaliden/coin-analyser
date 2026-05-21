@@ -360,7 +360,6 @@ function SettingsModal({ onClose, onSaved }) {
   const learner = cfg.online_learner || {}
   const bandit = cfg.bandit || {}
   const mh = cfg.multi_head || {}
-  const modify = cfg.modify_bandit || {}
   const whale = cfg.whale_tracker || {}
   const stalker = cfg.stalker || {}
   const stalkerRegime = stalker.btc_regime || {}
@@ -565,45 +564,6 @@ function SettingsModal({ onClose, onSaved }) {
           </Field>
         </Section>
 
-        <Section title="Trader (passt TP/SL laufender Trades alle 30s an)">
-          <Field label="Aktiv (nur wenn Auto-Trade an)">
-            <input type="checkbox" checked={!!modify.enabled}
-              onChange={e => set('modify_bandit.enabled', e.target.checked)} />
-          </Field>
-          <Field label="Tick-Intervall (s)">
-            <NumInput value={num('modify_bandit.interval_seconds', 30)} step="5" min="5" max="300"
-              onChange={v => set('modify_bandit.interval_seconds', parseInt(v))} />
-          </Field>
-          <Field label="Min. Trade-Alter bevor Modify (s)">
-            <NumInput value={num('modify_bandit.min_open_age_seconds', 60)} step="10" min="0" max="600"
-              onChange={v => set('modify_bandit.min_open_age_seconds', parseInt(v))} />
-          </Field>
-          <Field label="TP-Delta-Buckets (% in 0.1-Schritten — Komma-Liste, ± erlaubt)">
-            <input type="text"
-              defaultValue={formatList(modify.tp_delta_buckets)}
-              onBlur={e => set('modify_bandit.tp_delta_buckets', parseListSigned(e.target.value))}
-              className="w-full bg-gray-800 px-2 py-1.5 rounded border border-gray-600 text-xs"/>
-          </Field>
-          <Field label="SL-Delta-Buckets (% in 0.1-Schritten — Komma-Liste, ± erlaubt)">
-            <input type="text"
-              defaultValue={formatList(modify.sl_delta_buckets)}
-              onBlur={e => set('modify_bandit.sl_delta_buckets', parseListSigned(e.target.value))}
-              className="w-full bg-gray-800 px-2 py-1.5 rounded border border-gray-600 text-xs"/>
-          </Field>
-          <Field label="Exploration Start">
-            <NumInput value={num('modify_bandit.exploration_init', 1.0)} step="0.05" min="0" max="1"
-              onChange={v => set('modify_bandit.exploration_init', parseFloat(v))} />
-          </Field>
-          <Field label="Exploration Decay / Decision">
-            <NumInput value={num('modify_bandit.exploration_decay_per_decision', 0.0001)} step="0.00005" min="0" max="0.01"
-              onChange={v => set('modify_bandit.exploration_decay_per_decision', parseFloat(v))} />
-          </Field>
-          <Field label="Exploration Floor">
-            <NumInput value={num('modify_bandit.exploration_floor', 0.05)} step="0.01" min="0" max="0.5"
-              onChange={v => set('modify_bandit.exploration_floor', parseFloat(v))} />
-          </Field>
-        </Section>
-
         <Section title="Lifecycle">
           <Field label="Aus Liste verstecken nach (h)">
             <NumInput value={num('hide_after_hours', 1)} step="0.5" min="0.1" max="48" onChange={v => set('hide_after_hours', parseFloat(v))} />
@@ -623,22 +583,12 @@ function SettingsModal({ onClose, onSaved }) {
           <Field label="Trade-Size ($)">
             <NumInput value={trading.default_size_usd ?? 20} step="5" min="10" max="10000" onChange={v => set('trading.default_size_usd', parseFloat(v))} />
           </Field>
-          <Field label="Trail-Stop (%)">
-            <NumInput value={trading.default_trailing_stop_pct ?? 1} step="0.1" min="0.1" max="20" onChange={v => set('trading.default_trailing_stop_pct', parseFloat(v))} />
-          </Field>
-          <Field label="Trail standardmäßig an">
-            <input type="checkbox" checked={!!trading.default_use_trailing}
-              onChange={e => set('trading.default_use_trailing', e.target.checked)} />
-          </Field>
         </Section>
 
         <Section title="Lerner / Kalibrierung">
           <Field label="Online-Lerner aktiv">
             <input type="checkbox" checked={!!learner.enabled}
               onChange={e => set('online_learner.enabled', e.target.checked)} />
-          </Field>
-          <Field label="Min-Closes bevor Modell genutzt">
-            <NumInput value={learner.min_closed_to_use ?? 50} step="10" min="0" max="10000" onChange={v => set('online_learner.min_closed_to_use', parseInt(v))} />
           </Field>
           <Field label="Selbstkalibrierung aktiv">
             <input type="checkbox" checked={!!cal.enabled}
