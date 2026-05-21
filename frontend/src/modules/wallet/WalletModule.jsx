@@ -14,6 +14,8 @@ export default function WalletModule() {
   const [timeoutHours, setTimeoutHours] = useState(2)
   const [orders, setOrders] = useState([])
   const [hlOrders, setHlOrders] = useState([])
+  const [paperWallet, setPaperWallet] = useState(null)
+  const [paperPositions, setPaperPositions] = useState([])
   const [history, setHistory] = useState([])
   const [realizedPnl, setRealizedPnl] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -87,6 +89,15 @@ export default function WalletModule() {
       setHlPositions(hlPosRes?.data?.positions || [])
       setTimeoutHours(hlPosRes?.data?.timeout_hours ?? 2)
       setHlOrders(hlOrdRes?.data?.orders || [])
+      // Paper-Wallet (virtuelle Engine) — immer laden, leicht
+      try {
+        const [pw, pp] = await Promise.all([
+          api.get('/api/v1/predictor/paper/wallet'),
+          api.get('/api/v1/predictor/paper/positions?scope=open'),
+        ])
+        setPaperWallet(pw.data || null)
+        setPaperPositions(pp.data?.positions || [])
+      } catch { /* paper optional */ }
     } catch (err) { setError('Fehler beim Laden') }
     finally { setLoading(false) }
   }, [])
@@ -288,7 +299,7 @@ export default function WalletModule() {
   return (
     <div className="h-full flex flex-col overflow-hidden text-xs">
       {/* Balance Bar */}
-      {(balance || hlBalance) && (
+      {(balance || hlBalance || paperWallet) && (
         <div className="flex items-center gap-3 px-2 py-1.5 border-b border-zinc-700/50 bg-zinc-800/30 flex-shrink-0 flex-wrap">
           {balance && (
             <>
@@ -319,6 +330,16 @@ export default function WalletModule() {
               {hlUPnl !== 0 && <div className={hlUPnl >= 0 ? 'text-green-400' : 'text-red-400'}>{fPnl(hlUPnl)}</div>}
             </>
           )}
+          {paperWallet && (
+            <>
+              <span className="text-zinc-600">|</span>
+              <div><span className="text-indigo-400 font-semibold">PAPER{paperWallet.paper_mode ? '' : '*'}</span> <span className="font-mono">${fp(paperWallet.balance)}</span></div>
+              <div className={paperWallet.total_return_pct >= 0 ? 'text-green-400' : 'text-red-400'}>
+                {paperWallet.total_return_pct >= 0 ? '+' : ''}{paperWallet.total_return_pct}%
+              </div>
+              <div className="text-zinc-500 text-[10px]">W/L/TO {paperWallet.wins}/{paperWallet.losses}/{paperWallet.timeouts}</div>
+            </>
+          )}
           {balance && hlBalance && <span className="text-zinc-600">|</span>}
           <div><span className="text-zinc-500">Gesamt</span> <span className="font-mono font-semibold">${fp(grandTotal)}</span></div>
           <div className={(realizedPnl?.realized_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}><span className="text-zinc-500">7d</span> {fPnl(realizedPnl?.realized_pnl)}</div>
@@ -332,7 +353,7 @@ export default function WalletModule() {
       {/* Tabs */}
       <div className="flex items-center gap-1 px-2 py-1 border-b border-zinc-700/50 flex-shrink-0">
         {[
-          { id: 'positions', label: `Pos (${posSource === 'binance' ? (hideWithOrders ? positions.filter(p => !getOrderForPosition(p.symbol)).length : positions.length) : hlPositions.length})` },
+          { id: 'positions', label: `Pos (${posSource === 'binance' ? (hideWithOrders ? positions.filter(p => !getOrderForPosition(p.symbol)).length : positions.length) : posSource === 'paper' ? paperPositions.length : hlPositions.length})` },
           { id: 'orders', label: `Orders (${ordSource === 'binance' ? orders.length : hlOrders.length})` },
           { id: 'history', label: 'Hist' }
         ].map(t => (
@@ -345,6 +366,10 @@ export default function WalletModule() {
               className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${(activeTab === 'positions' ? posSource : ordSource) === 'binance' ? 'bg-yellow-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>BIN</button>
             <button onClick={() => activeTab === 'positions' ? setPosSource('hyperliquid') : setOrdSource('hyperliquid')}
               className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${(activeTab === 'positions' ? posSource : ordSource) === 'hyperliquid' ? 'bg-emerald-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>HL</button>
+            {activeTab === 'positions' && (
+              <button onClick={() => setPosSource('paper')}
+                className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${posSource === 'paper' ? 'bg-indigo-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>PAPER</button>
+            )}
           </div>
         )}
         {activeTab === 'positions' && posSource === 'binance' && (
@@ -415,6 +440,42 @@ export default function WalletModule() {
           </table>
         )}
 
+        {activeTab === 'positions' && posSource === 'paper' && (
+          <table className="w-full">
+            <thead className="sticky top-0 bg-zinc-900">
+              <tr className="text-zinc-500 text-left">
+                <th className="px-2 py-1 font-normal">Symbol</th>
+                <th className="px-2 py-1 font-normal">Side</th>
+                <th className="px-2 py-1 font-normal text-right">Hebel</th>
+                <th className="px-2 py-1 font-normal text-right">Einstieg</th>
+                <th className="px-2 py-1 font-normal text-right">TP</th>
+                <th className="px-2 py-1 font-normal text-right">SL</th>
+                <th className="px-2 py-1 font-normal text-right">Margin</th>
+                <th className="px-2 py-1 font-normal text-right">Alter</th>
+              </tr>
+            </thead>
+            <tbody>
+              {paperPositions.length === 0 && (
+                <tr><td colSpan={8} className="px-2 py-4 text-center text-zinc-600">Keine offenen Paper-Positionen</td></tr>
+              )}
+              {paperPositions.map((pos, i) => {
+                const ageMin = pos.opened_at ? Math.round((Date.now() - new Date(pos.opened_at).getTime())/60000) : 0
+                return (
+                  <tr key={i} className="border-t border-zinc-800 hover:bg-zinc-800/50">
+                    <td className="px-2 py-1 font-mono font-medium">{pos.symbol}</td>
+                    <td className={`px-2 py-1 font-semibold ${pos.side==='long'?'text-emerald-400':'text-red-400'}`}>{pos.side==='long'?'L':'S'}</td>
+                    <td className="px-2 py-1 text-right font-mono">{pos.leverage}x</td>
+                    <td className="px-2 py-1 text-right font-mono">${fp(pos.entry_px, 6)}</td>
+                    <td className="px-2 py-1 text-right font-mono text-emerald-300">${fp(pos.tp_px, 6)}</td>
+                    <td className="px-2 py-1 text-right font-mono text-red-300">${fp(pos.sl_px, 6)}</td>
+                    <td className="px-2 py-1 text-right font-mono">${fp(pos.margin_usd, 2)}</td>
+                    <td className="px-2 py-1 text-right font-mono text-zinc-400">{ageMin}m</td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        )}
         {activeTab === 'positions' && posSource === 'hyperliquid' && (<>
           <div className="px-2 py-1.5 border-b border-zinc-800 flex items-center gap-2 flex-wrap bg-zinc-800/40">
             <span className="text-zinc-500">TP setzen (% vor Hebel):</span>
