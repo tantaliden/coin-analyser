@@ -3376,6 +3376,181 @@ def process_due_hindsight(s, modify_bandit, modify_scaler, batch_size=64,
 
 
 # =============================================================================
+# Observer (v1, 21.05.2026) — bei Marktshift offene Positionen neu bewerten
+# =============================================================================
+
+def detect_market_shift(coins, obs_cfg):
+    """True wenn Referenz-Coin (BTC) sich in window_minutes mehr als
+    btc_move_threshold_pct bewegt hat. Returnt (move_pct, direction) oder None."""
+    ref = obs_cfg.get("reference_coin")
+    win = obs_cfg.get("window_minutes")
+    thr = obs_cfg.get("btc_move_threshold_pct")
+    if ref is None or win is None or thr is None:
+        log.error("FALLBACK_TRIGGERED detect_market_shift: observer-settings unvollständig")
+        return None
+    with coins.cursor() as cur:
+        cur.execute("SELECT close FROM agg_1m WHERE symbol=%s ORDER BY bucket DESC LIMIT %s", (ref, int(win)+1))
+        rows = [r[0] for r in cur.fetchall() if r[0] is not None]
+    if len(rows) < int(win)+1:
+        return None
+    now_px = rows[0]; old_px = rows[-1]
+    if not old_px:
+        return None
+    move = (now_px - old_px) / old_px * 100.0
+    if abs(move) >= float(thr):
+        return {"move_pct": move, "direction": "up" if move > 0 else "down"}
+    return None
+
+
+def _evaluate_coin_reeval(coins, app, sym, cfg, mh_model, mh_model_lock, btc_moves, uni_ctx):
+    """Berechnet für EINEN Coin die aktuellen Features + Predictor-Bewertung.
+    Identische compute_*-Pipeline wie scan_pass_mh (geteilte Feature-Module).
+    Returnt {side, confidence, tp_pct, sl_pct} oder None."""
+    mh_cfg = cfg.get("multi_head", {})
+    rules = cfg.get("rules", [])
+    lookback = cfg["lookback_minutes"]
+    min_n = int(mh_cfg.get("min_n_for_predict", 30))
+    tp_safety = float(mh_cfg.get("tp_safety_factor", 0.6))
+    sl_safety = float(mh_cfg.get("sl_safety_factor", 1.3))
+    max_tp_pct = float(mh_cfg.get("max_tp_pct"))
+    stalker_cfg = cfg.get("stalker", {}) or {}
+    stalker_on = bool(stalker_cfg.get("enabled")) and uni_ctx.get("stalker_btc_regime") is not None
+
+    rule_flags = {}
+    with coins.cursor(cursor_factory=RealDictCursor) as cur_w:
+        for rule in rules:
+            try: ok = evaluate_rule(cur_w, sym, rule, lookback)["ok"]
+            except Exception: ok = False
+            rule_flags[rule['name']] = 1 if ok else 0
+
+    feat = feature_snapshot_v2(coins, sym, rule_flags=rule_flags, btc_moves=btc_moves)
+    if feat is None: return None
+    of = compute_orderflow_features(coins, sym)
+    if of is None: return None
+    feat.update(of)
+    fb = compute_funding_features(coins, sym, uni_ctx["funding_median"])
+    if fb is None: return None
+    feat.update(fb)
+    sec = compute_sector_features(sym, uni_ctx["sector_map"], uni_ctx["sector_stats"], uni_ctx["coin_pcts"])
+    if sec is None: return None
+    feat.update(sec)
+    if uni_ctx["whale_enabled"]:
+        wh = compute_whale_features(app, sym)
+        if wh: feat.update(wh)
+    if stalker_on:
+        bl = compute_baseline_dev_features(coins, app, sym, stalker_cfg,
+                                           btc_regime=uni_ctx["stalker_btc_regime"],
+                                           effective_min_samples=uni_ctx["stalker_eff_min_samples"])
+        if bl is None: return None
+        feat.update(bl)
+        feat.update(compute_cross_coin_features(coins, sym, stalker_cfg["cross_coin"], uni_ctx["stalker_ref_cache"]))
+        feat.update(compute_identity_features(sym, app, stalker_cfg["coin_identity"]))
+
+    with mh_model_lock:
+        probs = mh_model.predict_proba(feat, min_n_for_predict=min_n)
+        if probs is None:
+            return None
+        side = 'long' if probs['long'] >= probs['short'] else 'short'
+        confidence = max(probs['long'], probs['short'])
+        tp_raw = mh_model.predict_tp(feat, side, min_n_for_predict=min_n)
+        sl_raw = mh_model.predict_sl(feat, side, min_n_for_predict=min_n)
+    if tp_raw is None or sl_raw is None:
+        return None
+    tp_pct = min(tp_raw * tp_safety, max_tp_pct)
+    sl_pct = max(sl_raw * sl_safety, 0.1)
+    return {"side": side, "confidence": float(confidence), "tp_pct": tp_pct, "sl_pct": sl_pct}
+
+
+def observer_reeval(s, mh_model, mh_model_lock):
+    """Bei Marktshift: offene Paper-Positionen am Predictor neu bewerten.
+    Wenn der Predictor die Richtung der Position noch bestätigt → TP/SL an die
+    aktuellen Magnituden anpassen (Endlosrutsche kappen). Wenn der Predictor
+    die GEGEN-Richtung sieht → SL enger ziehen (auf aktuelle Magnitude).
+    v1: nur paper_positions (Live ist Paper). Lernen über finalen Close."""
+    cfg = s["predictor"]
+    obs_cfg = cfg.get("observer", {})
+    if not obs_cfg.get("enabled"):
+        return 0
+    paper_mode = bool(cfg.get("trading", {}).get("paper_mode"))
+    if not paper_mode:
+        return 0  # v1: nur Paper-Welt
+    min_age = float(obs_cfg.get("reeval_min_age_minutes", 3))
+
+    with db_coins(s) as coins, db_app(s) as app:
+        shift = detect_market_shift(coins, obs_cfg)
+        if not shift:
+            return 0
+        with app.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT id, symbol, side, entry_px, tp_px, sl_px,
+                                  EXTRACT(EPOCH FROM (now()-opened_at))/60.0 AS age_min
+                           FROM paper_positions WHERE status='open'
+                             AND EXTRACT(EPOCH FROM (now()-opened_at))/60.0 >= %s""", (min_age,))
+            opens = cur.fetchall()
+        if not opens:
+            return 0
+
+        # Universe-Kontext 1× bauen
+        symbols = list({o['symbol'] for o in opens})
+        sector_priority = cfg.get("sector_priority", [])
+        sector_map = build_coin_sector_map(app, symbols, sector_priority)
+        sector_stats, coin_pcts = compute_sector_close_pcts(coins, sector_map)
+        uni_ctx = {
+            "sector_map": sector_map, "sector_stats": sector_stats, "coin_pcts": coin_pcts,
+            "funding_median": compute_universe_funding_median(coins, symbols),
+            "whale_enabled": bool(cfg.get("whale_tracker", {}).get("enabled", False)),
+            "stalker_ref_cache": None, "stalker_btc_regime": None, "stalker_eff_min_samples": None,
+        }
+        stalker_cfg = cfg.get("stalker", {}) or {}
+        if stalker_cfg.get("enabled"):
+            try:
+                uni_ctx["stalker_ref_cache"] = stalker_build_ref_cache(coins, stalker_cfg["cross_coin"])
+                uni_ctx["stalker_btc_regime"] = stalker_classify_btc_regime(coins, stalker_cfg["btc_regime"])
+                uni_ctx["stalker_eff_min_samples"] = stalker_effective_min_samples(stalker_cfg, stalker_data_days(coins))
+            except Exception as e:
+                log.warning("observer stalker-ctx failed: %s", e)
+        btc_moves = load_btc_moves(coins)
+
+        n_adj = 0
+        for o in opens:
+            try:
+                ev = _evaluate_coin_reeval(coins, app, o['symbol'], cfg, mh_model, mh_model_lock, btc_moves, uni_ctx)
+                if ev is None:
+                    continue
+                entry = float(o['entry_px']); side = o['side']
+                # Neue TP/SL gegen ENTRY der bestehenden Position (Position bleibt offen)
+                if side == 'long':
+                    new_tp = entry * (1 + ev['tp_pct']/100.0)
+                    new_sl = entry * (1 - ev['sl_pct']/100.0)
+                else:
+                    new_tp = entry * (1 - ev['tp_pct']/100.0)
+                    new_sl = entry * (1 + ev['sl_pct']/100.0)
+                # Nur anpassen wenn der Predictor die Richtung der Position noch hält.
+                # Sieht er die Gegenrichtung → SL eng an aktuellen Preis (Reißleine).
+                same_dir = (ev['side'] == side)
+                if not same_dir:
+                    # Gegenrichtung erkannt → SL auf aktuelle Magnitude (enger), TP lassen
+                    with app.cursor() as cu:
+                        cu.execute("UPDATE paper_positions SET sl_px=%s WHERE id=%s AND status='open'", (new_sl, o['id']))
+                    app.commit()
+                    log.info("OBSERVER %s ppid=%s GEGENRICHTUNG (%s→%s) SL→%.6g (shift %.2f%%)",
+                             o['symbol'], o['id'], side, ev['side'], new_sl, shift['move_pct'])
+                    n_adj += 1
+                else:
+                    with app.cursor() as cu:
+                        cu.execute("UPDATE paper_positions SET tp_px=%s, sl_px=%s WHERE id=%s AND status='open'", (new_tp, new_sl, o['id']))
+                    app.commit()
+                    log.info("OBSERVER %s ppid=%s bestätigt %s TP→%.6g SL→%.6g (shift %.2f%%)",
+                             o['symbol'], o['id'], side, new_tp, new_sl, shift['move_pct'])
+                    n_adj += 1
+            except Exception as e:
+                log.warning("observer reeval %s failed: %s", o['symbol'], e)
+        if n_adj > 0:
+            log.info("OBSERVER market-shift %.2f%% (%s): %d Paper-Positionen neu bewertet",
+                     shift['move_pct'], shift['direction'], n_adj)
+        return n_adj
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -3436,6 +3611,7 @@ def main():
         watch_interval = float(cfg["watch_interval_seconds"])
         last_timeout_watch_local = 0.0
         last_hl_sync_local = 0.0
+        last_observer_local = 0.0
         while True:
             try:
                 s_local = load_settings()
@@ -3476,6 +3652,20 @@ def main():
                             log.info("paper-watch: %d Paper-Positionen geschlossen", n_pc)
                     except Exception as e:
                         log.exception("paper-watch failed: %s", e)
+
+                # Observer: bei Marktshift offene Positionen neu bewerten + TP/SL anpassen.
+                # Eigener Tick (check_interval_seconds), nutzt mh_model_lock via _evaluate_coin_reeval.
+                obs_cfg = s_local.get("predictor", {}).get("observer", {})
+                if obs_cfg.get("enabled"):
+                    obs_iv = float(obs_cfg.get("check_interval_seconds", 30))
+                    if now_inner - last_observer_local >= obs_iv:
+                        try:
+                            n_obs_adj = observer_reeval(s_local, mh_model, mh_model_lock)
+                            if n_obs_adj > 0:
+                                log.info("observer: %d Positionen neu bewertet", n_obs_adj)
+                        except Exception as e:
+                            log.exception("observer_reeval failed: %s", e)
+                        last_observer_local = now_inner
                 with mh_model_lock:
                     n_h = process_due_mh_hindsight(s_local, mh_model, state_path)
                 if n_h > 0:
