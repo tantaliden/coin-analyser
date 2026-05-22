@@ -77,73 +77,57 @@ def _wallet_apply(app_conn, pnl_usd):
 
 
 def paper_watch(app_conn, coins_conn, cfg, timeout_h):
-    """Prüft offene paper_positions via Klines auf TP/SL/Timeout, schließt,
-    bucht PnL in paper_wallet_state. Gibt Anzahl Closes zurück."""
+    """Schliesst paper_positions GEKOPPELT an ihre Prediction (Volker 22.05.):
+    sobald die zugehoerige open_predictions geschlossen ist (win/loss/timeout),
+    wird das Paper mit DEMSELBEN Status + Exit-Preis geschlossen. Paper ist ein
+    Schatten der Prediction → exakt synchron, KEIN eigener Klines-Check (vermeidet
+    Versatz + Spike-Luecken). Paper rechnet nur sein $-PnL (Hebel + Slippage) aus
+    dem geteilten Exit. coins_conn/timeout_h bleiben in der Signatur (Aufruf-Kompat),
+    werden aber nicht mehr gebraucht. Gibt Anzahl Closes zurueck."""
     slip_pct = float(cfg.get("paper_wallet", {}).get("slippage_pct_per_trade") or 0.0)
+    reason_map = {'win': 'tp', 'loss': 'sl', 'timeout': 'timeout'}
     with app_conn.cursor() as cur:
         cur.execute("""
-            SELECT id, symbol, side, entry_px, qty, leverage, margin_usd, tp_px, sl_px,
-                   opened_at, timeout_enabled,
-                   EXTRACT(EPOCH FROM (now() - opened_at))/3600.0 AS age_h
-            FROM paper_positions WHERE status='open'
+            SELECT pp.id, pp.symbol, pp.side, pp.entry_px, pp.leverage, pp.margin_usd,
+                   op.status, op.exit_px, pp.tp_px, pp.sl_px
+            FROM paper_positions pp
+            JOIN open_predictions op ON op.id = pp.prediction_id
+            WHERE pp.status='open' AND op.status IN ('win','loss','timeout')
         """)
-        opens = cur.fetchall()
-    if not opens:
+        rows = cur.fetchall()
+    if not rows:
         return 0
 
-    symbols = list({o[1] for o in opens})
-    with coins_conn.cursor() as cur_c:
-        cur_c.execute("""
-            SELECT DISTINCT ON (symbol) symbol, high, low, close
-            FROM klines WHERE symbol = ANY(%s) AND interval='10s'
-            ORDER BY symbol, open_time DESC
-        """, (symbols,))
-        px = {r[0]: (float(r[1]), float(r[2]), float(r[3])) for r in cur_c.fetchall()}
-
     n_closed = 0
-    for (ppid, sym, side, entry, qty, lev, margin, tp, sl, opened, to_en, age_h) in opens:
-        p = px.get(sym)
-        if p is None:
-            continue
-        hi, lo, cl = p
-        entry = float(entry); tp = float(tp); sl = float(sl)
-        is_long = (side == 'long')
-        status = None; exit_px = None; reason = None
-
-        # TP/SL-Hit (intra-bucket via high/low)
-        if is_long:
-            if hi >= tp:
-                status='win'; exit_px=tp; reason='tp'
-            elif lo <= sl:
-                status='loss'; exit_px=sl; reason='sl'
+    for (ppid, sym, side, entry, lev, margin, pred_status, pred_exit, tp, sl) in rows:
+        entry = float(entry)
+        # Exit = realisierter Prediction-Exit; Fallback tp/sl je Status, sonst entry.
+        if pred_exit is not None:
+            exit_px = float(pred_exit)
+        elif pred_status == 'win' and tp is not None:
+            exit_px = float(tp)
+        elif pred_status == 'loss' and sl is not None:
+            exit_px = float(sl)
         else:
-            if lo <= tp:
-                status='win'; exit_px=tp; reason='tp'
-            elif hi >= sl:
-                status='loss'; exit_px=sl; reason='sl'
-        # Timeout
-        if status is None and to_en and age_h >= timeout_h:
-            status='timeout'; exit_px=cl; reason='timeout'
-
-        if status is None:
-            continue
-
+            exit_px = entry
+        is_long = (side == 'long')
         pnl_coin_pct = ((exit_px - entry)/entry if is_long else (entry - exit_px)/entry) * 100.0
         notional = float(margin) * int(lev)
         pnl_usd = pnl_coin_pct/100.0 * notional
         slip_usd = notional * slip_pct/100.0
         net_usd = pnl_usd - slip_usd
         margin_ret_pct = pnl_coin_pct * int(lev)  # return auf margin (nach Hebel)
+        reason = reason_map.get(pred_status, pred_status)
 
         with app_conn.cursor() as cur_u:
             cur_u.execute("""
                 UPDATE paper_positions
                 SET status=%s, closed_at=now(), exit_px=%s, pnl_pct=%s, pnl_usd=%s, close_reason=%s
                 WHERE id=%s AND status='open'
-            """, (status, exit_px, round(margin_ret_pct,4), round(net_usd,4), reason, ppid))
+            """, (pred_status, exit_px, round(margin_ret_pct,4), round(net_usd,4), reason, ppid))
         app_conn.commit()
         bal = _wallet_apply(app_conn, net_usd)
         n_closed += 1
-        log.info("PAPER-CLOSE %s %s ppid=%s %s pnl=%.3f%%margin net=$%.3f -> wallet=$%.2f",
-                 sym, side, ppid, status, margin_ret_pct, net_usd, bal or -1)
+        log.info("PAPER-CLOSE %s %s ppid=%s %s pnl=%.3f%%margin net=$%.3f -> wallet=$%.2f (gekoppelt an pred)",
+                 sym, side, ppid, pred_status, margin_ret_pct, net_usd, bal or -1)
     return n_closed
