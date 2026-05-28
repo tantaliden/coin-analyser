@@ -247,22 +247,26 @@ class MultiHeadPredictor:
         """Selbst-kalibrierter Faktor: gesetztes SL-% = sl_raw (Gewinner-Drawdown) * factor."""
         return float(self.sl_reach_factor.get(side, 1.0))
 
-    def register_sl_reach(self, side, set_sl_pct, trade_adverse_pct, returned,
-                          survive_target, step, min_factor, max_factor, ewma_alpha):
-        """SL-Überlebens-Regelkreis. Lernt NUR aus zurückgekehrten Trades (die das TP
-        erreichten) — nur sie zeigen, wie tief ein Trade fallen darf und trotzdem einen
-        Return macht. hit_sl = das gesetzte SL wäre bei diesem Gewinner ausgelöst worden
-        (hätte ihn fälschlich ausgestoppt). E[Δ]=0 ⇔ E[hit_sl]=1-survive_target → das SL
-        pendelt sich knapp unter die Return-Grenze ein (survive_target der Gewinner
-        überleben), ohne künstlich weit zu sein.
+    def register_sl_reach(self, side, set_sl_pct, max_drawdown_pct, recovered,
+                          target_recover, step, min_factor, max_factor, ewma_alpha):
+        """SL-Recover-Regelkreis (v6.7, Volker 28.05.): das SL wird auf den Drawdown-Punkt
+        justiert, an dem noch target_recover (~80%) der Trades, die SO tief gehen, innerhalb
+        der Trade-Zeit wieder ins + zurückkommen. Lernt aus ALLEN Trades, die das gesetzte
+        SL erreichen (inkl. der Nicht-Rückkehrer) — KEIN Survivorship-Bias mehr.
+
+        hit_recover = der Trade kam, nachdem er das SL-Niveau erreicht hatte, wieder über
+        Entry zurück. E[Δ]=0 ⇔ E[hit_recover]=target_recover:
+          - recover-rate > target → SL zu eng (erwischt zu viele Rückkehrer) → Faktor HOCH (SL tiefer)
+          - recover-rate < target → SL zu tief → Faktor RUNTER (SL flacher)
         """
-        if not returned or set_sl_pct is None or set_sl_pct <= 0 or trade_adverse_pct is None:
+        if set_sl_pct is None or set_sl_pct <= 0 or max_drawdown_pct is None:
             return
-        hit_sl = 1.0 if trade_adverse_pct >= set_sl_pct else 0.0
+        if max_drawdown_pct < set_sl_pct:
+            return  # Trade hat das SL-Niveau gar nicht erreicht → keine Info über die Grenze
+        hit_recover = 1.0 if recovered else 0.0
         a = float(ewma_alpha)
-        self.sl_reach_rate[side] = (1.0 - a) * self.sl_reach_rate.get(side, 0.0) + a * hit_sl
-        target_stop = 1.0 - float(survive_target)
-        f = self.sl_reach_factor.get(side, 1.0) + float(step) * (hit_sl - target_stop)
+        self.sl_reach_rate[side] = (1.0 - a) * self.sl_reach_rate.get(side, 0.0) + a * hit_recover
+        f = self.sl_reach_factor.get(side, 1.0) + float(step) * (hit_recover - float(target_recover))
         self.sl_reach_factor[side] = max(float(min_factor), min(float(max_factor), f))
         self.sl_reach_n[side] = self.sl_reach_n.get(side, 0) + 1
 
@@ -280,7 +284,11 @@ class MultiHeadPredictor:
                     peak_after_gain: float = None,
                     set_sl_pct: float = None,
                     sl_reach: dict = None,
-                    early_cfg: dict = None):
+                    early_cfg: dict = None,
+                    recovered: bool = None,
+                    net_margin_pct: float = None,
+                    profit_weight_scale: float = 1.0,
+                    flat_skip_threshold_pct: float = 0.2):
         """Verarbeitet einen geschlossenen Trade.
 
         features: Feature-Dict zum Zeitpunkt des Open
@@ -301,20 +309,21 @@ class MultiHeadPredictor:
 
         opposite = 'short' if predicted_side == 'long' else 'long'
 
-        # 1) Direction-Klassifikator
-        if status == 'win':
-            self.direction.learn(features, predicted_side, weight=win_weight)
-        elif status == 'loss':
-            self.direction.learn(features, opposite, weight=loss_weight)
+        # 1) Direction-Klassifikator (v7: Netto-Profit-gewichtet, Volker 28.05.).
+        #    Nicht mehr aus TP/SL-Treffer (kostenblind), sondern aus dem realen
+        #    Netto-margin-Return des Trades: net = eff_lev*(coin_move - slippage).
+        #    net>0 -> Richtung war nach Kosten richtig (Gewicht ~ |net|);
+        #    net<0 -> Gegenrichtung; |net| unter Schwelle -> 'skip' (up-and-down
+        #    nicht bestrafen). Kein Cap: |net| ist strukturell durch TP/SL begrenzt.
+        if net_margin_pct is None:
+            raise ValueError("net_margin_pct required for direction learning (v7)")
+        w = abs(net_margin_pct) * profit_weight_scale
+        if abs(net_margin_pct) < flat_skip_threshold_pct:
+            self.direction.learn(features, 'skip', weight=1.0)
+        elif net_margin_pct > 0:
+            self.direction.learn(features, predicted_side, weight=w)
         else:
-            drift_in_predict = peak_pct if predicted_side == 'long' else trough_pct
-            drift_against    = trough_pct if predicted_side == 'long' else peak_pct
-            if max(drift_in_predict, drift_against) < timeout_flat_threshold_pct:
-                self.direction.learn(features, 'skip', weight=1.0)
-            elif drift_against > drift_in_predict:
-                self.direction.learn(features, opposite, weight=timeout_wrong_weight)
-            else:
-                self.direction.learn(features, predicted_side, weight=timeout_correct_weight)
+            self.direction.learn(features, opposite, weight=w)
 
         # Bewegungsgrößen:
         #   peak_pct/trough_pct      = VOLLE Range (Magnitude-Schätzung, Anti-Zirkularität)
@@ -337,16 +346,17 @@ class MultiHeadPredictor:
         # TP: volle Gewinnbewegung, NUR aus richtungsrichtigen Trades (v6).
         # SL: Trade-Zeit-Drawdown, NUR aus ZURÜCKGEKEHRTEN Trades (v6.1, Volker) — nur Gewinner
         #     zeigen, wie tief man fallen darf und trotzdem einen Return macht.
+        # SL-Magnitude (v6.7): lernt den max-Drawdown der VOLLEN Range aus ALLEN Trades
+        # (nicht mehr nur aus Gewinnern → kein Survivorship-Bias). full_adverse = wie tief
+        # ging der Coin typisch gegen die Position über die volle 1h-Range.
         if predicted_side == 'long':
             if direction_correct:
                 self.tp_long.learn(features, full_gain)
-            if returned:
-                self.sl_long.learn(features, trade_adverse)
+            self.sl_long.learn(features, full_adverse)
         else:
             if direction_correct:
                 self.tp_short.learn(features, full_gain)
-            if returned:
-                self.sl_short.learn(features, trade_adverse)
+            self.sl_short.learn(features, full_adverse)
 
         # 3) TP-Erreichbarkeit: Trefferquote über die TRADE-ZEIT (Volker: TP muss VOR Close
         #    erreicht werden, nicht erst in der Nachphase) -> trade_gain statt voller Range.
@@ -359,12 +369,13 @@ class MultiHeadPredictor:
                 ewma_alpha=tp_reach['alpha'],
             )
 
-        # 4) SL-Überlebensgrenze justieren (nur aus zurückgekehrten Trades, Volker)
+        # 4) SL-Recover-Grenze justieren (v6.7): SL ans Drawdown-Level wo ~80% der Trades,
+        #    die so tief gehen, noch ins + zurückkommen. Lernt aus ALLEN SL-erreichenden Trades.
         if sl_reach is not None:
             self.register_sl_reach(
                 side=predicted_side, set_sl_pct=set_sl_pct,
-                trade_adverse_pct=trade_adverse, returned=returned,
-                survive_target=sl_reach['survive'], step=sl_reach['step'],
+                max_drawdown_pct=full_adverse, recovered=recovered,
+                target_recover=sl_reach['recover_target'], step=sl_reach['step'],
                 min_factor=sl_reach['min'], max_factor=sl_reach['max'],
                 ewma_alpha=sl_reach['alpha'],
             )

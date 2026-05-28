@@ -17,6 +17,7 @@ export default function WalletModule() {
   const [paperWallet, setPaperWallet] = useState(null)
   const [paperPositions, setPaperPositions] = useState([])
   const [paperHistory, setPaperHistory] = useState([])
+  const [paperCurve, setPaperCurve] = useState(null)
   const [walletMode, setWalletMode] = useState('live') // 'live' | 'paper'
   const modeInitRef = useRef(false)
   const [history, setHistory] = useState([])
@@ -94,14 +95,16 @@ export default function WalletModule() {
       setHlOrders(hlOrdRes?.data?.orders || [])
       // Paper-Wallet (virtuelle Engine) — immer laden, leicht
       try {
-        const [pw, pp, ph] = await Promise.all([
+        const [pw, pp, ph, pc] = await Promise.all([
           api.get('/api/v1/predictor/paper/wallet'),
           api.get('/api/v1/predictor/paper/positions?scope=open&limit=200'),
           api.get('/api/v1/predictor/paper/positions?scope=closed&limit=200'),
+          api.get('/api/v1/predictor/paper/equity-curve'),
         ])
         setPaperWallet(pw.data || null)
         setPaperPositions(pp.data?.positions || [])
         setPaperHistory(ph.data?.positions || [])
+        setPaperCurve(pc.data || null)
         // Initial-Anzeige an auto_trade gekoppelt — nur EINMAL (danach manuell).
         // Paper laeuft IMMER mit; der Schalter ist reine Anzeige. auto_trade aus →
         // standardmaessig Paper zeigen, auto_trade an → LIVE.
@@ -394,7 +397,8 @@ export default function WalletModule() {
           { id: 'positions', label: `Pos (${posSource === 'binance' ? (hideWithOrders ? positions.filter(p => !getOrderForPosition(p.symbol)).length : positions.length) : posSource === 'paper' ? paperPositions.length : hlPositions.length})` },
           // Paper: 2 Orders je offener Position (TP + SL, reduce-only) wie bei HL.
           { id: 'orders', label: `Orders (${walletMode === 'paper' ? paperPositions.length * 2 : (ordSource === 'binance' ? orders.length : hlOrders.length)})` },
-          { id: 'history', label: 'Hist' }
+          { id: 'history', label: 'Hist' },
+          ...(walletMode === 'paper' ? [{ id: 'verlauf', label: 'Verlauf' }] : [])
         ].map(t => (
           <button key={t.id} onClick={() => setActiveTab(t.id)}
             className={`px-2 py-0.5 rounded ${activeTab === t.id ? 'bg-blue-600 text-white' : 'text-zinc-400 hover:text-white'}`}>{t.label}</button>
@@ -780,6 +784,48 @@ export default function WalletModule() {
               ))}
             </tbody>
           </table>
+        )}
+        {activeTab === 'verlauf' && walletMode === 'paper' && (
+          <div className="p-3">
+            {!paperCurve || !paperCurve.points || paperCurve.points.length < 2 ? (
+              <div className="text-center py-8 text-zinc-500">Noch nicht genug Daten für den Verlauf</div>
+            ) : (() => {
+              const pts = paperCurve.points
+              const start = paperCurve.start_balance
+              const vals = pts.map(p => p.balance)
+              const minV = Math.min(...vals, start)
+              const maxV = Math.max(...vals, start)
+              const range = (maxV - minV) || 1
+              const W = 100, H = 100
+              const xAt = i => (i / (pts.length - 1)) * W
+              const yAt = v => H - ((v - minV) / range) * H
+              const path = pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${xAt(i).toFixed(2)},${yAt(p.balance).toFixed(2)}`).join(' ')
+              const startY = yAt(start)
+              const cur = paperCurve.current
+              const pnl = cur - start
+              const up = cur >= start
+              return (
+                <>
+                  <div className="flex items-baseline gap-3 mb-2">
+                    <span className="text-lg font-mono font-bold">${fp(cur, 2)}</span>
+                    <span className={`font-mono text-sm ${up ? 'text-green-400' : 'text-red-400'}`}>
+                      {pnl >= 0 ? '+' : ''}{fp(pnl, 2)} USD ({pnl >= 0 ? '+' : ''}{fp(pnl / start * 100, 2)}%)
+                    </span>
+                    <span className="text-zinc-500 text-[11px] ml-auto">Peak ${fp(paperCurve.peak, 2)} · {paperCurve.n_closed} Trades</span>
+                  </div>
+                  <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="w-full h-56 bg-zinc-900/50 rounded border border-zinc-800">
+                    <line x1="0" y1={startY} x2={W} y2={startY} stroke="#52525b" strokeWidth="0.3" strokeDasharray="1,1" />
+                    <path d={path} fill="none" stroke={up ? '#22c55e' : '#ef4444'} strokeWidth="0.8" vectorEffect="non-scaling-stroke" />
+                  </svg>
+                  <div className="flex justify-between text-[10px] text-zinc-600 mt-1">
+                    <span>{pts[0].t ? new Date(pts[0].t).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : ''}</span>
+                    <span>Start ${fp(start, 0)}</span>
+                    <span>{pts[pts.length - 1].t ? new Date(pts[pts.length - 1].t).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : 'jetzt'}</span>
+                  </div>
+                </>
+              )
+            })()}
+          </div>
         )}
         {activeTab === 'history' && walletMode !== 'paper' && (
           <table className="w-full">

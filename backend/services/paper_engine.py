@@ -116,7 +116,7 @@ def paper_watch(app_conn, coins_conn, cfg, timeout_h):
         pnl_usd = pnl_coin_pct/100.0 * notional
         slip_usd = notional * slip_pct/100.0
         net_usd = pnl_usd - slip_usd
-        margin_ret_pct = pnl_coin_pct * int(lev)  # return auf margin (nach Hebel)
+        margin_ret_pct = net_usd / float(margin) * 100.0  # netto-return auf margin (nach Slippage, v7)
         reason = reason_map.get(pred_status, pred_status)
 
         with app_conn.cursor() as cur_u:

@@ -394,6 +394,40 @@ def paper_positions(scope: str = "open", limit: int = 100):
     return {"positions": rows, "scope": scope, "count": len(rows)}
 
 
+@router.get("/paper/equity-curve")
+def paper_equity_curve(points: int = 300):
+    """Verlauf des Paper-Wallet-Gesamtstands: kumulierter realisierter PnL über Zeit
+    (geschlossene paper_positions, chronologisch), + Start-Balance. Auf `points`
+    downgesampelt für die Grafik."""
+    with _db_app() as app:
+        with app.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT start_balance FROM paper_wallet_state WHERE id=1")
+            r = cur.fetchone()
+            start = float(r["start_balance"]) if r and r.get("start_balance") is not None else 1000.0
+            cur.execute("""
+                SELECT closed_at, pnl_usd FROM paper_positions
+                WHERE status IN ('win','loss','timeout') AND closed_at IS NOT NULL
+                ORDER BY closed_at
+            """)
+            rows = cur.fetchall()
+    bal = start
+    peak = start
+    curve = []
+    for r in rows:
+        bal += float(r["pnl_usd"] or 0.0)
+        peak = max(peak, bal)
+        curve.append({"t": r["closed_at"].isoformat(), "balance": round(bal, 2)})
+    # downsample auf max `points` Stützstellen (letzter Punkt bleibt immer erhalten)
+    if len(curve) > points:
+        step = len(curve) / points
+        sampled = [curve[int(i * step)] for i in range(points)]
+        if sampled[-1] is not curve[-1]:
+            sampled.append(curve[-1])
+        curve = sampled
+    return {"start_balance": round(start, 2), "peak": round(peak, 2),
+            "current": round(bal, 2), "n_closed": len(rows), "points": curve}
+
+
 @router.post("/paper/reset")
 def paper_reset():
     """Paper-Wallet auf start_balance zurücksetzen + offene Paper-Positionen schließen."""

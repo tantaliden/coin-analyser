@@ -2262,7 +2262,7 @@ def process_due_mh_hindsight(s, mh_model, state_path, batch_size=20):
         tp_reach = None
     try:
         sl_reach = {
-            'survive': float(mh_cfg["sl_reach_survive"]),
+            'recover_target': float(mh_cfg["sl_recover_target"]),
             'step':    float(mh_cfg["sl_reach_step"]),
             'min':     float(mh_cfg["sl_reach_min"]),
             'max':     float(mh_cfg["sl_reach_max"]),
@@ -2279,6 +2279,17 @@ def process_due_mh_hindsight(s, mh_model, state_path, batch_size=20):
     except (KeyError, TypeError, ValueError) as e:
         log.error("FALLBACK_TRIGGERED process_due_mh_hindsight: early-Settings fehlen/ungültig (%s) -> Entry-Timing-Lernen aus", e)
         early_cfg = None
+    # Netto-Profit-Lernen (v7): Slippage MUSS dieselbe sein, die paper_engine real
+    # verbucht (predictor.paper_wallet) -> Lernsignal == Wallet. NO-FALLBACK: fehlt sie,
+    # ist kein ehrliches Direction-Lernen möglich -> Funktion bricht ab (laut geloggt).
+    _pw = cfg.get("paper_wallet", {})
+    if _pw.get("slippage_pct_per_trade") is None:
+        log.error("FALLBACK_TRIGGERED process_due_mh_hindsight: paper_wallet.slippage_pct_per_trade fehlt -> Profit-Lernen unmöglich, ABBRUCH")
+        return 0
+    slip_pct_pw = float(_pw["slippage_pct_per_trade"])
+    default_lev = int(cfg.get("trading", {}).get("default_leverage", 5))
+    profit_scale = float(mh_cfg.get("profit_weight_scale", 1.0))
+    flat_skip = float(mh_cfg.get("flat_skip_threshold_pct", 0.2))
 
     n_learned = 0
     with db_app(s) as app, db_coins(s) as coins:
@@ -2286,7 +2297,8 @@ def process_due_mh_hindsight(s, mh_model, state_path, batch_size=20):
             with app.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT q.id AS qid, q.prediction_id,
-                           p.symbol, p.side, p.status, p.entry_px,
+                           p.symbol, p.side, p.status, p.entry_px, p.exit_px,
+                           p.effective_leverage,
                            p.features, p.created_at, p.predicted_up_pct,
                            p.predicted_down_pct, p.closed_at
                     FROM predictor_hindsight_queue q
@@ -2349,6 +2361,45 @@ def process_due_mh_hindsight(s, mh_model, state_path, batch_size=20):
                     else:
                         peak_after_gain = (entry - float(row_a['lo'])) / entry * 100.0
 
+                # recovered (v6.7): kam der Preis NACH dem tiefsten Drawdown-Punkt (volle Range)
+                # wieder über Entry zurück (in Gewinnrichtung)? Grundlage der SL-Recover-Grenze.
+                recovered = None
+                with coins.cursor() as cur_r:
+                    if d['side'] == 'long':
+                        cur_r.execute("""SELECT MAX(high) FROM klines
+                            WHERE symbol=%s AND interval='10s' AND open_time <= %s
+                              AND open_time > (SELECT open_time FROM klines
+                                  WHERE symbol=%s AND interval='10s' AND open_time BETWEEN %s AND %s
+                                  ORDER BY low ASC LIMIT 1)""",
+                            (d['symbol'], end_time, d['symbol'], created, end_time))
+                        r = cur_r.fetchone()
+                        recovered = bool(r and r[0] is not None and float(r[0]) > entry)
+                    else:
+                        cur_r.execute("""SELECT MIN(low) FROM klines
+                            WHERE symbol=%s AND interval='10s' AND open_time <= %s
+                              AND open_time > (SELECT open_time FROM klines
+                                  WHERE symbol=%s AND interval='10s' AND open_time BETWEEN %s AND %s
+                                  ORDER BY high DESC LIMIT 1)""",
+                            (d['symbol'], end_time, d['symbol'], created, end_time))
+                        r = cur_r.fetchone()
+                        recovered = bool(r and r[0] is not None and float(r[0]) < entry)
+
+                # Netto-Profit (v7): realer Trade-Return aus exit_px, dieselbe Formel
+                # wie paper_engine (net = eff_lev*(coin_move - slip)). exit_px NULL trotz
+                # geschlossener Prediction = Daten-Bug -> skip + laut loggen (kein Kaschieren).
+                if d['exit_px'] is None:
+                    log.warning("process_due_mh_hindsight %s id=%s: exit_px NULL trotz status=%s -> skip Profit-Learn",
+                                d['symbol'], d['prediction_id'], d['status'])
+                    with app.cursor() as cur_u:
+                        cur_u.execute("UPDATE predictor_hindsight_queue SET processed_at=now(), n_updates=0 WHERE id=%s", (d['qid'],))
+                    app.commit()
+                    continue
+                exit_px = float(d['exit_px'])
+                eff_lev = int(d['effective_leverage'] or default_lev)
+                coin_move = ((exit_px - entry) / entry if d['side'] == 'long'
+                             else (entry - exit_px) / entry) * 100.0
+                net_margin_pct = eff_lev * (coin_move - slip_pct_pw)
+
                 try:
                     mh_model.learn_close(
                         features=feat_clean,
@@ -2372,6 +2423,10 @@ def process_due_mh_hindsight(s, mh_model, state_path, batch_size=20):
                                     if d['predicted_down_pct'] is not None else None),
                         sl_reach=sl_reach,
                         early_cfg=early_cfg,
+                        recovered=recovered,
+                        net_margin_pct=net_margin_pct,
+                        profit_weight_scale=profit_scale,
+                        flat_skip_threshold_pct=flat_skip,
                     )
                     n_learned += 1
                     log.info("HINDSIGHT-LEARN %s id=%s side=%s status=%s "
