@@ -53,9 +53,8 @@ def compute_funding_features(coins_conn, symbol, universe_funding_median=None):
         if sd > 1e-12:
             feat['fb_funding_zscore_24h'] = (funding_now - mean) / sd
         else:
-            log.error("FALLBACK_TRIGGERED compute_funding %s: funding-sd 24h = 0 -> None",
-                      symbol)
-            return None
+            # sd=0 <=> alle funding-Werte identisch <=> funding_now == mean -> Abweichung exakt 0
+            feat['fb_funding_zscore_24h'] = 0.0
     else:
         log.error("FALLBACK_TRIGGERED compute_funding %s: 24h-funding zu wenig -> None",
                   symbol)

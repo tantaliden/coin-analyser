@@ -654,9 +654,10 @@ def feature_snapshot_v2(coins_conn, symbol, rule_flags=None, btc_moves=None):
         f_std = math.sqrt(f_var)
         cur_f = clean_f[0]
         if f_std == 0:
-            log.error("FALLBACK_TRIGGERED feature_snapshot_v2 %s: funding_std=0, ergebnis undefiniert -> coin skip", symbol)
-            return None
-        feat['funding_zscore_24h'] = (cur_f - f_mean) / f_std
+            # std=0 <=> alle 24 funding-Werte identisch <=> cur_f == f_mean -> Abweichung exakt 0
+            feat['funding_zscore_24h'] = 0.0
+        else:
+            feat['funding_zscore_24h'] = (cur_f - f_mean) / f_std
         streak = 0; sign = None
         for v in f24:
             if v is None: continue
@@ -1393,8 +1394,19 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
                     return
                 tp_raw = float(cs_tp); sl_raw = float(cs_sl)
 
-            tp_pct = tp_raw * tp_safety
-            sl_pct = max(sl_raw * sl_safety, 0.1)
+            # TP-Höhe: selbst-kalibrierter Erreichbarkeits-Faktor je Side (v6) statt festem
+            # tp_safety. Der Regelkreis in register_tp_reach justiert ihn auf 80% Trefferquote.
+            tp_pct = tp_raw * mh_model.get_tp_reach_factor(side)
+            # SL-Höhe: selbst-kalibrierter Überlebens-Faktor (v6.1) statt festem sl_safety.
+            # register_sl_reach justiert ihn auf die Return-Grenze (survive_target der Gewinner).
+            # Hart-Untergrenze sl_pct_floor (v6.5, Volker 26.05.): verhindert dass das gelernte
+            # SL bei rauschigen Phasen unrealistisch nah ans Entry kollabiert (Trade-Stop am
+            # Spread+Slippage). Floor kommt aus Settings, kein Hardcode mehr.
+            sl_pct_floor = mh_cfg.get("sl_pct_floor")
+            if sl_pct_floor is None:
+                log.error("FALLBACK_TRIGGERED scan_pass_mh: predictor.multi_head.sl_pct_floor fehlt -> coin skip")
+                _bump("filt"); return
+            sl_pct = max(sl_raw * mh_model.get_sl_reach_factor(side), float(sl_pct_floor))
 
             if cold_start_active:
                 cs_tp = float(mh_cfg.get("cold_start_tp_raw_pct"))
@@ -2235,6 +2247,38 @@ def process_due_mh_hindsight(s, mh_model, state_path, batch_size=20):
     to_wrong_w = float(mh_cfg.get("timeout_wrong_weight", 1.0))
     loss_w = float(mh_cfg.get("loss_weight", 1.0))
     win_w = float(mh_cfg.get("win_weight", 1.0))
+    # TP-Erreichbarkeits-Regelkreis-Parameter (v6). NO-FALLBACK: fehlen sie, wird der
+    # Faktor nicht justiert (TP-Lernen läuft weiter), aber es wird laut geloggt.
+    try:
+        tp_reach = {
+            'target': float(mh_cfg["tp_reach_target"]),
+            'step':   float(mh_cfg["tp_reach_step"]),
+            'min':    float(mh_cfg["tp_reach_min"]),
+            'max':    float(mh_cfg["tp_reach_max"]),
+            'alpha':  float(mh_cfg["tp_reach_ewma_alpha"]),
+        }
+    except (KeyError, TypeError, ValueError) as e:
+        log.error("FALLBACK_TRIGGERED process_due_mh_hindsight: tp_reach-Settings fehlen/ungültig (%s) -> Faktor-Update aus", e)
+        tp_reach = None
+    try:
+        sl_reach = {
+            'survive': float(mh_cfg["sl_reach_survive"]),
+            'step':    float(mh_cfg["sl_reach_step"]),
+            'min':     float(mh_cfg["sl_reach_min"]),
+            'max':     float(mh_cfg["sl_reach_max"]),
+            'alpha':   float(mh_cfg["sl_reach_ewma_alpha"]),
+        }
+    except (KeyError, TypeError, ValueError) as e:
+        log.error("FALLBACK_TRIGGERED process_due_mh_hindsight: sl_reach-Settings fehlen/ungültig (%s) -> SL-Faktor-Update aus", e)
+        sl_reach = None
+    try:
+        early_cfg = {
+            'extra_pct':   float(mh_cfg["early_extra_pct"]),
+            'skip_weight': float(mh_cfg["early_skip_weight"]),
+        }
+    except (KeyError, TypeError, ValueError) as e:
+        log.error("FALLBACK_TRIGGERED process_due_mh_hindsight: early-Settings fehlen/ungültig (%s) -> Entry-Timing-Lernen aus", e)
+        early_cfg = None
 
     n_learned = 0
     with db_app(s) as app, db_coins(s) as coins:
@@ -2243,7 +2287,8 @@ def process_due_mh_hindsight(s, mh_model, state_path, batch_size=20):
                 cur.execute("""
                     SELECT q.id AS qid, q.prediction_id,
                            p.symbol, p.side, p.status, p.entry_px,
-                           p.features, p.created_at
+                           p.features, p.created_at, p.predicted_up_pct,
+                           p.predicted_down_pct, p.closed_at
                     FROM predictor_hindsight_queue q
                     JOIN open_predictions p ON p.id = q.prediction_id
                     WHERE q.processed_at IS NULL AND q.ready_at <= now()
@@ -2261,14 +2306,25 @@ def process_due_mh_hindsight(s, mh_model, state_path, batch_size=20):
                 created = d['created_at']
                 end_time = created + timedelta(hours=get_timeout_hours(s),
                                                minutes=float(mh_cfg.get("hindsight_extended_minutes", 30)))
+                # close_time = wann der Trade real schloss (TP/SL/Timeout). Trennt Trade-Zeit
+                # von Nachphase. Fallback: volle Range (kein Aufteilen möglich).
+                close_time = d['closed_at'] if d['closed_at'] is not None else end_time
                 with coins.cursor(cursor_factory=RealDictCursor) as cur_c:
-                    cur_c.execute("""
-                        SELECT MAX(high) AS hi, MIN(low) AS lo
-                        FROM klines
-                        WHERE symbol=%s AND interval='10s'
-                          AND open_time BETWEEN %s AND %s
-                    """, (d['symbol'], created, end_time))
+                    # volle Range [created, end_time] -> Magnitude-Schätzung (Anti-Zirkularität)
+                    cur_c.execute("""SELECT MAX(high) AS hi, MIN(low) AS lo FROM klines
+                        WHERE symbol=%s AND interval='10s' AND open_time BETWEEN %s AND %s""",
+                        (d['symbol'], created, end_time))
                     row = cur_c.fetchone()
+                    # Trade-Zeit [created, close_time] -> TP-Trefferquote + SL-Drawdown
+                    cur_c.execute("""SELECT MAX(high) AS hi, MIN(low) AS lo FROM klines
+                        WHERE symbol=%s AND interval='10s' AND open_time BETWEEN %s AND %s""",
+                        (d['symbol'], created, close_time))
+                    row_t = cur_c.fetchone()
+                    # Nachphase [close_time, end_time] -> Entry-Timing ("zu früh gesetzt?")
+                    cur_c.execute("""SELECT MAX(high) AS hi, MIN(low) AS lo FROM klines
+                        WHERE symbol=%s AND interval='10s' AND open_time BETWEEN %s AND %s""",
+                        (d['symbol'], close_time, end_time))
+                    row_a = cur_c.fetchone()
                 if not row or row['hi'] is None or row['lo'] is None:
                     log.warning("process_due_mh_hindsight %s id=%s: keine klines im Range, skip",
                                 d['symbol'], d['prediction_id'])
@@ -2279,6 +2335,19 @@ def process_due_mh_hindsight(s, mh_model, state_path, batch_size=20):
                     continue
                 peak_pct_full = (float(row['hi']) - entry) / entry * 100.0
                 trough_pct_full = (entry - float(row['lo'])) / entry * 100.0
+                # Trade-Zeit (Fallback auf volle Range, falls keine Trade-Zeit-klines)
+                if row_t and row_t['hi'] is not None and row_t['lo'] is not None:
+                    peak_trade = (float(row_t['hi']) - entry) / entry * 100.0
+                    trough_trade = (entry - float(row_t['lo'])) / entry * 100.0
+                else:
+                    peak_trade, trough_trade = peak_pct_full, trough_pct_full
+                # Nachphase-Peak in Gewinnrichtung
+                peak_after_gain = None
+                if row_a and row_a['hi'] is not None and row_a['lo'] is not None:
+                    if d['side'] == 'long':
+                        peak_after_gain = (float(row_a['hi']) - entry) / entry * 100.0
+                    else:
+                        peak_after_gain = (entry - float(row_a['lo'])) / entry * 100.0
 
                 try:
                     mh_model.learn_close(
@@ -2292,6 +2361,17 @@ def process_due_mh_hindsight(s, mh_model, state_path, batch_size=20):
                         timeout_wrong_weight=to_wrong_w,
                         loss_weight=loss_w,
                         win_weight=win_w,
+                        set_tp_pct=(float(d['predicted_up_pct'])
+                                    if d['predicted_up_pct'] is not None else None),
+                        tp_reach=tp_reach,
+                        peak_trade=max(0.0, peak_trade),
+                        trough_trade=max(0.0, trough_trade),
+                        peak_after_gain=(max(0.0, peak_after_gain)
+                                         if peak_after_gain is not None else None),
+                        set_sl_pct=(float(d['predicted_down_pct'])
+                                    if d['predicted_down_pct'] is not None else None),
+                        sl_reach=sl_reach,
+                        early_cfg=early_cfg,
                     )
                     n_learned += 1
                     log.info("HINDSIGHT-LEARN %s id=%s side=%s status=%s "
@@ -3786,17 +3866,21 @@ def main():
     seed = int(mh_cfg.get("seed", 42))
     n_models_direction = int(mh_cfg.get("n_models_direction", 10))
     grace_period = int(mh_cfg.get("grace_period", 50))
+    # direction_model_type aus Settings — 'logreg' (default) oder 'arf_full'.
+    # Volker 27.05.: Live = arf_full für A/B-Vergleich mit logreg auf Test.
+    direction_model_type = str(mh_cfg.get("direction_model_type", "logreg"))
 
     mh_model = None
     if os.path.exists(state_path):
         try:
-            mh_model = MultiHeadPredictor.load(state_path)
+            mh_model = MultiHeadPredictor.load(state_path, direction_model_type=direction_model_type)
             if mh_model.version != MultiHeadPredictor.VERSION:
                 log.warning("Multi-Head state version mismatch (%s != %s), fresh start",
                             mh_model.version, MultiHeadPredictor.VERSION)
                 mh_model = None
             else:
-                log.info("Multi-Head loaded: stats=%s", mh_model.stats())
+                log.info("Multi-Head loaded: direction_type=%s stats=%s",
+                         direction_model_type, mh_model.stats())
         except Exception as e:
             log.warning("Multi-Head load failed (%s), fresh start", e)
             mh_model = None
@@ -3805,10 +3889,11 @@ def main():
             seed=seed,
             n_models_direction=n_models_direction,
             grace_period=grace_period,
+            direction_model_type=direction_model_type,
         )
         mh_model.save(state_path)
-        log.info("Multi-Head fresh start: seed=%d n_models=%d grace=%d",
-                 seed, n_models_direction, grace_period)
+        log.info("Multi-Head fresh start: seed=%d n_models=%d grace=%d direction_type=%s",
+                 seed, n_models_direction, grace_period, direction_model_type)
 
     rng = np.random.default_rng(seed)
     log.info("Predictor v5 (Multi-Head) start. scan=%ss watch=%ss top_n=%d",
@@ -3822,53 +3907,20 @@ def main():
     mh_model_lock = threading.Lock()
 
     def _watch_thread_loop():
+        # v6.4 (26.05.2026, Volker): watch_pass_mh / paper_watch / timeout_watch /
+        # sync_hl_to_db sind in einen eigenen Daemon (predictor-watch.service) ausgelagert,
+        # damit Modell-gebundene lange Tasks (process_due_hindsight) den schnellen TP/SL-Check
+        # nicht mehr stauen. Hier bleiben NUR die modell-gebundenen Tasks: observer_reeval
+        # (re-evaluiert mit mh_model) + process_due_mh_hindsight (learn_close).
         watch_interval = float(cfg["watch_interval_seconds"])
-        last_timeout_watch_local = 0.0
-        last_hl_sync_local = 0.0
         last_observer_local = 0.0
         while True:
             try:
                 s_local = load_settings()
-                with mh_model_lock:
-                    c = watch_pass_mh(s_local, mh_model, state_path)
-                if c > 0:
-                    log.info("watch-pass: %d closed", c)
-                # timeout_watch (Trader-Welt): 10s-Tick, entkoppelt vom scan_pass.
-                # Verkauf max 10s verspaetet statt bis 9-min-scan_pass durch ist.
                 now_inner = time.time()
-                if now_inner - last_timeout_watch_local >= 10:
-                    try:
-                        n_to = timeout_watch(s_local)
-                        if n_to > 0:
-                            log.info("timeout-watch: %d Positionen via Timeout geschlossen", n_to)
-                    except Exception as e:
-                        log.exception("timeout-watch (in watch-thread) failed: %s", e)
-                    last_timeout_watch_local = now_inner
-                # HL-Sync: trader_positions ↔ echte HL-Realität abgleichen (auch hier
-                # entkoppelt vom scan_pass — sonst weiß Wallet erst nach 9 min was HL
-                # tatsächlich gemacht hat, z.B. SL-Trigger).
-                if now_inner - last_hl_sync_local >= 30:
-                    try:
-                        n_sync = sync_hl_to_db(s_local)
-                        if n_sync > 0:
-                            log.info("hl-sync: %d Phantom-Positionen reaktiviert", n_sync)
-                    except Exception as e:
-                        log.exception("hl-sync (in watch-thread) failed: %s", e)
-                    last_hl_sync_local = now_inner
-
-                # Paper-Watcher: virtuelle paper_positions auf TP/SL/Timeout prüfen.
-                # Laeuft IMMER (Paper ist durchgaengig an, unabhaengig vom Echtgeld-
-                # Schalter). Sekündlich wie watch_pass.
-                try:
-                    with db_coins(s_local) as _pc, db_app(s_local) as _pa:
-                        n_pc = paper_watch(_pa, _pc, s_local["predictor"], get_timeout_hours(s_local))
-                    if n_pc > 0:
-                        log.info("paper-watch: %d Paper-Positionen geschlossen", n_pc)
-                except Exception as e:
-                    log.exception("paper-watch failed: %s", e)
 
                 # Observer: bei Marktshift offene Positionen neu bewerten + TP/SL anpassen.
-                # Eigener Tick (check_interval_seconds), nutzt mh_model_lock via _evaluate_coin_reeval.
+                # Eigener Tick (check_interval_seconds), nutzt mh_model_lock.
                 obs_cfg = s_local.get("predictor", {}).get("observer", {})
                 if obs_cfg.get("enabled"):
                     obs_iv = float(obs_cfg.get("check_interval_seconds", 30))
@@ -3880,6 +3932,8 @@ def main():
                         except Exception as e:
                             log.exception("observer_reeval failed: %s", e)
                         last_observer_local = now_inner
+
+                # Hindsight-Lernen (modell-gebunden) — geblieben.
                 with mh_model_lock:
                     n_h = process_due_mh_hindsight(s_local, mh_model, state_path)
                 if n_h > 0:

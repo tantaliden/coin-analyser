@@ -96,8 +96,8 @@ export default function WalletModule() {
       try {
         const [pw, pp, ph] = await Promise.all([
           api.get('/api/v1/predictor/paper/wallet'),
-          api.get('/api/v1/predictor/paper/positions?scope=open'),
-          api.get('/api/v1/predictor/paper/positions?scope=closed'),
+          api.get('/api/v1/predictor/paper/positions?scope=open&limit=200'),
+          api.get('/api/v1/predictor/paper/positions?scope=closed&limit=200'),
         ])
         setPaperWallet(pw.data || null)
         setPaperPositions(pp.data?.positions || [])
