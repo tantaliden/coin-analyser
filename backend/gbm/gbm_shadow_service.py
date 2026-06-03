@@ -142,61 +142,58 @@ def load_regime(app):
         return cur.fetchone()
 
 
-def save_regime(app, recent, window, minw, seed_sign):
-    """recent = NUR echte Live-Closes (raw-Modell korrekt 0/1). Solange < minw
-    Live-Closes vorliegen, gilt das Seed-Vorzeichen; danach entscheidet das
-    Live-Fenster (schnelle Adaption, Seed erstickt nichts mehr)."""
-    recent = recent[-window:]
-    n = len(recent)
-    if n >= minw:
-        hit = sum(recent) / n
-        sign = -1 if hit < 0.5 else 1
-    else:
-        hit = (sum(recent) / n) if n else None
-        sign = seed_sign   # Kaltstart: Seed-Vorzeichen bis genug Live-Closes (kein Randomize)
+def set_regime(app, sign, hit, n):
     with app.cursor() as cur:
-        cur.execute("""UPDATE gbm_regime_state SET current_sign=%s, recent=%s, n_closed=%s,
-                       hit_rate=%s, seed_sign=%s, updated_at=now() WHERE id=1""",
-                    (sign, json.dumps(recent), n, hit, seed_sign))
+        cur.execute("""UPDATE gbm_regime_state SET current_sign=%s, hit_rate=%s, n_closed=%s,
+                       updated_at=now() WHERE id=1""", (sign, hit, n))
     app.commit()
-    return sign, hit, n
 
 
-def seed_regime(coins, app, cfg, sv, ad, base, feat_cols):
-    """Bestimmt NUR das Start-Vorzeichen (seed_sign) aus der jüngsten Historie.
-    Das laufende Fenster startet LEER und füllt sich nur mit echten Live-Closes."""
-    st = load_regime(app)
-    if st.get("seed_sign") is not None:
-        log(f"Regime-Seed übersprungen (seed_sign={st['seed_sign']} gesetzt, {st['n_closed']} Live-Closes)")
-        return
-    minutes = int(sv["seed_days"] * 24 * 60)
-    market = recent_market(coins, cfg, minutes + max(cfg["windows"]) + 5)
-    recent = []
+def estimate_regime(coins, cfg, base, feat_cols, lookback_min, settle_min, min_samples):
+    """Dichte, NICHT gate-verzerrte Regime-Schätzung (wie der Backtest):
+    Basis-Modell auf das GANZE liquide Universum, Roh-Trefferquote auf kürzlich
+    AUFGELÖSTEN Setups (TP-vor-SL, vorwärts bis jetzt gescannt). >0.5 = Modell
+    direkt richtig -> sign +1; <0.5 -> invertieren (-1). Liefert (sign, hit, n)
+    oder (None, None, n) bei zu wenig Evidenz."""
+    import datetime as dt
+    now = dt.datetime.now(dt.timezone.utc)
+    tp = cfg["tp"] / 100.0; sl = cfg["sl"] / 100.0
+    market = recent_market(coins, cfg, lookback_min + cfg["min_hist"] + max(cfg["windows"]) + 5)
+    correct = 0; total = 0
     for sym in coin_universe(coins, cfg):
-        rows = fetch_recent(coins, sym, minutes)
-        if len(rows) < cfg["min_hist"] + int(cfg["horizon_h"] * 60) + 50:
+        rows = fetch_recent(coins, sym, lookback_min + cfg["min_hist"] + 10)
+        if len(rows) < cfg["min_hist"] + 10:
             continue
         df = to_df(rows)
         feats = build_features(df, cfg, market)
-        idx = np.arange(cfg["min_hist"], len(df), cfg["step"])
-        labels = label_at(df, idx, cfg)
-        for k, i in enumerate(idx):
-            lb = labels[k]
-            if lb == -1 or lb == 0:
+        close = df["close"].to_numpy(); high = df["high"].to_numpy(); low = df["low"].to_numpy()
+        bk = df["bucket"]; n = len(df)
+        for i in range(cfg["min_hist"], n - 1, cfg["step"]):
+            age_min = (now - bk.iloc[i].to_pydatetime()).total_seconds() / 60.0
+            if age_min < settle_min:   # zu jung -> evtl. noch nicht aufgelöst
+                continue
+            e = close[i]
+            if not np.isfinite(e) or e <= 0:
                 continue
             row = feats.iloc[i]
             if row[feat_cols].isna().any():
                 continue
+            fh = high[i + 1:]; fl = low[i + 1:]   # vorwärts bis jetzt
+            up = np.argmax(fh >= e * (1 + tp)) if (fh >= e * (1 + tp)).any() else -1
+            dn = np.argmax(fl <= e * (1 - sl)) if (fl <= e * (1 - sl)).any() else -1
+            long_win = up != -1 and (dn == -1 or up < dn)
+            dn2 = np.argmax(fl <= e * (1 - tp)) if (fl <= e * (1 - tp)).any() else -1
+            up2 = np.argmax(fh >= e * (1 + sl)) if (fh >= e * (1 + sl)).any() else -1
+            short_win = dn2 != -1 and (up2 == -1 or dn2 < up2)
+            if not (long_win or short_win):
+                continue   # (noch) nicht aufgelöst -> raus
             pl = predict_long(base, row[feat_cols].to_numpy(dtype=np.float32).reshape(1, -1))
-            raw_long = pl >= 0.5
-            recent.append((1 if (raw_long == (lb == 1)) else 0, df["bucket"].iloc[i]))
-    recent.sort(key=lambda x: x[1])
-    # Nur die jüngsten regime_window Fälle für das Start-Vorzeichen (aktuelles Regime)
-    flags = [f for f, _ in recent][-ad["regime_window"]:]
-    seed_hit = (sum(flags) / len(flags)) if flags else None
-    seed_sign = -1 if (seed_hit is not None and seed_hit < 0.5) else 1
-    sign, hit, n = save_regime(app, [], ad["regime_window"], ad["min_window"], seed_sign)
-    log(f"Regime-Seed: seed_sign={seed_sign} aus {len(flags)} hist. Fällen (hit={seed_hit}); Live-Buffer leer")
+            correct += 1 if ((pl >= 0.5) == long_win) else 0
+            total += 1
+    if total < min_samples:
+        return None, None, total
+    hit = correct / total
+    return (-1 if hit < 0.5 else 1), hit, total
 
 
 # ---------- Wallet ----------
@@ -275,9 +272,6 @@ def watch(coins, app, cfg, ad):
         opens = cur.fetchall()
     if not opens:
         return 0
-    st = load_regime(app)
-    recent = json.loads(st["recent"]) if isinstance(st["recent"], str) else st["recent"]
-    seed_sign = st.get("seed_sign") if st.get("seed_sign") is not None else 1
     H = cfg["horizon_h"]; closed = 0
     import datetime as dt
     now = dt.datetime.now(dt.timezone.utc)
@@ -319,15 +313,9 @@ def watch(coins, app, cfg, ad):
         app.commit()
         wallet_apply(app, pnl_usd)
         closed += 1
-        # Regime füttern: war das BASIS-Modell (vor Vorzeichen) richtig? nur bei win/loss
-        if reason in ("win", "loss"):
-            winning_side = p["side"] if reason == "win" else ("short" if p["side"] == "long" else "long")
-            raw_side = p["side"] if p["regime_sign"] == 1 else ("short" if p["side"] == "long" else "long")
-            recent.append(1 if raw_side == winning_side else 0)
         log(f"CLOSE {p['side']} {p['symbol']} {reason} pnl={pnl_pct:.2f}% ${pnl_usd:.3f}")
-    sign, hit, n = save_regime(app, recent, ad["regime_window"], ad["min_window"], seed_sign)
     if closed:
-        log(f"watch: {closed} geschlossen, Regime sign={sign} hit={hit} n={n}")
+        log(f"watch: {closed} geschlossen")
     return closed
 
 
@@ -338,12 +326,12 @@ def mtimes(paths):
 def main():
     s, g, cfg, sv, ad, paths = load_all()
     log(f"GBM-Shadow start: gate>={sv['gate_threshold']} dir>={sv['dir_threshold']} "
-        f"max_open={sv['max_open']} W={ad['regime_window']} scan={sv['scan_interval_seconds']}s")
+        f"max_open={sv['max_open']} regime=universe-estimator scan={sv['scan_interval_seconds']}s")
     base = load_booster(paths["base_model"]); gate = load_booster(paths["gate_model"])
     feat_cols = json.load(open(paths["feat_meta"]))["feat_cols"]
     mt = mtimes(paths)
     coins = dbc(s, "coins"); app = dbc(s, "app")
-    seed_regime(coins, app, cfg, sv, ad, base, feat_cols)
+    last_regime = 0.0
     while True:
         t0 = time.time()
         try:
@@ -354,6 +342,17 @@ def main():
                 base = load_booster(paths["base_model"]); gate = load_booster(paths["gate_model"])
                 feat_cols = json.load(open(paths["feat_meta"]))["feat_cols"]
                 mt = mtimes(paths); log("Modelle neu geladen (Re-Training erkannt)")
+            # Regime-Vorzeichen periodisch aus dem GANZEN Universum schätzen (dicht, ungate-verzerrt)
+            if time.time() - last_regime >= ad["regime_refresh_seconds"]:
+                sg, hit, ntot = estimate_regime(coins, cfg, base, feat_cols,
+                                                ad["regime_lookback_minutes"], ad["regime_settle_minutes"],
+                                                ad["regime_min_samples"])
+                if sg is not None:
+                    set_regime(app, sg, hit, ntot)
+                    log(f"regime-estimate: sign={sg} hit={hit:.3f} n={ntot}")
+                else:
+                    log(f"regime-estimate: zu wenig Evidenz (n={ntot}) — Vorzeichen unverändert")
+                last_regime = time.time()
             st = load_regime(app); sign = st["current_sign"]
             watch(coins, app, cfg, ad)
             scan(coins, app, cfg, sv, feat_cols, base, gate, sign)
