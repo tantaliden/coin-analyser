@@ -114,6 +114,15 @@ def coin_universe(coins, cfg):
         return [r[0] for r in cur.fetchall()]
 
 
+def max_leverage_map(coins, symbols):
+    """Echter HL-Max-Hebel je Coin aus hl_meta (Paper soll Live spiegeln)."""
+    if not symbols:
+        return {}
+    with coins.cursor() as cur:
+        cur.execute("SELECT symbol, max_leverage FROM hl_meta WHERE symbol = ANY(%s)", (list(symbols),))
+        return {r[0]: int(r[1]) for r in cur.fetchall() if r[1]}
+
+
 def feat_vector(coins, symbol, cfg, market, feat_cols, minutes):
     rows = fetch_recent(coins, symbol, minutes)
     if len(rows) < max(cfg["windows"]) + 121:
@@ -209,13 +218,19 @@ def scan(coins, app, cfg, sv, feat_cols, base, gate, sign):
     import datetime as dt
     now = dt.datetime.now(dt.timezone.utc)
     size = float(json.load(open(SETTINGS))["gbm_predictor"]["dollar"]["trade_size_usd"])
-    lev = sv["leverage"]; tp, sl = cfg["tp"], cfg["sl"]
+    lev_cap = sv["leverage"]; tp, sl = cfg["tp"], cfg["sl"]
+    uni = coin_universe(coins, cfg)
+    maxlev = max_leverage_map(coins, uni)
     opened = 0
-    for sym in coin_universe(coins, cfg):
+    for sym in uni:
         if n_open + opened >= sv["max_open"]:
             break
         if sym in held:
             continue
+        ml = maxlev.get(sym)
+        if ml is None:
+            continue  # kein Hebel aus hl_meta bekannt -> kein Trade (kein Fallback)
+        eff_lev = min(lev_cap, ml)
         lo = last_open.get(sym)
         if lo and (now - lo).total_seconds() < sv["cooldown_minutes"] * 60:
             continue
@@ -233,19 +248,19 @@ def scan(coins, app, cfg, sv, feat_cols, base, gate, sign):
             tp_px = px * (1 + tp / 100); sl_px = px * (1 - sl / 100)
         else:
             tp_px = px * (1 - tp / 100); sl_px = px * (1 + sl / 100)
-        qty = size * lev / px
+        qty = size * eff_lev / px
         with app.cursor() as cur:
             cur.execute("""INSERT INTO gbm_paper_positions
                 (symbol,side,entry_px,tp_px,sl_px,qty,margin_usd,dir_conf,p_resolve,regime_sign)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (sym, side, px, tp_px, sl_px, qty, size, dir_conf, p_res, sign))
         app.commit(); opened += 1
-        log(f"OPEN {side} {sym} @ {px:.6g} conf={dir_conf:.3f} pres={p_res:.3f} sign={sign}")
+        log(f"OPEN {side} {sym} @ {px:.6g} conf={dir_conf:.3f} pres={p_res:.3f} lev={eff_lev} sign={sign}")
     return opened
 
 
 # ---------- Watch (schließen + Regime füttern) ----------
-def watch(coins, app, cfg, ad, lev):
+def watch(coins, app, cfg, ad):
     with app.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT * FROM gbm_paper_positions WHERE status='open'")
         opens = cur.fetchall()
@@ -281,11 +296,12 @@ def watch(coins, app, cfg, ad, lev):
                 exit_px, reason, ct = float(rows[-1][2]), "timeout", rows[-1][3]
         if exit_px is None:
             continue
-        if p["side"] == "long":
-            pnl_pct = (exit_px / p["entry_px"] - 1) * 100 - cfg["fee"]
-        else:
-            pnl_pct = (1 - exit_px / p["entry_px"]) * 100 - cfg["fee"]
-        pnl_usd = p["margin_usd"] * lev * pnl_pct / 100.0
+        # qty trägt den (coin-spezifischen) Hebel -> PnL direkt aus Notional
+        entry = p["entry_px"]; notional = float(p["qty"]) * entry
+        gross = (exit_px - entry) / entry if p["side"] == "long" else (entry - exit_px) / entry
+        net = gross - cfg["fee"] / 100.0
+        pnl_usd = notional * net
+        pnl_pct = pnl_usd / p["margin_usd"] * 100.0 if p["margin_usd"] else 0.0
         with app.cursor() as cur:
             cur.execute("""UPDATE gbm_paper_positions SET status=%s,exit_px=%s,pnl_pct=%s,
                            pnl_usd=%s,closed_at=%s,close_reason=%s WHERE id=%s""",
@@ -329,7 +345,7 @@ def main():
                 feat_cols = json.load(open(paths["feat_meta"]))["feat_cols"]
                 mt = mtimes(paths); log("Modelle neu geladen (Re-Training erkannt)")
             st = load_regime(app); sign = st["current_sign"]
-            watch(coins, app, cfg, ad, sv["leverage"])
+            watch(coins, app, cfg, ad)
             scan(coins, app, cfg, sv, feat_cols, base, gate, sign)
         except Exception as e:
             log(f"loop error: {e}")
