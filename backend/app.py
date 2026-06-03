@@ -43,6 +43,8 @@ from bot import router as bot_router
 from momentum import router as momentum_router
 from rl_agent.routes import router as rl_agent_router
 from predictor import router as predictor_router
+from seq import router as seq_router
+from gbm import router as gbm_router
 
 # Include routers
 app.include_router(auth_router)
@@ -69,6 +71,8 @@ app.include_router(bot_router)
 app.include_router(momentum_router)
 app.include_router(rl_agent_router)
 app.include_router(predictor_router)
+app.include_router(seq_router)
+app.include_router(gbm_router)
 
 @app.on_event("startup")
 async def _start_hl_ws():

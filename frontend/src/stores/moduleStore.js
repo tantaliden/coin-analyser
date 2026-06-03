@@ -22,6 +22,8 @@ const AVAILABLE_MODULES = [
   { id: 'momentum', label: 'Momentum Scanner' },
   { id: 'rlagent', label: 'RL-Agent' },
   { id: 'predictions', label: 'Predictions' },
+  { id: 'seqshadow', label: 'Sequenz-Shadow' },
+  { id: 'gbmshadow', label: 'GBM-Predictor' },
 ]
 
 export const useModuleStore = create(persist((set, get) => ({

@@ -16,6 +16,8 @@ import BotModule from '../modules/bot/BotModule'
 import MomentumModule from '../modules/MomentumModule'
 import RLAgentModule from '../modules/RLAgentModule'
 import PredictionsModule from '../modules/PredictionsModule'
+import SeqShadowModule from '../modules/SeqShadowModule'
+import GbmShadowModule from '../modules/GbmShadowModule'
 
 const ResponsiveGridLayout = WidthProvider(Responsive)
 
@@ -30,6 +32,8 @@ const MODULE_COMPONENTS = {
   momentum: MomentumModule,
   rlagent: RLAgentModule,
   predictions: PredictionsModule,
+  seqshadow: SeqShadowModule,
+  gbmshadow: GbmShadowModule,
 }
 
 const MODULE_TITLES = {
@@ -43,6 +47,8 @@ const MODULE_TITLES = {
   momentum: 'Momentum Scanner',
   rlagent: 'RL-Agent',
   predictions: 'Predictions',
+  seqshadow: 'Sequenz-Shadow',
+  gbmshadow: 'GBM-Predictor',
 }
 
 export default function Dashboard() {
