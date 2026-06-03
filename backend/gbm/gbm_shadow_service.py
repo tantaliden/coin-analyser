@@ -142,27 +142,33 @@ def load_regime(app):
         return cur.fetchone()
 
 
-def save_regime(app, recent, window, minw):
+def save_regime(app, recent, window, minw, seed_sign):
+    """recent = NUR echte Live-Closes (raw-Modell korrekt 0/1). Solange < minw
+    Live-Closes vorliegen, gilt das Seed-Vorzeichen; danach entscheidet das
+    Live-Fenster (schnelle Adaption, Seed erstickt nichts mehr)."""
     recent = recent[-window:]
     n = len(recent)
     if n >= minw:
         hit = sum(recent) / n
         sign = -1 if hit < 0.5 else 1
     else:
-        hit = None; sign = 1   # definierter Cold-Start: Basis-Modell direkt (kein Randomize)
+        hit = (sum(recent) / n) if n else None
+        sign = seed_sign   # Kaltstart: Seed-Vorzeichen bis genug Live-Closes (kein Randomize)
     with app.cursor() as cur:
         cur.execute("""UPDATE gbm_regime_state SET current_sign=%s, recent=%s, n_closed=%s,
-                       hit_rate=%s, updated_at=now() WHERE id=1""",
-                    (sign, json.dumps(recent), n, hit))
+                       hit_rate=%s, seed_sign=%s, updated_at=now() WHERE id=1""",
+                    (sign, json.dumps(recent), n, hit, seed_sign))
     app.commit()
     return sign, hit, n
 
 
 def seed_regime(coins, app, cfg, sv, ad, base, feat_cols):
-    """Regime-Buffer aus jüngster Historie füllen (Basis-Modell-Korrektheit)."""
+    """Bestimmt NUR das Start-Vorzeichen (seed_sign) aus der jüngsten Historie.
+    Das laufende Fenster startet LEER und füllt sich nur mit echten Live-Closes."""
     st = load_regime(app)
-    if st["n_closed"] >= ad["min_window"]:
-        log(f"Regime-Seed übersprungen (schon {st['n_closed']} Closes)"); return
+    if st.get("seed_sign") is not None:
+        log(f"Regime-Seed übersprungen (seed_sign={st['seed_sign']} gesetzt, {st['n_closed']} Live-Closes)")
+        return
     minutes = int(sv["seed_days"] * 24 * 60)
     market = recent_market(coins, cfg, minutes + max(cfg["windows"]) + 5)
     recent = []
@@ -185,9 +191,12 @@ def seed_regime(coins, app, cfg, sv, ad, base, feat_cols):
             raw_long = pl >= 0.5
             recent.append((1 if (raw_long == (lb == 1)) else 0, df["bucket"].iloc[i]))
     recent.sort(key=lambda x: x[1])
-    flags = [f for f, _ in recent]
-    sign, hit, n = save_regime(app, flags, ad["regime_window"], ad["min_window"])
-    log(f"Regime geseedet: {n} Fälle, hit={hit}, sign={sign}")
+    # Nur die jüngsten regime_window Fälle für das Start-Vorzeichen (aktuelles Regime)
+    flags = [f for f, _ in recent][-ad["regime_window"]:]
+    seed_hit = (sum(flags) / len(flags)) if flags else None
+    seed_sign = -1 if (seed_hit is not None and seed_hit < 0.5) else 1
+    sign, hit, n = save_regime(app, [], ad["regime_window"], ad["min_window"], seed_sign)
+    log(f"Regime-Seed: seed_sign={seed_sign} aus {len(flags)} hist. Fällen (hit={seed_hit}); Live-Buffer leer")
 
 
 # ---------- Wallet ----------
@@ -268,6 +277,7 @@ def watch(coins, app, cfg, ad):
         return 0
     st = load_regime(app)
     recent = json.loads(st["recent"]) if isinstance(st["recent"], str) else st["recent"]
+    seed_sign = st.get("seed_sign") if st.get("seed_sign") is not None else 1
     H = cfg["horizon_h"]; closed = 0
     import datetime as dt
     now = dt.datetime.now(dt.timezone.utc)
@@ -315,7 +325,7 @@ def watch(coins, app, cfg, ad):
             raw_side = p["side"] if p["regime_sign"] == 1 else ("short" if p["side"] == "long" else "long")
             recent.append(1 if raw_side == winning_side else 0)
         log(f"CLOSE {p['side']} {p['symbol']} {reason} pnl={pnl_pct:.2f}% ${pnl_usd:.3f}")
-    sign, hit, n = save_regime(app, recent, ad["regime_window"], ad["min_window"])
+    sign, hit, n = save_regime(app, recent, ad["regime_window"], ad["min_window"], seed_sign)
     if closed:
         log(f"watch: {closed} geschlossen, Regime sign={sign} hit={hit} n={n}")
     return closed
