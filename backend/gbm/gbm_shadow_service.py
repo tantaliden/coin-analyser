@@ -207,7 +207,7 @@ def wallet_apply(app, pnl_usd):
 
 
 # ---------- Scan (öffnen) ----------
-def scan(coins, app, cfg, sv, feat_cols, base, gate, sign):
+def scan(coins, app, cfg, sv, feat_cols, gate):
     market = recent_market(coins, cfg, sv["recent_fetch_minutes"] + max(cfg["windows"]) + 5)
     if market is None:
         log("kein Market-Frame — Scan übersprungen"); return 0
@@ -225,6 +225,8 @@ def scan(coins, app, cfg, sv, feat_cols, base, gate, sign):
     now = dt.datetime.now(dt.timezone.utc)
     size = float(json.load(open(SETTINGS))["gbm_predictor"]["dollar"]["trade_size_usd"])
     lev_cap = sv["leverage"]; tp, sl = cfg["tp"], cfg["sl"]
+    mom_idx = feat_cols.index(f"ret_{sv['momentum_window']}")
+    min_brk = float(sv["min_breakout_pct"])
     uni = coin_universe(coins, cfg)
     maxlev = max_leverage_map(coins, uni)
     opened = 0
@@ -243,13 +245,12 @@ def scan(coins, app, cfg, sv, feat_cols, base, gate, sign):
         Xrow, px = feat_vector(coins, sym, cfg, market, feat_cols, sv["recent_fetch_minutes"])
         if Xrow is None or px is None or px <= 0:
             continue
-        p_long = predict_long(base, Xrow)
+        # Gate (Modell) sagt OB ein Move kommt; Momentum-Richtung sagt WOHIN (mitlaufen)
         p_res = predict_long(gate, Xrow)
-        p_adj = p_long if sign == 1 else 1.0 - p_long
-        dir_conf = max(p_adj, 1 - p_adj)
-        if p_res < sv["gate_threshold"] or dir_conf < sv["dir_threshold"]:
+        mom = float(Xrow[0, mom_idx])           # Return über momentum_window in %
+        if p_res < sv["gate_threshold"] or abs(mom) < min_brk:
             continue
-        side = "long" if p_adj >= 0.5 else "short"
+        side = "long" if mom >= 0 else "short"
         if side == "long":
             tp_px = px * (1 + tp / 100); sl_px = px * (1 - sl / 100)
         else:
@@ -259,9 +260,9 @@ def scan(coins, app, cfg, sv, feat_cols, base, gate, sign):
             cur.execute("""INSERT INTO gbm_paper_positions
                 (symbol,side,entry_px,tp_px,sl_px,qty,margin_usd,dir_conf,p_resolve,regime_sign)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (sym, side, px, tp_px, sl_px, qty, size, dir_conf, p_res, sign))
+                (sym, side, px, tp_px, sl_px, qty, size, min(1.0, abs(mom) / 3.0), p_res, 0))
         app.commit(); opened += 1
-        log(f"OPEN {side} {sym} @ {px:.6g} conf={dir_conf:.3f} pres={p_res:.3f} lev={eff_lev} sign={sign}")
+        log(f"OPEN {side} {sym} @ {px:.6g} mom={mom:+.2f}% pres={p_res:.3f} lev={eff_lev}")
     return opened
 
 
@@ -325,8 +326,9 @@ def mtimes(paths):
 
 def main():
     s, g, cfg, sv, ad, paths = load_all()
-    log(f"GBM-Shadow start: gate>={sv['gate_threshold']} dir>={sv['dir_threshold']} "
-        f"max_open={sv['max_open']} regime=universe-estimator scan={sv['scan_interval_seconds']}s")
+    log(f"GBM-Shadow start: mode=momentum+gate gate>={sv['gate_threshold']} "
+        f"mom_window={sv['momentum_window']} min_breakout={sv['min_breakout_pct']}% "
+        f"max_open={sv['max_open']} scan={sv['scan_interval_seconds']}s")
     base = load_booster(paths["base_model"]); gate = load_booster(paths["gate_model"])
     feat_cols = json.load(open(paths["feat_meta"]))["feat_cols"]
     mt = mtimes(paths)
@@ -342,20 +344,17 @@ def main():
                 base = load_booster(paths["base_model"]); gate = load_booster(paths["gate_model"])
                 feat_cols = json.load(open(paths["feat_meta"]))["feat_cols"]
                 mt = mtimes(paths); log("Modelle neu geladen (Re-Training erkannt)")
-            # Regime-Vorzeichen periodisch aus dem GANZEN Universum schätzen (dicht, ungate-verzerrt)
-            if time.time() - last_regime >= ad["regime_refresh_seconds"]:
+            # Optional: Regime des Basis-Modells weiter mitloggen (treibt aber NICHT mehr den Handel)
+            if ad.get("regime_estimate_enabled") and time.time() - last_regime >= ad["regime_refresh_seconds"]:
                 sg, hit, ntot = estimate_regime(coins, cfg, base, feat_cols,
                                                 ad["regime_lookback_minutes"], ad["regime_settle_minutes"],
                                                 ad["regime_min_samples"])
                 if sg is not None:
                     set_regime(app, sg, hit, ntot)
-                    log(f"regime-estimate: sign={sg} hit={hit:.3f} n={ntot}")
-                else:
-                    log(f"regime-estimate: zu wenig Evidenz (n={ntot}) — Vorzeichen unverändert")
+                    log(f"regime-info: sign={sg} hit={hit:.3f} n={ntot} (nur Info)")
                 last_regime = time.time()
-            st = load_regime(app); sign = st["current_sign"]
             watch(coins, app, cfg, ad)
-            scan(coins, app, cfg, sv, feat_cols, base, gate, sign)
+            scan(coins, app, cfg, sv, feat_cols, gate)
         except Exception as e:
             log(f"loop error: {e}")
             try:
