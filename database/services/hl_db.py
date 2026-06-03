@@ -1,15 +1,29 @@
 """DB-Helper fuer HL-Ingestor. Keine Fallbacks — Fehler propagieren."""
 import json
+import time
+import logging
 import psycopg2
 from psycopg2.extras import execute_values
 
+log = logging.getLogger("hl_db")
 
-def get_conn(settings: dict):
+
+def get_conn(settings: dict, attempts: int = 10, backoff_seconds: float = 1.5):
+    """Reconnect-Loop: ein Postgres-Bounce darf den Ingestor nicht stilllegen.
+    Kein Fallback (keine Fake-Daten) — nur Wiederholversuch, sonst propagiert der Fehler."""
     db = settings["databases"]["coins"]
-    return psycopg2.connect(
-        host=db["host"], port=db["port"], dbname=db["name"],
-        user=db["user"], password=db["password"]
-    )
+    last_err = None
+    for i in range(attempts):
+        try:
+            return psycopg2.connect(
+                host=db["host"], port=db["port"], dbname=db["name"],
+                user=db["user"], password=db["password"]
+            )
+        except psycopg2.OperationalError as e:
+            last_err = e
+            log.warning("DB connect %d/%d fehlgeschlagen: %s", i + 1, attempts, e)
+            time.sleep(backoff_seconds)
+    raise last_err
 
 
 def insert_klines_10s(conn, rows):

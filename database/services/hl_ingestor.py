@@ -92,8 +92,13 @@ async def task_meta(cfg: dict, state: HLState, on_new_symbols, on_delisted):
                 "margin_table_id": u.get("marginTableId"),
                 "price_decimals": _price_decimals_from_str(mids[u["name"]]) if u["name"] in mids else None,
             } for u in active]
-            with get_conn(db_cfg) as conn:
-                upsert_meta(conn, rows)
+            # DB-Write entkoppelt: Subscriben kommt aus dem REST-universe, nicht aus der DB —
+            # ein Postgres-Bounce darf das initiale Subscriben NICHT verhindern.
+            try:
+                with get_conn(db_cfg) as conn:
+                    upsert_meta(conn, rows)
+            except Exception as e:
+                log.warning("upsert_meta fehlgeschlagen (Subscriben laeuft trotzdem): %s", e)
             new_syms = [r["symbol"] for r in rows if r["symbol"] not in state.subscribed]
             zombie_syms = sorted(s for s in state.subscribed if s in delisted_set)
             log.info("meta refresh: %d active, %d delisted (%d zombies subscribed), %d new",
@@ -102,9 +107,11 @@ async def task_meta(cfg: dict, state: HLState, on_new_symbols, on_delisted):
                 await on_new_symbols(new_syms)
             if zombie_syms:
                 await on_delisted(zombie_syms)
+            sleep_s = interval
         except Exception as e:
-            log.exception("meta task error: %s", e)
-        await asyncio.sleep(interval)
+            log.exception("meta task error: %s -- retry in 60s", e)
+            sleep_s = 60
+        await asyncio.sleep(sleep_s)
 
 
 async def task_ws(cfg: dict, state: HLState):
