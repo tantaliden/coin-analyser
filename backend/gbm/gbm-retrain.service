@@ -1,0 +1,8 @@
+[Unit]
+Description=GBM-Predictor tägliches Re-Training (frischer Cache + base/gate)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/coin
+ExecStart=/opt/coin/venv/bin/python3 -u /opt/coin/backend/gbm/train_models.py --rebuild

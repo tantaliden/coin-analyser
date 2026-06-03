@@ -29,6 +29,8 @@ def main():
     s = json.load(open("/opt/coin/settings.json"))
     paths = s["gbm_predictor"]["paths"]
     cache = paths["dataset_cache"]
+    if "--rebuild" in sys.argv and os.path.exists(cache):
+        os.remove(cache); log("Cache verworfen (--rebuild) — baue frisch")
     if os.path.exists(cache):
         d = np.load(cache, allow_pickle=True)
         X, y, fc = d["X"], d["y"], list(d["feat_cols"])
