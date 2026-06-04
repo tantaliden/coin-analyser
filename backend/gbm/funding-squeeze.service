@@ -1,0 +1,15 @@
+[Unit]
+Description=Funding-Squeeze Paper-Shadow (mechanischer Edge, kein Echtgeld)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/coin
+ExecStart=/opt/coin/venv/bin/python3 -u /opt/coin/backend/gbm/funding_squeeze_service.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
