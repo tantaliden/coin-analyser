@@ -2231,6 +2231,13 @@ def watch_pass_mh(s, mh_model, state_path):
                 if side != _want:
                     status = 'storm_close'; exit_px = cur_px
 
+            # Win/Loss nach realisiertem PnL (Volker 05.06.): der Observer zieht den Stop
+            # in den Gewinn nach -> ein SL-Treffer kann profitabel sein. Dann ist es ein WIN
+            # (Label + Lernen), nicht Loss. Massgeblich ist das PnL-Vorzeichen, nicht das Level.
+            if status in ('win', 'loss'):
+                _realized = ((exit_px - entry) / entry) if side == 'long' else ((entry - exit_px) / entry)
+                status = 'win' if _realized > 0 else 'loss'
+
             with app.cursor() as cur_a:
                 if status:
                     pnl_pct = ((exit_px - entry) / entry * 100) if side == 'long' else ((entry - exit_px) / entry * 100)
