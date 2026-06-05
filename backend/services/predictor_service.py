@@ -1299,6 +1299,22 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
             except Exception as e:
                 log.error("storm_warner eval (scan) failed: %s", e); storm_state = None
 
+        # Rate-Sperre (Volker 05.06.): max N Predictions pro rollendem Fenster.
+        # Alle Werte aus settings.predictor.rate_limit — kein Hardcode/Fallback.
+        rl_cfg = cfg.get("rate_limit")
+        rl_on = bool(rl_cfg and rl_cfg.get("enabled"))
+        rl_max = int(rl_cfg["max_predictions"]) if rl_on else 0
+        rl_recent = 0
+        if rl_on:
+            rl_window = int(rl_cfg["window_minutes"])
+            with app.cursor() as _cur_rl:
+                _cur_rl.execute("SELECT count(*) FROM open_predictions WHERE created_at > now() - make_interval(mins => %s)",
+                                (rl_window,))
+                rl_recent = _cur_rl.fetchone()[0]
+            if rl_recent >= rl_max:
+                log.info("RATE-LIMIT: %d/%d im %dmin-Fenster -> keine neuen Predictions diesen Pass",
+                         rl_recent, rl_max, rl_window)
+
         # Universe-level pre-computes für Sektor + Funding-Universe-Median
         sector_priority = cfg.get("sector_priority", [])
         coin_sector_map = build_coin_sector_map(app, uni, sector_priority)
@@ -1335,7 +1351,7 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
         n_workers = int(_n_w)
         stats_lock = _th.Lock()
         slot_lock = _th.Lock()
-        stats = {"cold_skip":0,"below":0,"no_mag":0,"filt":0,"storm":0,
+        stats = {"cold_skip":0,"below":0,"no_mag":0,"filt":0,"storm":0,"ratelimit":0,
                  "no_of":0,"no_fb":0,"no_sec":0,"no_bl":0,"matches":0,
                  "paper_traded":0,"paper_reserved":0,
                  "live_traded":0,"live_reserved":0}
@@ -1354,6 +1370,12 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
                         age = (datetime.now(timezone.utc) - last_close).total_seconds()
                         if age < cooldown:
                             return
+                    # Rate-Sperre: Fenster-Limit (rl_recent vor diesem Pass + matches dieses Passes).
+                    if rl_on:
+                        with stats_lock:
+                            if rl_recent + stats["matches"] >= rl_max:
+                                stats["ratelimit"] += 1
+                                return
 
                     rule_flags = {}
                     with coins_w.cursor(cursor_factory=RealDictCursor) as cur_w:
@@ -1572,10 +1594,10 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
             list(pool.map(_process_one, uni))
 
         log.info("scan: hl_open=%d max=%d quota_this_scan=%d paper_traded=%d live_traded=%d, %d preds geöffnet "
-                 "(n_obs=%d, workers=%d, cold=%d, below=%d, no_mag=%d, no_of=%d, no_fb=%d, no_sec=%d, no_bl=%d, filt=%d, storm=%d, stalker=%s min_s=%s)",
+                 "(n_obs=%d, workers=%d, cold=%d, below=%d, no_mag=%d, no_of=%d, no_fb=%d, no_sec=%d, no_bl=%d, filt=%d, storm=%d, ratelimit=%d, stalker=%s min_s=%s)",
                  hl_open_at_start, max_open, hl_quota_this_scan, stats["paper_traded"], stats["live_traded"], stats["matches"],
                  n_obs, n_workers, stats["cold_skip"], stats["below"], stats["no_mag"],
-                 stats["no_of"], stats["no_fb"], stats["no_sec"], stats["no_bl"], stats["filt"], stats["storm"],
+                 stats["no_of"], stats["no_fb"], stats["no_sec"], stats["no_bl"], stats["filt"], stats["storm"], stats["ratelimit"],
                  stalker_btc_regime if stalker_on else "off",
                  stalker_eff_min_samples if stalker_on else "-")
         matches = stats["matches"]
