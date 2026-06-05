@@ -54,6 +54,7 @@ from services.feature_sector import (build_coin_sector_map,
                                       compute_sector_close_pcts,
                                       compute_sector_features)
 from services.feature_whale import compute_whale_features
+from services.feature_reachability import check_reachability
 
 # Stalker (v5.1, 18.05.2026): pro-Coin Baseline + Cross-Coin + Coin-Identity
 from services.feature_baseline_dev import (
@@ -73,8 +74,24 @@ from services.feature_coin_identity import (
     feature_keys as stalker_identity_keys,
 )
 
+
+def _orderflow_kwargs(feat_cfg):
+    """compute_orderflow_features-kwargs aus predictor.features (vorher hardcoded).
+    Defaults = bisherige Hardcode-Werte, d.h. ohne settings-Eintrag unverändertes Verhalten."""
+    return dict(
+        lookback_short_s=int(feat_cfg.get("orderflow_lookback_short_s", 60)),
+        lookback_long_s=int(feat_cfg.get("orderflow_lookback_long_s", 300)),
+        min_snapshots_short=int(feat_cfg.get("orderflow_min_snapshots_short", 3)),
+        min_snapshots_long=int(feat_cfg.get("orderflow_min_snapshots_long", 10)),
+        spoof_max_lifetime_s=int(feat_cfg.get("orderflow_spoof_max_lifetime_s", 30)),
+        wall_factor=float(feat_cfg.get("orderflow_wall_factor", 2.0)),
+        velocity_window_s=int(feat_cfg.get("orderflow_velocity_window_s", 60)),
+    )
+
 # Paper-Trading-Engine (Variante B, 20.05.2026)
 from services.paper_engine import paper_open, paper_count_open, paper_watch
+# Sturm-Warner (Volker 05.06.2026) — BTC-Turbulenz-Gate + Positions-Schutz
+from services import storm_warner
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger("predictor")
@@ -1175,6 +1192,14 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
     """
     cfg = s["predictor"]
     mh_cfg = cfg.get("multi_head", {})
+    feat_cfg = cfg.get("features", {})
+    reach_cfg = cfg.get("reachability", {})
+    of_kw = _orderflow_kwargs(feat_cfg)
+    sec_kw = dict(
+        lookback_buckets=int(feat_cfg.get("sector_lookback_buckets", 61)),
+        min_buckets=int(feat_cfg.get("sector_min_buckets", 16)),
+    )
+    whale_lookback_min = int(feat_cfg.get("whale_lookback_minutes", 15))
     rules = cfg.get("rules", [])
     lookback = cfg["lookback_minutes"]
     cooldown = cfg.get("cooldown_seconds_per_symbol", 300)
@@ -1193,6 +1218,7 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
     tp_safety = float(mh_cfg.get("tp_safety_factor", 0.6))
     sl_safety = float(mh_cfg.get("sl_safety_factor", 1.3))
     min_tp_pct = float(mh_cfg.get("min_tp_pct", 0.5))
+    tp_peak_share = float(mh_cfg.get("tp_peak_share", 0.8))  # TP = 80% des erwarteten Peaks (Volker 28.05.)
     max_sl_pct = float(mh_cfg.get("max_sl_pct", 2.5))
     _mtp = mh_cfg.get("max_tp_pct")  # Sanity-Cap gegen Magnitude-Regressor-Explosion (Billionen %)
     if _mtp is None:
@@ -1258,10 +1284,25 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
             log.error("FALLBACK_TRIGGERED scan_pass_mh: load_btc_moves None -> scan-pass abgebrochen")
             return 0
 
+        # Sturm-Warner einmal pro Pass (stateless, BTC-basiert). Alle Werte aus
+        # settings.predictor.storm_warner — kein Hardcode. Block fehlt/disabled -> Feature aus.
+        sw_cfg = cfg.get("storm_warner")
+        storm_gate_new = bool(sw_cfg and sw_cfg.get("enabled") and sw_cfg.get("gate_new_entries"))
+        storm_state = None
+        if sw_cfg and sw_cfg.get("enabled"):
+            try:
+                storm_state = storm_warner.evaluate(coins, sw_cfg)
+                if storm_state["phase"] != "calm":
+                    log.info("STORM-WARNER scan: phase=%s dir=%s vola=%s volr=%s minutes=%s",
+                             storm_state["phase"], storm_state["clarified_dir"],
+                             storm_state["vola"], storm_state["volr"], storm_state["minutes_in_storm"])
+            except Exception as e:
+                log.error("storm_warner eval (scan) failed: %s", e); storm_state = None
+
         # Universe-level pre-computes für Sektor + Funding-Universe-Median
         sector_priority = cfg.get("sector_priority", [])
         coin_sector_map = build_coin_sector_map(app, uni, sector_priority)
-        sector_stats, coin_pcts = compute_sector_close_pcts(coins, coin_sector_map)
+        sector_stats, coin_pcts = compute_sector_close_pcts(coins, coin_sector_map, **sec_kw)
         universe_funding_median = compute_universe_funding_median(coins, uni)
         whale_enabled = bool(cfg.get("whale_tracker", {}).get("enabled", False))
 
@@ -1294,7 +1335,7 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
         n_workers = int(_n_w)
         stats_lock = _th.Lock()
         slot_lock = _th.Lock()
-        stats = {"cold_skip":0,"below":0,"no_mag":0,"filt":0,
+        stats = {"cold_skip":0,"below":0,"no_mag":0,"filt":0,"storm":0,
                  "no_of":0,"no_fb":0,"no_sec":0,"no_bl":0,"matches":0,
                  "paper_traded":0,"paper_reserved":0,
                  "live_traded":0,"live_reserved":0}
@@ -1326,7 +1367,7 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
                     feat = feature_snapshot_v2(coins_w, sym, rule_flags=rule_flags, btc_moves=btc_moves)
                     if feat is None: return
 
-                    of_feat = compute_orderflow_features(coins_w, sym)
+                    of_feat = compute_orderflow_features(coins_w, sym, **of_kw)
                     if of_feat is None: _bump("no_of"); return
                     feat.update(of_feat)
 
@@ -1339,7 +1380,7 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
                     feat.update(sec_feat)
 
                     if whale_enabled:
-                        wh_feat = compute_whale_features(app_w, sym)
+                        wh_feat = compute_whale_features(app_w, sym, lookback_minutes=whale_lookback_min)
                         if wh_feat: feat.update(wh_feat)
 
                     if stalker_on:
@@ -1394,9 +1435,12 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
                     return
                 tp_raw = float(cs_tp); sl_raw = float(cs_sl)
 
-            # TP-Höhe: selbst-kalibrierter Erreichbarkeits-Faktor je Side (v6) statt festem
-            # tp_safety. Der Regelkreis in register_tp_reach justiert ihn auf 80% Trefferquote.
-            tp_pct = tp_raw * mh_model.get_tp_reach_factor(side)
+            # TP-Höhe (v7, Volker 28.05.): TP = 80% des erwarteten Peaks (tp_peak_share).
+            # Statt dem Erreichbarkeits-Regelkreis, der den Faktor auf 0,2 kollabieren ließ
+            # (Mikro-TP am Floor). Der Peak (tp_raw) kommt aus dem Magnitude-Regressor; 80%
+            # davon ist das TP. Zusammen mit min_tp_pct (echte Mindestgewinn-Schwelle) werden
+            # nur Setups mit ausreichendem Potential getradet -> weniger, größere Trades.
+            tp_pct = tp_raw * tp_peak_share
             # SL-Höhe: selbst-kalibrierter Überlebens-Faktor (v6.1) statt festem sl_safety.
             # register_sl_reach justiert ihn auf die Return-Grenze (survive_target der Gewinner).
             # Hart-Untergrenze sl_pct_floor (v6.5, Volker 26.05.): verhindert dass das gelernte
@@ -1407,6 +1451,11 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
                 log.error("FALLBACK_TRIGGERED scan_pass_mh: predictor.multi_head.sl_pct_floor fehlt -> coin skip")
                 _bump("filt"); return
             sl_pct = max(sl_raw * mh_model.get_sl_reach_factor(side), float(sl_pct_floor))
+            # Hart-Obergrenze sl_pct_cap (optional, Volker 31.05.): begrenzt das SL nach oben.
+            # Wenn Key fehlt -> kein Cap (kein Fallback, explizit). Wenn gesetzt: SL ≤ cap.
+            _slc = mh_cfg.get("sl_pct_cap")
+            if _slc is not None:
+                sl_pct = min(sl_pct, float(_slc))
 
             if cold_start_active:
                 cs_tp = float(mh_cfg.get("cold_start_tp_raw_pct"))
@@ -1416,6 +1465,27 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
                 if tp_pct > max_tp_pct: tp_pct = cs_tp * tp_safety
             elif tp_pct < min_tp_pct or tp_pct > max_tp_pct or sl_pct > max_sl_pct:
                 _bump("filt"); return
+
+            # Sturm-Warner-Gate (Volker 05.06.): waiting -> gar keine neuen Trades;
+            # clarified -> nur Entries MIT der geklaerten BTC-Richtung. Greift fuer
+            # Paper UND Echtgeld (vor open_prediction/try_auto_trade).
+            if storm_state is not None and storm_gate_new:
+                _ph = storm_state["phase"]
+                if _ph == "waiting":
+                    _bump("storm"); return
+                if _ph == "clarified":
+                    _want = 'long' if storm_state["clarified_dir"] == 1 else 'short'
+                    if side != _want:
+                        _bump("storm"); return
+
+            # Erreichbarkeits-Kopf (Easy-Run-Filter, 29.05.): nur deployen wenn in der
+            # Coin-Historie vergleichbare Vorboten zu >= reach_rate_target das peak_share×Peak-TP
+            # erreichten UND nah am realen Peak lagen. Gated (default AUS), nicht im Cold-Start
+            # (der soll breit lernen). tp_raw = erwarteter Peak (vor peak_share).
+            if reach_cfg.get("enabled") and not cold_start_active:
+                reach = check_reachability(coins_w, sym, side, tp_raw, reach_cfg)
+                if reach is None or not reach.get('pass'):
+                    _bump("reach"); return
 
             with coins_w.cursor(cursor_factory=RealDictCursor) as cur_w:
                 cur_w.execute("SELECT close FROM agg_1m WHERE symbol=%s ORDER BY bucket DESC LIMIT 1", (sym,))
@@ -1502,10 +1572,10 @@ def scan_pass_mh(s, mh_model, rng, mh_model_lock):
             list(pool.map(_process_one, uni))
 
         log.info("scan: hl_open=%d max=%d quota_this_scan=%d paper_traded=%d live_traded=%d, %d preds geöffnet "
-                 "(n_obs=%d, workers=%d, cold=%d, below=%d, no_mag=%d, no_of=%d, no_fb=%d, no_sec=%d, no_bl=%d, filt=%d, stalker=%s min_s=%s)",
+                 "(n_obs=%d, workers=%d, cold=%d, below=%d, no_mag=%d, no_of=%d, no_fb=%d, no_sec=%d, no_bl=%d, filt=%d, storm=%d, stalker=%s min_s=%s)",
                  hl_open_at_start, max_open, hl_quota_this_scan, stats["paper_traded"], stats["live_traded"], stats["matches"],
                  n_obs, n_workers, stats["cold_skip"], stats["below"], stats["no_mag"],
-                 stats["no_of"], stats["no_fb"], stats["no_sec"], stats["no_bl"], stats["filt"],
+                 stats["no_of"], stats["no_fb"], stats["no_sec"], stats["no_bl"], stats["filt"], stats["storm"],
                  stalker_btc_regime if stalker_on else "off",
                  stalker_eff_min_samples if stalker_on else "-")
         matches = stats["matches"]
@@ -1954,7 +2024,7 @@ def backfill_hindsight(s, bandit, scaler):
                 if n > 0: n_preds += 1
 
                 # Wallet aktualisieren (netto: pnl - slippage)
-                eff_lev = int(p.get('effective_leverage') or 5)
+                eff_lev = int(p.get('effective_leverage') or s["predictor"].get("trading", {}).get("default_leverage", 5))
                 pnl_pct_real = float(p.get('pnl_pct') or 0.0)
                 gross = pnl_pct_real / 100.0 * eff_lev * margin
                 slip = (eff_lev * margin) * slip_pct / 100.0
@@ -2054,6 +2124,15 @@ def watch_pass_mh(s, mh_model, state_path):
             opens = cur_a.fetchall()
         if not opens: return 0
 
+        # Sturm-Schutz einmal pro Watch-Pass (settings-getrieben, kein Hardcode).
+        sw_cfg = cfg.get("storm_warner")
+        storm_protect = None
+        if sw_cfg and sw_cfg.get("enabled") and sw_cfg.get("protect_open_positions"):
+            try:
+                storm_protect = storm_warner.evaluate(coins, sw_cfg)
+            except Exception as e:
+                log.error("storm_warner eval (watch) failed: %s", e); storm_protect = None
+
         symbols = list({o['symbol'] for o in opens})
         with coins.cursor(cursor_factory=RealDictCursor) as cur_c:
             cur_c.execute("""
@@ -2120,6 +2199,16 @@ def watch_pass_mh(s, mh_model, state_path):
             if status is None and age_h >= timeout_h:
                 status = 'timeout'; exit_px = cur_px
 
+            # Sturm-Schutz (Volker 05.06.): offene Position GEGEN die geklaerte Sturm-
+            # Richtung bei Markt schliessen (Schadensbegrenzung der laufenden Bewegung).
+            # Eigener Status storm_close -> NICHT ins Richtungs-Lernen (sonst register_outcome
+            # ValueError) und im Paper via paper_watch gespiegelt. Echtgeld (trader_positions)
+            # waere hier zu schliessen, sobald auto_trade live ist (aktuell auto_trade=false).
+            if status is None and storm_protect is not None and storm_protect["phase"] == "clarified":
+                _want = 'long' if storm_protect["clarified_dir"] == 1 else 'short'
+                if side != _want:
+                    status = 'storm_close'; exit_px = cur_px
+
             with app.cursor() as cur_a:
                 if status:
                     pnl_pct = ((exit_px - entry) / entry * 100) if side == 'long' else ((entry - exit_px) / entry * 100)
@@ -2132,7 +2221,8 @@ def watch_pass_mh(s, mh_model, state_path):
                         WHERE id=%s AND status='open'
                     """, (status, exit_px, pnl_pct, cur_px, peak_px, trough_px, o['id']))
                     # Multi-Head-Learn nur fuer multi_head-Trades (keine resync_hl).
-                    if o.get('source') == 'multi_head':
+                    # storm_close ist KEIN Richtungs-Ergebnis -> nicht lernen (register_outcome wirft sonst).
+                    if o.get('source') == 'multi_head' and status in ('win', 'loss', 'timeout'):
                         closes.append({
                             'id': o['id'], 'symbol': o['symbol'], 'side': side,
                             'entry': entry, 'exit': exit_px, 'pnl_pct': pnl_pct,
@@ -2144,7 +2234,7 @@ def watch_pass_mh(s, mh_model, state_path):
                     # Virtuelle Wallet aktualisieren — Bandit lernt Drawdown.
                     # Slippage (taker+maker, ca 0.1%) wird vom Brutto abgezogen
                     # damit Wallet-Verlauf realistisch ist.
-                    eff_lev = int(o.get('effective_leverage') or 5)
+                    eff_lev = int(o.get('effective_leverage') or s["predictor"].get("trading", {}).get("default_leverage", 5))
                     notional = eff_lev * vwallet_margin
                     gross_pnl = pnl_pct / 100.0 * eff_lev * vwallet_margin
                     slip_dollar = notional * vwallet_slip / 100.0
@@ -2290,6 +2380,7 @@ def process_due_mh_hindsight(s, mh_model, state_path, batch_size=20):
     default_lev = int(cfg.get("trading", {}).get("default_leverage", 5))
     profit_scale = float(mh_cfg.get("profit_weight_scale", 1.0))
     flat_skip = float(mh_cfg.get("flat_skip_threshold_pct", 0.2))
+    profit_max_repeats = int(mh_cfg.get("profit_weight_max_repeats", 5))
 
     n_learned = 0
     with db_app(s) as app, db_coins(s) as coins:
@@ -2427,6 +2518,7 @@ def process_due_mh_hindsight(s, mh_model, state_path, batch_size=20):
                         net_margin_pct=net_margin_pct,
                         profit_weight_scale=profit_scale,
                         flat_skip_threshold_pct=flat_skip,
+                        profit_weight_max_repeats=profit_max_repeats,
                     )
                     n_learned += 1
                     log.info("HINDSIGHT-LEARN %s id=%s side=%s status=%s "
@@ -3657,7 +3749,7 @@ def _evaluate_coin_reeval(coins, app, sym, cfg, mh_model, mh_model_lock, btc_mov
 
     feat = feature_snapshot_v2(coins, sym, rule_flags=rule_flags, btc_moves=btc_moves)
     if feat is None: return None
-    of = compute_orderflow_features(coins, sym)
+    of = compute_orderflow_features(coins, sym, **_orderflow_kwargs(cfg.get("features", {})))
     if of is None: return None
     feat.update(of)
     fb = compute_funding_features(coins, sym, uni_ctx["funding_median"])
@@ -3667,7 +3759,7 @@ def _evaluate_coin_reeval(coins, app, sym, cfg, mh_model, mh_model_lock, btc_mov
     if sec is None: return None
     feat.update(sec)
     if uni_ctx["whale_enabled"]:
-        wh = compute_whale_features(app, sym)
+        wh = compute_whale_features(app, sym, lookback_minutes=int(cfg.get("features", {}).get("whale_lookback_minutes", 15)))
         if wh: feat.update(wh)
     if stalker_on:
         bl = compute_baseline_dev_features(coins, app, sym, stalker_cfg,
@@ -3697,7 +3789,7 @@ def _build_observer_uni_ctx(coins, app, cfg, symbols):
     """Universe-Kontext fuer die Re-Eval (Sektor/Funding/Stalker) — 1x pro Tick."""
     sector_priority = cfg.get("sector_priority", [])
     sector_map = build_coin_sector_map(app, symbols, sector_priority)
-    sector_stats, coin_pcts = compute_sector_close_pcts(coins, sector_map)
+    sector_stats, coin_pcts = compute_sector_close_pcts(coins, sector_map, lookback_buckets=int(cfg.get("features", {}).get("sector_lookback_buckets", 61)), min_buckets=int(cfg.get("features", {}).get("sector_min_buckets", 16)))
     uni_ctx = {
         "sector_map": sector_map, "sector_stats": sector_stats, "coin_pcts": coin_pcts,
         "funding_median": compute_universe_funding_median(coins, symbols),
@@ -3939,6 +4031,14 @@ def main():
         except Exception as e:
             log.warning("Multi-Head load failed (%s), fresh start", e)
             mh_model = None
+    if mh_model is None and os.path.exists(state_path):
+        # GAU-Schutz: ein bestehendes (nicht ladbares / versions-fremdes) Modell NIE
+        # blind überschreiben. Erst zur Seite retten, damit Gelerntes rettbar bleibt.
+        import shutil
+        from datetime import datetime as _dt, timezone as _tz
+        rescue = f"{state_path}.rescue_{_dt.now(_tz.utc).strftime('%Y%m%d_%H%M%S')}"
+        shutil.copy2(state_path, rescue)
+        log.error("FRESH-START wuerde bestehendes Modell ueberschreiben — gerettet nach %s", rescue)
     if mh_model is None:
         mh_model = MultiHeadPredictor(
             seed=seed,

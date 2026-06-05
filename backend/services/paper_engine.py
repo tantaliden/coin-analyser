@@ -85,14 +85,14 @@ def paper_watch(app_conn, coins_conn, cfg, timeout_h):
     dem geteilten Exit. coins_conn/timeout_h bleiben in der Signatur (Aufruf-Kompat),
     werden aber nicht mehr gebraucht. Gibt Anzahl Closes zurueck."""
     slip_pct = float(cfg.get("paper_wallet", {}).get("slippage_pct_per_trade") or 0.0)
-    reason_map = {'win': 'tp', 'loss': 'sl', 'timeout': 'timeout'}
+    reason_map = {'win': 'tp', 'loss': 'sl', 'timeout': 'timeout', 'storm_close': 'storm'}
     with app_conn.cursor() as cur:
         cur.execute("""
             SELECT pp.id, pp.symbol, pp.side, pp.entry_px, pp.leverage, pp.margin_usd,
                    op.status, op.exit_px, pp.tp_px, pp.sl_px
             FROM paper_positions pp
             JOIN open_predictions op ON op.id = pp.prediction_id
-            WHERE pp.status='open' AND op.status IN ('win','loss','timeout')
+            WHERE pp.status='open' AND op.status IN ('win','loss','timeout','storm_close')
         """)
         rows = cur.fetchall()
     if not rows:
