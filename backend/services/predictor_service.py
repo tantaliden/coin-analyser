@@ -4027,9 +4027,35 @@ def observer_reeval(s, mh_model, mh_model_lock):
 # Main
 # =============================================================================
 
+def validate_predictor_settings(s):
+    """Startup-Check (Volker 07.06.): erzwingt 'kein stiller Fallback'. Jeder Pflicht-Key
+    aus dem Manifest MUSS in settings.predictor stehen — fehlt einer, lauter Abbruch
+    statt stillem Default. Manifest: predictor_settings_manifest.json (aus Code generiert)."""
+    import os as _os
+    mpath = _os.path.join(_os.path.dirname(__file__), "predictor_settings_manifest.json")
+    if not _os.path.exists(mpath):
+        log.error("SETTINGS-MANIFEST fehlt (%s) -> Check übersprungen", mpath); return
+    manifest = json.load(open(mpath))
+    pred = s.get("predictor", {})
+    missing = []
+    for block_path, keys in manifest.items():
+        node = pred
+        for seg in block_path.split("."):
+            node = node.get(seg, {}) if isinstance(node, dict) else {}
+        for k in keys:
+            if not isinstance(node, dict) or k not in node:
+                missing.append(f"predictor.{block_path}.{k}".replace("..", "."))
+    if missing:
+        for m in missing:
+            log.error("SETTINGS-PFLICHTKEY FEHLT: %s (kein stiller Fallback -> Abbruch)", m)
+        raise RuntimeError(f"settings unvollständig: {len(missing)} Pflicht-Keys fehlen: {missing}")
+    log.info("Settings-Check OK: %d Pflicht-Keys vorhanden", sum(len(v) for v in manifest.values()))
+
+
 def main():
     global FEATURE_KEYS, N_FEAT, MODIFY_FEATURE_KEYS, N_FEAT_MODIFY
     s = load_settings()
+    validate_predictor_settings(s)
     cfg = s["predictor"]
     if not cfg.get("enabled"):
         log.info("predictor disabled in settings, exit"); return

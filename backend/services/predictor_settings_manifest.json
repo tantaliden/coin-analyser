@@ -1,0 +1,100 @@
+{
+ "multi_head": [
+  "cold_start_max_per_scan",
+  "cold_start_min_n",
+  "cold_start_sl_raw_pct",
+  "cold_start_threshold",
+  "cold_start_tp_raw_pct",
+  "direction_model_type",
+  "flat_skip_threshold_pct",
+  "grace_period",
+  "hindsight_extended_minutes",
+  "max_open_predictions",
+  "max_sl_pct",
+  "max_tp_pct",
+  "min_direction_confidence",
+  "min_n_for_predict",
+  "min_tp_pct",
+  "n_models_direction",
+  "profit_weight_max_repeats",
+  "profit_weight_scale",
+  "scan_workers",
+  "seed",
+  "sl_pct_floor",
+  "sl_safety_factor",
+  "state_path",
+  "timeout_correct_weight",
+  "timeout_flat_threshold_pct",
+  "timeout_wrong_weight",
+  "tp_peak_share",
+  "tp_safety_factor"
+ ],
+ "stalker": [
+  "enabled"
+ ],
+ "observer": [
+  "btc_move_threshold_pct",
+  "check_interval_seconds",
+  "coin_drop",
+  "enabled",
+  "exit_confidence",
+  "reeval_cooldown_minutes",
+  "reeval_min_age_minutes",
+  "reference_coin",
+  "window_minutes"
+ ],
+ "observer.coin_drop": [
+  "enabled"
+ ],
+ "features": [
+  "orderflow_lookback_long_s",
+  "orderflow_lookback_short_s",
+  "orderflow_min_snapshots_long",
+  "orderflow_min_snapshots_short",
+  "orderflow_spoof_max_lifetime_s",
+  "orderflow_velocity_window_s",
+  "orderflow_wall_factor",
+  "sector_lookback_buckets",
+  "sector_min_buckets",
+  "whale_lookback_minutes"
+ ],
+ "storm_warner": [
+  "enabled",
+  "gate_new_entries",
+  "protect_open_positions"
+ ],
+ "modify_bandit": [
+  "enabled",
+  "exploration_decay_per_decision",
+  "exploration_floor",
+  "exploration_init",
+  "interval_seconds",
+  "min_open_age_seconds",
+  "prior_alpha",
+  "state_path"
+ ],
+ "modify_bandit.reward": [
+  "reward_timeout_mult_neg",
+  "reward_timeout_mult_pos"
+ ],
+ "bandit": [
+  "backfill_closed_at_cutoff",
+  "hindsight_extended_minutes",
+  "reward_mult_tiers",
+  "reward_skip",
+  "reward_time_penalty_per_hour",
+  "reward_timeout_mult_neg",
+  "reward_timeout_mult_pos"
+ ],
+ "virtual_wallet": [
+  "margin_per_trade",
+  "slippage_pct_per_trade",
+  "start_balance"
+ ],
+ "rate_limit": [
+  "enabled"
+ ],
+ "reachability": [
+  "enabled"
+ ]
+}
