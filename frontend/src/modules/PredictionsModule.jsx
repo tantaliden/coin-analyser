@@ -296,6 +296,45 @@ export default function PredictionsModule() {
   )
 }
 
+function GenericField({ label, value, onChange }) {
+  const t = typeof value
+  if (t === 'boolean')
+    return (<div className="flex items-center gap-2 my-0.5"><label className="text-gray-300 text-xs flex-1 truncate" title={label}>{label}</label>
+      <input type="checkbox" checked={value} onChange={e => onChange(e.target.checked)} /></div>)
+  if (Array.isArray(value))
+    return (<div className="flex items-center gap-2 my-0.5"><label className="text-gray-300 text-xs flex-1 truncate" title={label}>{label}</label>
+      <input className="bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs text-gray-200 w-72" defaultValue={JSON.stringify(value)}
+        onBlur={e => { try { onChange(JSON.parse(e.target.value)) } catch (x) {} }} title="JSON" /></div>)
+  if (t === 'number')
+    return (<div className="flex items-center gap-2 my-0.5"><label className="text-gray-300 text-xs flex-1 truncate" title={label}>{label}</label>
+      <input type="number" step="any" className="bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs text-gray-200 w-36"
+        value={value} onChange={e => onChange(e.target.value === '' ? null : parseFloat(e.target.value))} /></div>)
+  return (<div className="flex items-center gap-2 my-0.5"><label className="text-gray-300 text-xs flex-1 truncate" title={label}>{label}</label>
+    <input type="text" className="bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs text-gray-200 w-72"
+      value={value ?? ''} onChange={e => onChange(e.target.value)} /></div>)
+}
+
+function GenericEditor({ data, path = '', onSet }) {
+  if (data == null || typeof data !== 'object') return null
+  return (
+    <div style={{ marginLeft: path ? 10 : 0 }}>
+      {Object.keys(data).map((k) => {
+        const v = data[k]
+        const p = path ? `${path}.${k}` : k
+        if (v != null && typeof v === 'object' && !Array.isArray(v)) {
+          return (
+            <details key={p} open className="my-1 border-l border-gray-700 pl-2">
+              <summary className="cursor-pointer text-cyan-300 text-xs font-semibold">{k}</summary>
+              <GenericEditor data={v} path={p} onSet={onSet} />
+            </details>
+          )
+        }
+        return <GenericField key={p} label={k} value={v} onChange={(nv) => onSet(p, nv)} />
+      })}
+    </div>
+  )
+}
+
 function SettingsModal({ onClose, onSaved }) {
   const [cfg, setCfg] = useState(null)
   const [err, setErr] = useState(null)
@@ -383,223 +422,8 @@ function SettingsModal({ onClose, onSaved }) {
         </div>
         {err && <div className="bg-red-900/40 text-red-300 p-2 rounded mb-2 text-sm">{err}</div>}
 
-        <Section title="Predictor v5 (Multi-Head: DirectionClassifier + 2× MagnitudeRegressor)">
-          <Field label="Min. Direction-Confidence (target nach Cold-Start)">
-            <NumInput value={num('multi_head.min_direction_confidence', 0.95)} step="0.01" min="0.5" max="0.999"
-              onChange={v => set('multi_head.min_direction_confidence', parseFloat(v))} />
-          </Field>
-          <Field label="Max. gleichzeitige Predictions">
-            <NumInput value={num('multi_head.max_open_predictions', 50)} step="1" min="1" max="500"
-              onChange={v => set('multi_head.max_open_predictions', parseInt(v))} />
-          </Field>
-          <Field label="Min. TP-% (Schwelle, kleiner: skip)">
-            <NumInput value={num('multi_head.min_tp_pct', 0.5)} step="0.1" min="0.1" max="10"
-              onChange={v => set('multi_head.min_tp_pct', parseFloat(v))} />
-          </Field>
-          <Field label="Max. SL-% (Risiko-Cap, größer: skip)">
-            <NumInput value={num('multi_head.max_sl_pct', 2.5)} step="0.1" min="0.5" max="20"
-              onChange={v => set('multi_head.max_sl_pct', parseFloat(v))} />
-          </Field>
-          <Field label="TP Safety-Factor (× Predicted-Peak)">
-            <NumInput value={num('multi_head.tp_safety_factor', 0.6)} step="0.05" min="0.1" max="2"
-              onChange={v => set('multi_head.tp_safety_factor', parseFloat(v))} />
-          </Field>
-          <Field label="SL Safety-Factor (× Predicted-Trough)">
-            <NumInput value={num('multi_head.sl_safety_factor', 1.3)} step="0.05" min="0.5" max="3"
-              onChange={v => set('multi_head.sl_safety_factor', parseFloat(v))} />
-          </Field>
-          <Field label="Cold-Start: min N für Random→Modell-Switch">
-            <NumInput value={num('multi_head.cold_start_min_n', 200)} step="10" min="0" max="10000"
-              onChange={v => set('multi_head.cold_start_min_n', parseInt(v))} />
-          </Field>
-          <Field label="Cold-Start: threshold während Lern-Phase">
-            <NumInput value={num('multi_head.cold_start_threshold', 0.5)} step="0.05" min="0" max="1"
-              onChange={v => set('multi_head.cold_start_threshold', parseFloat(v))} />
-          </Field>
-          <Field label="Cold-Start: Max Predictions / Scan">
-            <NumInput value={num('multi_head.cold_start_max_per_scan', 10)} step="1" min="1" max="200"
-              onChange={v => set('multi_head.cold_start_max_per_scan', parseInt(v))} />
-          </Field>
-          <Field label="Cold-Start: TP-Magnitude in % (raw, vor safety)">
-            <NumInput value={num('multi_head.cold_start_tp_raw_pct', 1.5)} step="0.1" min="0.1" max="10"
-              onChange={v => set('multi_head.cold_start_tp_raw_pct', parseFloat(v))} />
-          </Field>
-          <Field label="Cold-Start: SL-Magnitude in % (raw, vor safety)">
-            <NumInput value={num('multi_head.cold_start_sl_raw_pct', 1.0)} step="0.1" min="0.1" max="10"
-              onChange={v => set('multi_head.cold_start_sl_raw_pct', parseFloat(v))} />
-          </Field>
-          <Field label="Timeout (Min)">
-            <NumInput value={Math.round(num('timeout_hours', 1) * 60)} step="15" min="15" max="10080"
-              onChange={v => set('timeout_hours', parseInt(v) / 60)} />
-          </Field>
-          <Field label="Cooldown pro Symbol (s)">
-            <NumInput value={num('cooldown_seconds_per_symbol', 300)} step="60" min="0" max="86400"
-              onChange={v => set('cooldown_seconds_per_symbol', parseInt(v))} />
-          </Field>
-          <Field label="Universe Top-N (Coins nach Volume)">
-            <NumInput value={num('universe_top_n', 200)} step="10" min="10" max="500"
-              onChange={v => set('universe_top_n', parseInt(v))} />
-          </Field>
-          <Field label="Scan-Pass-Intervall (s) — wie oft neue Predictions geprüft">
-            <NumInput value={num('scan_interval_seconds', 60)} step="1" min="1" max="3600"
-              onChange={v => set('scan_interval_seconds', parseInt(v))} />
-          </Field>
-          <Field label="Watch-Pass-Intervall (s) — wie oft TP/SL geprüft wird">
-            <NumInput value={num('watch_interval_seconds', 1)} step="1" min="1" max="60"
-              onChange={v => set('watch_interval_seconds', parseInt(v))} />
-          </Field>
-
-          <div style={{gridColumn: '1 / -1', marginTop: 8, fontSize: 12, color: '#9ca3af'}}>
-            Lern-Gewichte (Multi-Head Direction-Classifier):
-          </div>
-          <Field label="Loss-Weight (falsche Richtung: härter)">
-            <NumInput value={num('multi_head.loss_weight', 1.0)} step="0.5" min="0" max="10"
-              onChange={v => set('multi_head.loss_weight', parseFloat(v))} />
-          </Field>
-          <Field label="Win-Weight (richtige Richtung)">
-            <NumInput value={num('multi_head.win_weight', 1.0)} step="0.5" min="0" max="10"
-              onChange={v => set('multi_head.win_weight', parseFloat(v))} />
-          </Field>
-          <Field label="Timeout-Wrong-Weight (Drift in Gegenrichtung)">
-            <NumInput value={num('multi_head.timeout_wrong_weight', 1.0)} step="0.5" min="0" max="10"
-              onChange={v => set('multi_head.timeout_wrong_weight', parseFloat(v))} />
-          </Field>
-          <Field label="Timeout-Correct-Weight (Drift in Predict-Richtung)">
-            <NumInput value={num('multi_head.timeout_correct_weight', 0.3)} step="0.1" min="0" max="2"
-              onChange={v => set('multi_head.timeout_correct_weight', parseFloat(v))} />
-          </Field>
-          <Field label="Timeout-Flat-Threshold % (drunter: skip-label)">
-            <NumInput value={num('multi_head.timeout_flat_threshold_pct', 0.3)} step="0.05" min="0.05" max="2"
-              onChange={v => set('multi_head.timeout_flat_threshold_pct', parseFloat(v))} />
-          </Field>
-        </Section>
-
-        <Section title="Stalker-Predictor (pro-Coin Baseline + Cross-Coin + Coin-Identity)">
-          <Field label="Aktiv">
-            <input type="checkbox" checked={!!stalker.enabled}
-              onChange={e => set('stalker.enabled', e.target.checked)} />
-          </Field>
-          <Field label="Baseline-Refresh (h)">
-            <NumInput value={num('stalker.baseline_refresh_hours', 24)} step="1" min="1" max="168"
-              onChange={v => set('stalker.baseline_refresh_hours', parseInt(v))} />
-          </Field>
-          <Field label="Baseline-Lookback (Tage)">
-            <NumInput value={num('stalker.baseline_lookback_days', 14)} step="1" min="3" max="90"
-              onChange={v => set('stalker.baseline_lookback_days', parseInt(v))} />
-          </Field>
-          <Field label="Min-Samples Schedule (Format: Tage:Wert — Komma-Liste, z.B. 0:2, 7:3, 14:5, 30:10)">
-            <input type="text"
-              defaultValue={(stalker.baseline_min_samples_schedule || []).map(s => `${s.after_days_data}:${s.value}`).join(', ')}
-              onBlur={e => {
-                const items = e.target.value.split(',').map(s => s.trim()).filter(Boolean).map(s => {
-                  const [d, v] = s.split(':').map(p => parseInt(p.trim()))
-                  return (isNaN(d) || isNaN(v)) ? null : { after_days_data: d, value: v }
-                }).filter(Boolean)
-                set('stalker.baseline_min_samples_schedule', items)
-              }}
-              className="w-full bg-gray-800 px-2 py-1.5 rounded border border-gray-600 text-xs"/>
-          </Field>
-          <Field label="BTC-Regime Fenster (h)">
-            <NumInput value={num('stalker.btc_regime.source_window_hours', 4)} step="1" min="1" max="48"
-              onChange={v => set('stalker.btc_regime.source_window_hours', parseInt(v))} />
-          </Field>
-          <Field label="BTC-Bull Schwelle (% Change)">
-            <NumInput value={num('stalker.btc_regime.bull_threshold_pct', 1.0)} step="0.1" min="0" max="20"
-              onChange={v => set('stalker.btc_regime.bull_threshold_pct', parseFloat(v))} />
-          </Field>
-          <Field label="BTC-Bear Schwelle (% Change)">
-            <NumInput value={num('stalker.btc_regime.bear_threshold_pct', -1.0)} step="0.1" min="-20" max="0"
-              onChange={v => set('stalker.btc_regime.bear_threshold_pct', parseFloat(v))} />
-          </Field>
-          <Field label="Cross-Coin Reference (Komma-Liste)">
-            <input type="text"
-              defaultValue={(stalkerCross.reference_coins || []).join(', ')}
-              onBlur={e => set('stalker.cross_coin.reference_coins', e.target.value.split(',').map(s => s.trim()).filter(Boolean))}
-              className="w-full bg-gray-800 px-2 py-1.5 rounded border border-gray-600 text-xs"/>
-          </Field>
-          <Field label="Corr-Fenster Minuten (Komma-Liste)">
-            <input type="text"
-              defaultValue={(stalkerCross.corr_windows_minutes || []).join(', ')}
-              onBlur={e => set('stalker.cross_coin.corr_windows_minutes', e.target.value.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n) && n > 0))}
-              className="w-full bg-gray-800 px-2 py-1.5 rounded border border-gray-600 text-xs"/>
-          </Field>
-          <Field label="Lead/Lag Fenster (min)">
-            <NumInput value={num('stalker.cross_coin.lead_lag_window_minutes', 5)} step="1" min="1" max="60"
-              onChange={v => set('stalker.cross_coin.lead_lag_window_minutes', parseInt(v))} />
-          </Field>
-          <Field label="Lead/Lag Schwelle (% Reference-Move)">
-            <NumInput value={num('stalker.cross_coin.lead_lag_threshold_pct', 0.2)} step="0.05" min="0" max="5"
-              onChange={v => set('stalker.cross_coin.lead_lag_threshold_pct', parseFloat(v))} />
-          </Field>
-          <Field label="Coin-Identity Hash-Slots">
-            <NumInput value={num('stalker.coin_identity.hash_slots', 16)} step="1" min="4" max="128"
-              onChange={v => set('stalker.coin_identity.hash_slots', parseInt(v))} />
-          </Field>
-          <Field label="Network Hash-Slots">
-            <NumInput value={num('stalker.coin_identity.network_hash_slots', 8)} step="1" min="2" max="64"
-              onChange={v => set('stalker.coin_identity.network_hash_slots', parseInt(v))} />
-          </Field>
-        </Section>
-
-        <Section title="Whale-Tracker (Stufe B: HL Leaderboard + Position-Snapshots)">
-          <Field label="Aktiv">
-            <input type="checkbox" checked={!!whale.enabled}
-              onChange={e => set('whale_tracker.enabled', e.target.checked)} />
-          </Field>
-          <Field label="Leaderboard-Refresh (h)">
-            <NumInput value={num('whale_tracker.leaderboard_refresh_hours', 6)} step="1" min="1" max="48"
-              onChange={v => set('whale_tracker.leaderboard_refresh_hours', parseInt(v))} />
-          </Field>
-          <Field label="Fills-Poll (s)">
-            <NumInput value={num('whale_tracker.fills_poll_seconds', 300)} step="30" min="60" max="3600"
-              onChange={v => set('whale_tracker.fills_poll_seconds', parseInt(v))} />
-          </Field>
-          <Field label="Top-N Wallets">
-            <NumInput value={num('whale_tracker.top_n_wallets', 50)} step="10" min="10" max="500"
-              onChange={v => set('whale_tracker.top_n_wallets', parseInt(v))} />
-          </Field>
-          <Field label="Min. 7d-PnL für Whale ($)">
-            <NumInput value={num('whale_tracker.min_rolling_7d_pnl_usd', 100000)} step="10000" min="1000" max="10000000"
-              onChange={v => set('whale_tracker.min_rolling_7d_pnl_usd', parseInt(v))} />
-          </Field>
-        </Section>
-
-        <Section title="Lifecycle">
-          <Field label="Aus Liste verstecken nach (h)">
-            <NumInput value={num('hide_after_hours', 1)} step="0.5" min="0.1" max="48" onChange={v => set('hide_after_hours', parseFloat(v))} />
-          </Field>
-          <Field label="Cooldown / Symbol (s)">
-            <NumInput value={num('cooldown_seconds_per_symbol', 300)} step="30" min="0" max="3600" onChange={v => set('cooldown_seconds_per_symbol', parseInt(v))} />
-          </Field>
-          <Field label="Universe Top-N">
-            <NumInput value={num('universe_top_n', 50)} step="10" min="5" max="230" onChange={v => set('universe_top_n', parseInt(v))} />
-          </Field>
-        </Section>
-
-        <Section title="Trading-Defaults (vorausgefüllt im Order-Modal)">
-          <Field label="Hebel">
-            <NumInput value={trading.default_leverage ?? 5} step="1" min="1" max="20" onChange={v => set('trading.default_leverage', parseInt(v))} />
-          </Field>
-          <Field label="Trade-Size ($)">
-            <NumInput value={trading.default_size_usd ?? 20} step="5" min="10" max="10000" onChange={v => set('trading.default_size_usd', parseFloat(v))} />
-          </Field>
-        </Section>
-
-        <Section title="Lerner / Kalibrierung">
-          <Field label="Online-Lerner aktiv">
-            <input type="checkbox" checked={!!learner.enabled}
-              onChange={e => set('online_learner.enabled', e.target.checked)} />
-          </Field>
-          <Field label="Selbstkalibrierung aktiv">
-            <input type="checkbox" checked={!!cal.enabled}
-              onChange={e => set('self_calibration.enabled', e.target.checked)} />
-          </Field>
-          <Field label="Ziel-WR">
-            <NumInput value={cal.target_winrate ?? 0.55} step="0.01" min="0.1" max="0.95" onChange={v => set('self_calibration.target_winrate', parseFloat(v))} />
-          </Field>
-          <Field label="Rolling-Window">
-            <NumInput value={cal.rolling_window ?? 100} step="10" min="20" max="1000" onChange={v => set('self_calibration.rolling_window', parseInt(v))} />
-          </Field>
+        <Section title="Predictor-Settings — alle Werte editierbar (generisch)">
+          <GenericEditor data={cfg} onSet={set} />
         </Section>
 
         <Section title="Wallet (HL REST-Fallback-Caches — live aus settings)">
