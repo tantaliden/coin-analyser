@@ -2152,6 +2152,9 @@ def watch_pass_mh(s, mh_model, state_path):
         if sw_cfg and sw_cfg.get("enabled") and sw_cfg.get("protect_open_positions"):
             try:
                 storm_protect = storm_warner.evaluate(coins, sw_cfg)
+                if storm_protect and storm_protect["phase"] != "calm":
+                    log.info("STORM-PROTECT watch: phase=%s dir=%s open=%d",
+                             storm_protect["phase"], storm_protect["clarified_dir"], len(opens))
             except Exception as e:
                 log.error("storm_warner eval (watch) failed: %s", e); storm_protect = None
 
