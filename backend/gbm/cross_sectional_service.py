@@ -30,7 +30,7 @@ def load_cfg():
     )
 def dbc(s,which):
     d=s["databases"][which]
-    return psycopg2.connect(host=d["host"],port=d["port"],dbname=d["name"],user=d["user"],password=d["password"])
+    _c = psycopg2.connect(host=d["host"],port=d["port"],dbname=d["name"],user=d["user"],password=d["password"]); _c.autocommit = True; return _c
 def price_now(coins,sym):
     with coins.cursor() as cur:
         cur.execute("SELECT close FROM agg_1m WHERE symbol=%s ORDER BY bucket DESC LIMIT 1",(sym,))

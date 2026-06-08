@@ -53,8 +53,8 @@ def load_all():
 
 def dbc(s, which):
     d = s["databases"][which]
-    return psycopg2.connect(host=d["host"], port=d["port"], dbname=d["name"],
-                            user=d["user"], password=d["password"])
+    _c = psycopg2.connect(host=d["host"], port=d["port"], dbname=d["name"],
+                          user=d["user"], password=d["password"]); _c.autocommit = True; return _c
 
 
 def load_booster(path):
