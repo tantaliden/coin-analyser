@@ -45,7 +45,7 @@ def seq_paper():
                 COALESCE(sum(pnl_usd),0) sum_usd, COALESCE(avg(pnl_pct),0) avg_pct
                 FROM seq_paper_positions WHERE status='closed'""")
             cl = dict(cur.fetchone())
-            cur.execute("""SELECT id,symbol,side,entry_px,tp_px,sl_px,conf,opened_at
+            cur.execute("""SELECT id,symbol,side,entry_px,tp_px,sl_px,conf,leverage,opened_at
                            FROM seq_paper_positions WHERE status='open' ORDER BY opened_at DESC""")
             opens = [dict(r) for r in cur.fetchall()]
             cur.execute("""SELECT symbol,side,entry_px,exit_px,pnl_pct,pnl_usd,exit_reason,opened_at,closed_at
@@ -63,14 +63,14 @@ def seq_paper():
     prices = _current_prices({o['symbol'] for o in opens})
     unrealized = 0.0
     for o in opens:
-        entry = float(o['entry_px']); px = prices.get(o['symbol'])
+        entry = float(o['entry_px']); px = prices.get(o['symbol']); lev = o.get('leverage') or 1
         if px and entry:
             px = float(px)
             move = (px - entry) / entry if o['side'] == 'long' else (entry - px) / entry
             o['current_px'] = px
-            o['live_pnl_pct'] = round(move * 100.0, 3)
-            o['live_pnl_usd'] = round(move * size, 3)
-            unrealized += move * size
+            o['live_pnl_pct'] = round(move * 100.0 * lev, 3)
+            o['live_pnl_usd'] = round(move * size * lev, 3)
+            unrealized += move * size * lev
         else:
             o['current_px'] = None; o['live_pnl_pct'] = None; o['live_pnl_usd'] = None
 
