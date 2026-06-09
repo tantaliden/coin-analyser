@@ -38,7 +38,10 @@ def compute_orderflow_features(coins_conn, symbol,
                                 lookback_short_s=60,
                                 lookback_long_s=300,
                                 min_snapshots_short=3,
-                                min_snapshots_long=10):
+                                min_snapshots_long=10,
+                                spoof_max_lifetime_s=30,
+                                wall_factor=2.0,
+                                velocity_window_s=60):
     """Berechnet Orderflow-Features für `symbol` aus hl_l2_snapshot.
 
     Returns dict mit Features oder None bei zu wenig Daten.
@@ -72,7 +75,7 @@ def compute_orderflow_features(coins_conn, symbol,
     ts_series = []
     wall_lifetimes = {}  # px → first_seen_ts (für Spoof-Detection)
     spoof_count = 0
-    SPOOF_MAX_LIFETIME_S = 30
+    SPOOF_MAX_LIFETIME_S = spoof_max_lifetime_s
 
     for r in rows:
         ts = r['ts']
@@ -122,8 +125,8 @@ def compute_orderflow_features(coins_conn, symbol,
         last_bid_levels = cur_bid_set
         last_ask_levels = cur_ask_set
 
-        # Spoof-Detection: tracke Lebensdauer von Walls (size > 2× avg)
-        if bw is not None and bw > 2.0:
+        # Spoof-Detection: tracke Lebensdauer von Walls (size > wall_factor× avg)
+        if bw is not None and bw > wall_factor:
             wall_px = bid_pxs5[bid_szs5.index(max(bid_szs5))]
             if wall_px not in wall_lifetimes:
                 wall_lifetimes[wall_px] = ts
@@ -153,10 +156,10 @@ def compute_orderflow_features(coins_conn, symbol,
         latest_ts = ts_series[-1]
         # Mittelwert über letzte 60s
         recent_imb = [imb5_series[i] for i, t in enumerate(ts_series)
-                      if (latest_ts - t).total_seconds() <= 60]
-        # Mittelwert über 60-120s zurück
+                      if (latest_ts - t).total_seconds() <= velocity_window_s]
+        # Mittelwert über velocity_window_s bis 2× zurück
         older_imb = [imb5_series[i] for i, t in enumerate(ts_series)
-                     if 60 < (latest_ts - t).total_seconds() <= 120]
+                     if velocity_window_s < (latest_ts - t).total_seconds() <= 2 * velocity_window_s]
         if recent_imb and older_imb:
             feat['of_imbalance_velocity_60s'] = (sum(recent_imb)/len(recent_imb)
                                                   - sum(older_imb)/len(older_imb))

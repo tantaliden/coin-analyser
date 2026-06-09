@@ -37,6 +37,10 @@ import os
 import pickle
 from river import forest, tree
 
+# Auto-Backup-Aufbewahrung (Tage). Reine Ops-Housekeeping, keine Trading-Logik.
+# Bei Bedarf nach settings.json verschieben (predictor.multi_head.autobak_keep_days).
+AUTOBAK_KEEP_DAYS = 14
+
 
 class DirectionClassifier:
     """3-Klassen-Klassifikator (long / short / skip).
@@ -99,12 +103,12 @@ class DirectionClassifier:
             return None
         return {l: v / s for l, v in out.items()}
 
-    def learn(self, features: dict, label: str, weight: float = 1.0):
+    def learn(self, features: dict, label: str, weight: float = 1.0, max_repeats: int = 5):
         if label not in self.LABELS:
             raise ValueError(f"label must be in {self.LABELS}, got {label!r}")
         if weight <= 0:
             return
-        n_repeats = max(1, min(5, int(round(weight))))
+        n_repeats = max(1, min(max_repeats, int(round(weight))))
         for _ in range(n_repeats):
             self.model.learn_one(features, label)
         self.n_obs += 1
@@ -288,7 +292,8 @@ class MultiHeadPredictor:
                     recovered: bool = None,
                     net_margin_pct: float = None,
                     profit_weight_scale: float = 1.0,
-                    flat_skip_threshold_pct: float = 0.2):
+                    flat_skip_threshold_pct: float = 0.2,
+                    profit_weight_max_repeats: int = 5):
         """Verarbeitet einen geschlossenen Trade.
 
         features: Feature-Dict zum Zeitpunkt des Open
@@ -321,9 +326,9 @@ class MultiHeadPredictor:
         if abs(net_margin_pct) < flat_skip_threshold_pct:
             self.direction.learn(features, 'skip', weight=1.0)
         elif net_margin_pct > 0:
-            self.direction.learn(features, predicted_side, weight=w)
+            self.direction.learn(features, predicted_side, weight=w, max_repeats=profit_weight_max_repeats)
         else:
-            self.direction.learn(features, opposite, weight=w)
+            self.direction.learn(features, opposite, weight=w, max_repeats=profit_weight_max_repeats)
 
         # Bewegungsgrößen:
         #   peak_pct/trough_pct      = VOLLE Range (Magnitude-Schätzung, Anti-Zirkularität)
@@ -391,10 +396,24 @@ class MultiHeadPredictor:
 
     def save(self, path: str):
         from datetime import datetime, timezone
-        self.last_save_at = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
+        self.last_save_at = now
         tmp = path + '.tmp'
         with open(tmp, 'wb') as f:
             pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
+        # 1 Backup pro Kalendertag VOR dem Überschreiben, letzte AUTOBAK_KEEP_DAYS behalten.
+        # Sichert das zuletzt gelernte Modell, bevor os.replace es ersetzt — ein
+        # Fresh-Start / Lade-Fehler kann das Gelernte dann nicht mehr vernichten.
+        if os.path.exists(path):
+            bak = f"{path}.autobak_{now.strftime('%Y%m%d')}"
+            if not os.path.exists(bak):
+                try:
+                    import shutil, glob
+                    shutil.copy2(path, bak)
+                    for old in sorted(glob.glob(f"{path}.autobak_*"))[:-AUTOBAK_KEEP_DAYS]:
+                        os.remove(old)
+                except Exception:
+                    pass  # Backup-Fehler darf save() nie blockieren
         os.replace(tmp, path)
 
     @classmethod

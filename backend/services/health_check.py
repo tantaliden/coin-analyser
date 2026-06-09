@@ -28,6 +28,12 @@ def db_conn(s):
                             user=db["user"], password=db["password"])
 
 
+def db_conn_app(s):
+    db = s["databases"]["app"]
+    return psycopg2.connect(host=db["host"], port=db["port"], dbname=db["name"],
+                            user=db["user"], password=db["password"])
+
+
 def send_telegram(s, text):
     tg = s["telegram"]
     url = f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage"
@@ -93,6 +99,27 @@ def run_checks(s) -> list:
     if syms_recent < cfg["min_symbols_last_window"]:
         issues.append(("crit",
             f"nur {syms_recent}/{total_syms} Symbole aktiv (letzte {cfg['window_seconds']}s)"))
+
+    # 3) Watch-Freshness: offene Predictions muessen vom Watch-Loop laufend geprueft
+    #    werden (last_check_at). Friert der Loop ein (z.B. haengender HL-Call), altert
+    #    last_check_at obwohl der Service formal 'active' bleibt — genau der Fall vom 02.06.
+    wmax = cfg.get("watch_stale_max_seconds")
+    if wmax is not None:
+        try:
+            with db_conn_app(s) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT count(*),
+                               EXTRACT(EPOCH FROM (now() - min(last_check_at)))::int
+                        FROM open_predictions WHERE status='open'
+                    """)
+                    n_open, oldest = cur.fetchone()
+            if n_open and oldest is not None and oldest > wmax:
+                issues.append(("crit",
+                    f"Watch eingefroren? {n_open} offene Predictions, aelteste seit "
+                    f"{oldest}s ungeprueft (>{wmax}s)"))
+        except Exception as e:
+            issues.append(("crit", f"Watch-Freshness-Query fehlgeschlagen: {e}"))
 
     return issues
 

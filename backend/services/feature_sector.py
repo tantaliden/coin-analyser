@@ -48,7 +48,7 @@ def build_coin_sector_map(app_conn, universe_symbols, sector_priority):
     return result
 
 
-def compute_sector_close_pcts(coins_conn, coin_sector_map):
+def compute_sector_close_pcts(coins_conn, coin_sector_map, lookback_buckets=61, min_buckets=16):
     """Returns dict sector → {'mean_60m': float, 'mean_15m': float, 'n': int}.
 
     Liest close-Werte aus agg_5m/agg_1m für alle Coins im map.
@@ -69,10 +69,10 @@ def compute_sector_close_pcts(coins_conn, coin_sector_map):
             cur.execute("""
                 SELECT close FROM agg_1m
                 WHERE symbol=%s
-                ORDER BY bucket DESC LIMIT 61
-            """, (sym,))
+                ORDER BY bucket DESC LIMIT %s
+            """, (sym, lookback_buckets))
             rows = cur.fetchall()
-            if len(rows) < 16:
+            if len(rows) < min_buckets:
                 continue
             c_now = float(rows[0]['close']) if rows[0]['close'] is not None else None
             c_15m = float(rows[15]['close']) if len(rows) > 15 and rows[15]['close'] is not None else None

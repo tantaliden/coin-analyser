@@ -23,7 +23,7 @@ const AVAILABLE_MODULES = [
   { id: 'rlagent', label: 'RL-Agent' },
   { id: 'predictions', label: 'Predictions' },
   { id: 'seqshadow', label: 'Sequenz-Shadow' },
-  { id: 'gbmshadow', label: 'GBM-Predictor' },
+  { id: 'reachshadow', label: 'Reach-Predictor' },
 ]
 
 export const useModuleStore = create(persist((set, get) => ({

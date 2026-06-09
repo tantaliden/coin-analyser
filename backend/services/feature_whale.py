@@ -18,9 +18,11 @@ log = logging.getLogger("predictor")
 _TABLE_MISSING_WARNED = False
 
 
-def compute_whale_features(app_conn, symbol):
+def compute_whale_features(app_conn, symbol, lookback_minutes=15):
     """Returns dict mit Whale-Features für `symbol`, leeres dict bei fehlender
     Tabelle (whale_tracker noch nie gelaufen), None bei anderen DB-Fehlern.
+
+    lookback_minutes: Zeitfenster für aktive Whale-Positionen (Setting, vorher hart 15).
 
     WICHTIG: bei jedem Fehler wird die Transaction zurückgerollt, damit nachfolgende
     Queries auf derselben Connection nicht "current transaction is aborted" werfen.
@@ -34,13 +36,13 @@ def compute_whale_features(app_conn, symbol):
                     SELECT DISTINCT ON (address) address, side, qty, ts
                     FROM whale_positions
                     WHERE symbol = %s
-                      AND ts > now() - interval '15 minutes'
+                      AND ts > now() - make_interval(mins => %s)
                     ORDER BY address, ts DESC
                 )
                 SELECT side, COUNT(*) AS n, COALESCE(SUM(qty),0) AS total_qty
                 FROM latest
                 GROUP BY side
-            """, (symbol,))
+            """, (symbol, lookback_minutes))
             rows = cur.fetchall()
     except UndefinedTable:
         # whale_tracker noch nicht gestartet -> Tabelle fehlt. Kein Fehler, einfach

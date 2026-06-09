@@ -18,33 +18,19 @@ router = APIRouter(prefix="/api/v1/predictor", tags=["predictor"])
 
 SETTINGS_PATH = "/opt/coin/settings.json"
 
-# REST-Fallback-Cache für mids (nur wenn WS-State noch nicht initialisiert).
-_mids_cache = {"ts": 0.0, "data": {}}
-
-
 def _live_mids() -> dict:
-    """Aktuelle HL Mid-Preise — primaer aus WS-State (sub-200ms),
-    Fallback: REST mit 1s-Cache."""
+    """Aktuelle HL Mid-Preise — AUSSCHLIESSLICH aus WS-State (sub-200ms).
+    KEIN Fallback (Volker 30.05.: Fallbacks mischen Quellen und produzieren
+    Inkonsistenz — UI zeigt mal WS-Preis, mal stale REST-Cache). WS leer/Fehler
+    → {} → live_px=None → UI zeigt '—' statt erfundene Zahl.
+    """
     try:
         from wallet.hl_ws_state import get_ws_state
-        ws_mids = get_ws_state().get_mids()
-        if ws_mids:
-            return ws_mids
+        return get_ws_state().get_mids() or {}
     except Exception as e:
         import logging
-        logging.getLogger("predictor.routes").warning("ws_mids access failed: %s", e)
-    # Fallback: REST
-    now = time.time()
-    if now - _mids_cache["ts"] < 1.0 and _mids_cache["data"]:
-        return _mids_cache["data"]
-    try:
-        from rl_agent.trader import get_current_prices_hl
-        _mids_cache["data"] = get_current_prices_hl()
-        _mids_cache["ts"] = now
-    except Exception as e:
-        import logging
-        logging.getLogger("predictor.routes").warning("allMids REST failed: %s", e)
-    return _mids_cache["data"]
+        logging.getLogger("predictor.routes").error("FALLBACK_TRIGGERED ws_mids access failed: %s -> {}", e)
+        return {}
 
 
 def _load_settings():

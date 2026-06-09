@@ -43,6 +43,7 @@ export default function WalletModule() {
   const [newQuickTP, setNewQuickTP] = useState('')
   const [tpUpdating, setTpUpdating] = useState(false)
   const [tpMsg, setTpMsg] = useState(null)
+  const [histLimit, setHistLimit] = useState(200)
 
   const loadData = useCallback(async () => {
     setLoading(true)
@@ -98,7 +99,7 @@ export default function WalletModule() {
         const [pw, pp, ph, pc] = await Promise.all([
           api.get('/api/v1/predictor/paper/wallet'),
           api.get('/api/v1/predictor/paper/positions?scope=open&limit=200'),
-          api.get('/api/v1/predictor/paper/positions?scope=closed&limit=200'),
+          api.get(`/api/v1/predictor/paper/positions?scope=closed&limit=${histLimit}`),
           api.get('/api/v1/predictor/paper/equity-curve'),
         ])
         setPaperWallet(pw.data || null)
@@ -115,7 +116,7 @@ export default function WalletModule() {
       } catch { /* paper optional */ }
     } catch (err) { setError('Fehler beim Laden') }
     finally { setLoading(false) }
-  }, [])
+  }, [histLimit])
 
   useEffect(() => {
     loadData()
@@ -754,6 +755,15 @@ export default function WalletModule() {
         )}
 
         {activeTab === 'history' && walletMode === 'paper' && (
+          <>
+          <div className="flex items-center justify-end gap-2 px-2 py-1 text-xs text-zinc-400">
+            <span>Anzahl:</span>
+            <select value={histLimit} onChange={e => setHistLimit(Number(e.target.value))}
+                    className="bg-zinc-800 border border-zinc-700 rounded px-2 py-0.5 text-zinc-200">
+              {[100, 200, 500, 1000].map(n => <option key={n} value={n}>{n}</option>)}
+            </select>
+            <span className="text-zinc-600">({paperHistory.length} geladen)</span>
+          </div>
           <table className="w-full">
             <thead className="sticky top-0 bg-zinc-900">
               <tr className="text-zinc-500 text-left">
@@ -784,6 +794,7 @@ export default function WalletModule() {
               ))}
             </tbody>
           </table>
+          </>
         )}
         {activeTab === 'verlauf' && walletMode === 'paper' && (
           <div className="p-3">

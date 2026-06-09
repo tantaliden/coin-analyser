@@ -46,8 +46,18 @@ def _hl_account(creds: dict):
     return EthAccount.from_key(creds["secret_key"])
 
 
+def _hl_request_timeout() -> float:
+    """HL-Request-Timeout aus settings.json (live gelesen, kein Default).
+    Verhindert dass ein hängender HL-HTTP-Call den Watch-Loop einfriert."""
+    with open(SETTINGS_PATH) as f:
+        v = json.load(f).get("hyperliquid_ingest", {}).get("request_timeout_seconds")
+    if v is None:
+        raise RuntimeError("settings.hyperliquid_ingest.request_timeout_seconds fehlt")
+    return float(v)
+
+
 def get_hl_info():
-    return HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True)
+    return HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True, timeout=_hl_request_timeout())
 
 
 def get_hl_exchange(creds):
@@ -546,7 +556,7 @@ def place_tp_sl_hl(creds: dict, coin: str, is_long: bool, quantity,
         if tp_oid is not None and sl_oid is not None:
             time.sleep(1.0)  # HL-OrderBook-Propagation
             try:
-                info = HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True)
+                info = get_hl_info()
                 fe_orders = info.frontend_open_orders(creds["wallet_address"]) or []
                 live_oids = {int(o.get("oid", 0)) for o in fe_orders if o.get("coin") == coin}
                 tp_live = int(tp_oid) in live_oids
