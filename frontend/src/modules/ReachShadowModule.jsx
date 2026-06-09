@@ -92,13 +92,14 @@ export default function ReachShadowModule() {
       {tab === 'open' ? (
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
           <thead><tr style={{ color: '#888', textAlign: 'left' }}>
-            <th>Coin</th><th>Seite</th><th>Entry</th><th>akt.</th><th>PnL %</th><th>PnL $</th><th>TP%</th><th>SL%</th><th>reach</th><th>n</th><th>seit</th>
+            <th>Coin</th><th>Seite</th><th>Hbl</th><th>Entry</th><th>akt.</th><th>PnL %</th><th>PnL $</th><th>TP%</th><th>SL%</th><th>reach</th><th>n</th><th>seit</th>
           </tr></thead>
           <tbody>
             {(d.open_positions || []).map((p, i) => (
               <tr key={i} style={{ borderTop: '1px solid #2a2a33' }}>
                 <td>{p.symbol}</td>
                 <td style={{ color: p.side === 'long' ? '#3c3' : '#f77' }}>{p.side}</td>
+                <td style={{ color: '#caa' }}>{p.leverage}x</td>
                 <td>{num(p.entry_px)}</td>
                 <td>{num(p.current_px)}</td>
                 <td style={{ color: col(p.live_pnl_pct) }}>{p.live_pnl_pct == null ? '—' : `${sgn(p.live_pnl_pct)}${p.live_pnl_pct}%`}</td>

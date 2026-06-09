@@ -33,8 +33,11 @@ def load_cfg():
         size=float(req(lv, "trade_size_usd", "live")),
         top_n=int(req(lv, "top_n_coins", "live")),
         max_open=int(req(lv, "max_open", "live")),
+        leverage_cap=int(req(lv, "leverage_cap", "live")),
         fee=float(req(tg, "fee_roundtrip_pct", "target")),
-        horizon_h=float(req(tg, "horizon_hours", "target")),
+        # Halten = Messfenster: die Reach-Rate wurde über forward_window_minutes
+        # gemessen -> genau so lange halten, sonst driftet der Trade aus der Statistik.
+        hold_min=int(req(mt, "forward_window_minutes", "match")),
         sig_cfg=flat)
 
 def dbc(s):
@@ -47,12 +50,24 @@ CREATE TABLE IF NOT EXISTS reach_paper_positions(
   id BIGSERIAL PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL,
   entry_px DOUBLE PRECISION NOT NULL, tp_px DOUBLE PRECISION NOT NULL, sl_px DOUBLE PRECISION NOT NULL,
   tp_pct DOUBLE PRECISION, sl_pct DOUBLE PRECISION, conf DOUBLE PRECISION NOT NULL, n_match INT,
-  opened_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  leverage INT, opened_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   status TEXT NOT NULL DEFAULT 'open', exit_px DOUBLE PRECISION, pnl_pct DOUBLE PRECISION,
   pnl_usd DOUBLE PRECISION, closed_at TIMESTAMPTZ, exit_reason TEXT);
+ALTER TABLE reach_paper_positions ADD COLUMN IF NOT EXISTS leverage INT;
 CREATE INDEX IF NOT EXISTS reach_pp_status ON reach_paper_positions(status);
 CREATE TABLE IF NOT EXISTS reach_paper_meta(id INT PRIMARY KEY DEFAULT 1, start_balance DOUBLE PRECISION);
 """
+
+
+def coin_leverage(coins, sym, cap):
+    """Hebel = min(cap, max-verfügbar) aus hl_meta. RULE_6: kein Fallback —
+    fehlt der Coin in hl_meta -> None -> Caller skippt (kein stiller Default)."""
+    cur = coins.cursor()
+    cur.execute("SELECT max_leverage FROM hl_meta WHERE symbol=%s", (sym,))
+    r = cur.fetchone()
+    if not r or r[0] is None:
+        return None
+    return min(cap, int(r[0]))
 
 def top_coins(coins, n):
     """Top-N nach Dollar-Volumen der letzten 24h (agg_1m quote_asset_volume)."""
@@ -62,8 +77,9 @@ def top_coins(coins, n):
                    GROUP BY symbol ORDER BY v DESC NULLS LAST LIMIT %s""", (n,))
     return [r[0] for r in cur.fetchall()]
 
-def check_close(coins, pos, horizon_h):
-    """Erste TP/SL-Überschreitung seit opened_at auf 10s-Klines, sonst Horizont-Drift."""
+def check_close(coins, pos, hold_minutes):
+    """Erste TP/SL-Überschreitung seit opened_at auf 10s-Klines, sonst Timeout-Drift
+    nach hold_minutes (= Messfenster der Reach-Rate)."""
     cur = coins.cursor()
     cur.execute("""SELECT high, low, close, open_time FROM klines WHERE symbol=%s AND interval='10s'
                    AND open_time > %s ORDER BY open_time""", (pos['symbol'], pos['opened_at']))
@@ -77,15 +93,16 @@ def check_close(coins, pos, horizon_h):
         else:
             if h >= pos['sl_px']: return pos['sl_px'], 'SL', ot
             if l <= pos['tp_px']: return pos['tp_px'], 'TP', ot
-    age_h = (rows[-1][3] - pos['opened_at']).total_seconds() / 3600
-    if age_h >= horizon_h:
+    age_min = (rows[-1][3] - pos['opened_at']).total_seconds() / 60
+    if age_min >= hold_minutes:
         return float(rows[-1][2]), 'DRIFT', rows[-1][3]
     return None
 
 def main():
     s, C = load_cfg()
     log(f"REACH-SHADOW start: scan {C['scan_s']}s top{C['top_n']} max_open={C['max_open']} "
-        f"gate net>={C['sig_cfg']['min_net_expectancy_pct']}% reach>={C['sig_cfg']['min_reach_rate']} size ${C['size']}")
+        f"gate net>={C['sig_cfg']['min_net_expectancy_pct']}% reach>={C['sig_cfg']['min_reach_rate']} "
+        f"size ${C['size']} lev≤{C['leverage_cap']}x hold={C['hold_min']}min")
     with dba(s) as app:
         with app.cursor() as cur:
             cur.execute(DDL)
@@ -101,11 +118,14 @@ def main():
                     opens = cur.fetchall()
                 closed = 0
                 for pos in opens:
-                    r = check_close(coins, pos, C["horizon_h"])
+                    r = check_close(coins, pos, C["hold_min"])
                     if r is None: continue
                     px, reason, ct = r
-                    if pos['side'] == 'long': pnl = (px / pos['entry_px'] - 1) * 100 - C["fee"]
-                    else:                     pnl = (1 - px / pos['entry_px']) * 100 - C["fee"]
+                    lev = pos['leverage'] or 1
+                    if pos['side'] == 'long': move = (px / pos['entry_px'] - 1) * 100
+                    else:                     move = (1 - px / pos['entry_px']) * 100
+                    # Gehebelt: Move & Gebühr (auf Notional) skalieren mit dem Hebel -> Rendite auf Margin.
+                    pnl = (move - C["fee"]) * lev
                     usd = C["size"] * pnl / 100
                     with app.cursor() as cu:
                         cu.execute("""UPDATE reach_paper_positions SET status='closed',exit_px=%s,pnl_pct=%s,
@@ -138,16 +158,18 @@ def main():
                             p = cc.fetchone()
                         if not p or p[0] is None: continue
                         entry = float(p[0])
+                        lev = coin_leverage(coins, sym, C["leverage_cap"])
+                        if lev is None: continue  # RULE_6: kein hl_meta -> kein stiller Default-Hebel
                         if side == 'long': tp = entry * (1 + tp_pct / 100); slx = entry * (1 - sl_pct / 100)
                         else:              tp = entry * (1 - tp_pct / 100); slx = entry * (1 + sl_pct / 100)
                         with app.cursor() as cu:
                             cu.execute("""INSERT INTO reach_paper_positions
-                                          (symbol,side,entry_px,tp_px,sl_px,tp_pct,sl_pct,conf,n_match)
-                                          VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                                       (sym, side, entry, tp, slx, tp_pct, sl_pct, sig['conf'], sig.get('n_match')))
+                                          (symbol,side,entry_px,tp_px,sl_px,tp_pct,sl_pct,conf,n_match,leverage)
+                                          VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                                       (sym, side, entry, tp, slx, tp_pct, sl_pct, sig['conf'], sig.get('n_match'), lev))
                         app.commit(); opened += 1
                         log(f"OPEN {side} {sym} @ {entry:.6f} reach={sig['conf']:.2f} n={sig.get('n_match')} "
-                            f"(tp +{tp_pct:.2f}/sl -{sl_pct:.2f})")
+                            f"{lev}x (tp +{tp_pct:.2f}/sl -{sl_pct:.2f})")
                 if closed or opened:
                     log(f"scan: +{opened} open, {closed} closed, held={len(held)}")
         except Exception as e:
