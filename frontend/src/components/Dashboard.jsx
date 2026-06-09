@@ -15,7 +15,6 @@ import WalletModule from '../modules/wallet/WalletModule'
 import BotModule from '../modules/bot/BotModule'
 import MomentumModule from '../modules/MomentumModule'
 import RLAgentModule from '../modules/RLAgentModule'
-import PredictionsModule from '../modules/PredictionsModule'
 import SeqShadowModule from '../modules/SeqShadowModule'
 import ReachShadowModule from '../modules/ReachShadowModule'
 
@@ -31,7 +30,6 @@ const MODULE_COMPONENTS = {
   bot: BotModule,
   momentum: MomentumModule,
   rlagent: RLAgentModule,
-  predictions: PredictionsModule,
   seqshadow: SeqShadowModule,
   reachshadow: ReachShadowModule,
 }
@@ -46,7 +44,6 @@ const MODULE_TITLES = {
   bot: 'Trading Bot',
   momentum: 'Momentum Scanner',
   rlagent: 'RL-Agent',
-  predictions: 'Predictions',
   seqshadow: 'Sequenz-Shadow',
   reachshadow: 'Reach-Predictor',
 }

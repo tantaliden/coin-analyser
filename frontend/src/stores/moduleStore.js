@@ -21,7 +21,6 @@ const AVAILABLE_MODULES = [
   { id: 'wallet', label: 'Wallet' },
   { id: 'momentum', label: 'Momentum Scanner' },
   { id: 'rlagent', label: 'RL-Agent' },
-  { id: 'predictions', label: 'Predictions' },
   { id: 'seqshadow', label: 'Sequenz-Shadow' },
   { id: 'reachshadow', label: 'Reach-Predictor' },
 ]
