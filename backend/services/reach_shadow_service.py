@@ -41,9 +41,11 @@ def load_cfg():
         sig_cfg=flat)
 
 def dbc(s):
-    d = s["databases"]["coins"]; return psycopg2.connect(host=d["host"], port=d["port"], dbname=d["name"], user=d["user"], password=d["password"])
+    d = s["databases"]["coins"]
+    _c = psycopg2.connect(host=d["host"], port=d["port"], dbname=d["name"], user=d["user"], password=d["password"]); _c.autocommit = True; return _c
 def dba(s):
-    d = s["databases"]["app"]; return psycopg2.connect(host=d["host"], port=d["port"], dbname=d["name"], user=d["user"], password=d["password"])
+    d = s["databases"]["app"]
+    _c = psycopg2.connect(host=d["host"], port=d["port"], dbname=d["name"], user=d["user"], password=d["password"]); _c.autocommit = True; return _c
 
 DDL = """
 CREATE TABLE IF NOT EXISTS reach_paper_positions(
@@ -54,6 +56,7 @@ CREATE TABLE IF NOT EXISTS reach_paper_positions(
   status TEXT NOT NULL DEFAULT 'open', exit_px DOUBLE PRECISION, pnl_pct DOUBLE PRECISION,
   pnl_usd DOUBLE PRECISION, closed_at TIMESTAMPTZ, exit_reason TEXT);
 ALTER TABLE reach_paper_positions ADD COLUMN IF NOT EXISTS leverage INT;
+ALTER TABLE reach_paper_positions ADD COLUMN IF NOT EXISTS net_exp_pct DOUBLE PRECISION;
 CREATE INDEX IF NOT EXISTS reach_pp_status ON reach_paper_positions(status);
 CREATE TABLE IF NOT EXISTS reach_paper_meta(id INT PRIMARY KEY DEFAULT 1, start_balance DOUBLE PRECISION);
 """
@@ -164,9 +167,9 @@ def main():
                         else:              tp = entry * (1 - tp_pct / 100); slx = entry * (1 + sl_pct / 100)
                         with app.cursor() as cu:
                             cu.execute("""INSERT INTO reach_paper_positions
-                                          (symbol,side,entry_px,tp_px,sl_px,tp_pct,sl_pct,conf,n_match,leverage)
-                                          VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                                       (sym, side, entry, tp, slx, tp_pct, sl_pct, sig['conf'], sig.get('n_match'), lev))
+                                          (symbol,side,entry_px,tp_px,sl_px,tp_pct,sl_pct,conf,n_match,leverage,net_exp_pct)
+                                          VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                                       (sym, side, entry, tp, slx, tp_pct, sl_pct, sig['conf'], sig.get('n_match'), lev, sig['net_exp']))
                         app.commit(); opened += 1
                         log(f"OPEN {side} {sym} @ {entry:.6f} reach={sig['conf']:.2f} n={sig.get('n_match')} "
                             f"{lev}x (tp +{tp_pct:.2f}/sl -{sl_pct:.2f})")
