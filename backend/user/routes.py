@@ -23,7 +23,7 @@ class UserStateUpdate(BaseModel):
     current_layout_id: Optional[int] = None
 
 @router.get("/state")
-async def get_user_state(current_user: dict = Depends(get_current_user)):
+def get_user_state(current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
     with get_app_db() as conn:
         with conn.cursor() as cur:
@@ -52,7 +52,7 @@ async def get_user_state(current_user: dict = Depends(get_current_user)):
                     "selected_event_ids": [], "chart_settings": {}, "module_layouts": [], "updated_at": None}
 
 @router.put("/state")
-async def update_user_state(state: UserStateUpdate, current_user: dict = Depends(get_current_user)):
+def update_user_state(state: UserStateUpdate, current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
     updates, params = [], []
     if state.current_set_id is not None:
@@ -91,7 +91,7 @@ class LayoutUpdate(BaseModel):
     layout_data: List[dict]
 
 @router.get("/layouts")
-async def get_layouts(current_user: dict = Depends(get_current_user)):
+def get_layouts(current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT id, name, layout_data, is_default, updated_at
@@ -105,7 +105,7 @@ async def get_layouts(current_user: dict = Depends(get_current_user)):
     } for r in rows]}
 
 @router.post("/layouts")
-async def create_layout(data: LayoutSave, current_user: dict = Depends(get_current_user)):
+def create_layout(data: LayoutSave, current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
     with get_app_db() as conn:
         with conn.cursor() as cur:
@@ -119,7 +119,7 @@ async def create_layout(data: LayoutSave, current_user: dict = Depends(get_curre
     return {"id": new_id, "name": data.name}
 
 @router.put("/layouts/{layout_id}")
-async def update_layout(layout_id: int, data: LayoutUpdate, current_user: dict = Depends(get_current_user)):
+def update_layout(layout_id: int, data: LayoutUpdate, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""UPDATE user_layouts SET layout_data = %s, updated_at = NOW()
@@ -129,7 +129,7 @@ async def update_layout(layout_id: int, data: LayoutUpdate, current_user: dict =
     return {"status": "updated"}
 
 @router.put("/layouts/{layout_id}/default")
-async def set_default_layout(layout_id: int, current_user: dict = Depends(get_current_user)):
+def set_default_layout(layout_id: int, current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
     with get_app_db() as conn:
         with conn.cursor() as cur:
@@ -139,7 +139,7 @@ async def set_default_layout(layout_id: int, current_user: dict = Depends(get_cu
     return {"status": "updated"}
 
 @router.delete("/layouts/{layout_id}")
-async def delete_layout(layout_id: int, current_user: dict = Depends(get_current_user)):
+def delete_layout(layout_id: int, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM user_layouts WHERE id = %s AND user_id = %s", (layout_id, current_user['user_id']))
@@ -153,7 +153,7 @@ class ApiKeyUpdate(BaseModel):
     api_secret: str
 
 @router.get("/settings")
-async def get_settings(current_user: dict = Depends(get_current_user)):
+def get_settings(current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
     with get_app_db() as conn:
         with conn.cursor() as cur:
@@ -178,7 +178,7 @@ async def get_settings(current_user: dict = Depends(get_current_user)):
     }
 
 @router.put("/settings/binance")
-async def update_binance_keys(data: ApiKeyUpdate, current_user: dict = Depends(get_current_user)):
+def update_binance_keys(data: ApiKeyUpdate, current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
     # Test: Binance API Ping
     try:
@@ -199,7 +199,7 @@ async def update_binance_keys(data: ApiKeyUpdate, current_user: dict = Depends(g
     return {"status": "ok", "valid": valid}
 
 @router.put("/settings/hyperliquid")
-async def update_hyperliquid_keys(data: ApiKeyUpdate, current_user: dict = Depends(get_current_user)):
+def update_hyperliquid_keys(data: ApiKeyUpdate, current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
     # Test: Hyperliquid API — hole User State mit der Wallet-Adresse (api_key = wallet address)
     try:

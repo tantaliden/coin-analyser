@@ -79,7 +79,7 @@ class CounterSearchRequest(BaseModel):
 
 # === SETS CRUD ===
 @router.get("/sets")
-async def list_indicator_sets(current_user: dict = Depends(get_current_user), only_mine: bool = False):
+def list_indicator_sets(current_user: dict = Depends(get_current_user), only_mine: bool = False):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             if only_mine:
@@ -93,7 +93,7 @@ async def list_indicator_sets(current_user: dict = Depends(get_current_user), on
     return {"sets": sets}
 
 @router.post("/sets")
-async def create_indicator_set(request: IndicatorSetCreate, current_user: dict = Depends(get_current_user)):
+def create_indicator_set(request: IndicatorSetCreate, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO indicator_sets (owner_id, name, description, coin_group_id, search_date_from, search_date_to,
@@ -107,7 +107,7 @@ async def create_indicator_set(request: IndicatorSetCreate, current_user: dict =
     return {"message": "Set created", "set_id": set_id}
 
 @router.post("/sets/with-indicator")
-async def create_indicator_set_with_first_item(request: IndicatorSetWithFirstItem, current_user: dict = Depends(get_current_user)):
+def create_indicator_set_with_first_item(request: IndicatorSetWithFirstItem, current_user: dict = Depends(get_current_user)):
     if request.time_end_minutes > request.prehistory_minutes - 15:
         raise HTTPException(status_code=400, detail=f"time_end muss < prehistory - 15 sein")
     if request.time_start_minutes >= request.time_end_minutes:
@@ -132,7 +132,7 @@ async def create_indicator_set_with_first_item(request: IndicatorSetWithFirstIte
     return {"message": "Set with indicator created", "set_id": set_id, "item_id": item_id, "prehistory_minutes": request.prehistory_minutes}
 
 @router.get("/sets/{set_id}")
-async def get_indicator_set(set_id: int, current_user: dict = Depends(get_current_user)):
+def get_indicator_set(set_id: int, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT s.*, u.email as owner_email, cg.name as coin_group_name FROM indicator_sets s
@@ -155,7 +155,7 @@ async def get_indicator_set(set_id: int, current_user: dict = Depends(get_curren
                 "prehistory_minutes": indicator_set.get('prehistory_minutes'), "coins": coins}}
 
 @router.delete("/sets/{set_id}")
-async def delete_indicator_set(set_id: int, current_user: dict = Depends(get_current_user)):
+def delete_indicator_set(set_id: int, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT owner_id FROM indicator_sets WHERE set_id = %s", (set_id,))
@@ -168,7 +168,7 @@ async def delete_indicator_set(set_id: int, current_user: dict = Depends(get_cur
 
 # === ITEMS CRUD ===
 @router.post("/sets/{set_id}/items")
-async def add_indicator_item(set_id: int, request: IndicatorItemCreate, current_user: dict = Depends(get_current_user)):
+def add_indicator_item(set_id: int, request: IndicatorItemCreate, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT owner_id, is_locked, prehistory_minutes FROM indicator_sets WHERE set_id = %s", (set_id,))
@@ -197,7 +197,7 @@ async def add_indicator_item(set_id: int, request: IndicatorItemCreate, current_
     return {"message": "Indicator added", "item_id": item_id, "set_id": set_id}
 
 @router.delete("/sets/{set_id}/items/{item_id}")
-async def delete_indicator_item(set_id: int, item_id: int, current_user: dict = Depends(get_current_user)):
+def delete_indicator_item(set_id: int, item_id: int, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT owner_id FROM indicator_sets WHERE set_id = %s", (set_id,))
@@ -211,7 +211,7 @@ async def delete_indicator_item(set_id: int, item_id: int, current_user: dict = 
     return {"message": "Item deleted"}
 
 @router.put("/sets/{set_id}/items/{item_id}/toggle")
-async def toggle_indicator_item(set_id: int, item_id: int, current_user: dict = Depends(get_current_user)):
+def toggle_indicator_item(set_id: int, item_id: int, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT i.is_active, s.owner_id FROM indicator_items i
@@ -225,7 +225,7 @@ async def toggle_indicator_item(set_id: int, item_id: int, current_user: dict = 
     return {"item_id": item_id, "is_active": new_active}
 
 @router.put("/items/{item_id}")
-async def update_indicator_item(item_id: int, update: IndicatorItemUpdate, current_user: dict = Depends(get_current_user)):
+def update_indicator_item(item_id: int, update: IndicatorItemUpdate, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT i.*, s.owner_id FROM indicator_items i
@@ -254,7 +254,7 @@ async def update_indicator_item(item_id: int, update: IndicatorItemUpdate, curre
 
 # === BACKSEARCH ===
 @router.post("/sets/{set_id}/backsearch")
-async def backsearch(set_id: int, request: CounterSearchRequest, current_user: dict = Depends(get_current_user)):
+def backsearch(set_id: int, request: CounterSearchRequest, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT s.*, g.name as coin_group_name FROM indicator_sets s
@@ -440,7 +440,7 @@ class ValidateSetRequest(BaseModel):
     prehistory_minutes: int = 720
 
 @router.post("/validate")
-async def validate_indicator_set(request: ValidateSetRequest, current_user: dict = Depends(get_current_user)):
+def validate_indicator_set(request: ValidateSetRequest, current_user: dict = Depends(get_current_user)):
     if not request.indicators or not request.main_search_events:
         return {"matched_count": 0, "ok_count": 0, "ok_percent": 0, "grey_count": 0, "grey_percent": 0,
             "fail_count": 0, "fail_percent": 0, "false_positives": 0, "hit_rate": 0, "decision": "FAIL", "message": "No indicators or events"}

@@ -33,7 +33,7 @@ class RLConfigUpdate(BaseModel):
 
 
 @router.get("/config")
-async def get_rl_config(current_user: dict = Depends(get_current_user)):
+def get_rl_config(current_user: dict = Depends(get_current_user)):
     user_id = current_user["user_id"]
     with get_app_db() as conn:
         with conn.cursor() as cur:
@@ -73,7 +73,7 @@ async def get_rl_config(current_user: dict = Depends(get_current_user)):
 
 
 @router.put("/config")
-async def update_rl_config(request: RLConfigUpdate, current_user: dict = Depends(get_current_user)):
+def update_rl_config(request: RLConfigUpdate, current_user: dict = Depends(get_current_user)):
     user_id = current_user["user_id"]
     updates, values = [], []
 
@@ -147,7 +147,7 @@ async def update_rl_config(request: RLConfigUpdate, current_user: dict = Depends
 
 
 @router.post("/service/{action}")
-async def control_service(action: str, current_user: dict = Depends(get_current_user)):
+def control_service(action: str, current_user: dict = Depends(get_current_user)):
     """Service starten/stoppen + DB-Flag setzen."""
     if action not in ('start', 'stop'):
         return {"error": "Nur 'start' oder 'stop'"}
@@ -174,7 +174,7 @@ async def control_service(action: str, current_user: dict = Depends(get_current_
 
 
 @router.get("/status")
-async def get_rl_status(current_user: dict = Depends(get_current_user)):
+def get_rl_status(current_user: dict = Depends(get_current_user)):
     """Agent-Status: Modell, Performance, Punkte, letzte Entscheidungen."""
 
     # Agent-State aus Datei (Punkte, Portfolio)
@@ -293,7 +293,7 @@ async def get_rl_status(current_user: dict = Depends(get_current_user)):
 
 
 @router.get("/trades")
-async def get_rl_trades(status: str = "all", limit: int = 50,
+def get_rl_trades(status: str = "all", limit: int = 50,
                         current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
@@ -380,7 +380,7 @@ async def get_backtest_results(current_user: dict = Depends(get_current_user)):
 
 
 @router.get("/monthly")
-async def get_rl_monthly(current_user: dict = Depends(get_current_user)):
+def get_rl_monthly(current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM rl_monthly_summary ORDER BY month DESC LIMIT 12")

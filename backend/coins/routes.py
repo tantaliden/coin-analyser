@@ -10,7 +10,7 @@ from auth.auth import get_current_user
 router = APIRouter(prefix="/api/v1/coins", tags=["coins"])
 
 @router.get("")
-async def get_coins(network: Optional[str] = None, category: Optional[str] = None, search: Optional[str] = None, hl_only: bool = False, current_user: dict = Depends(get_current_user)):
+def get_coins(network: Optional[str] = None, category: Optional[str] = None, search: Optional[str] = None, hl_only: bool = False, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             query = "SELECT symbol, base_asset, name, network, categories, price_precision, qty_precision, min_notional, min_qty, CASE WHEN hl_sz_decimals IS NOT NULL THEN true ELSE false END as is_hl FROM coin_info WHERE 1=1"
@@ -32,7 +32,7 @@ async def get_coins(network: Optional[str] = None, category: Optional[str] = Non
     return {"coins": [dict(c) for c in coins]}
 
 @router.get("/networks")
-async def get_networks(current_user: dict = Depends(get_current_user)):
+def get_networks(current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT DISTINCT network FROM coin_info WHERE network IS NOT NULL ORDER BY network")
@@ -40,7 +40,7 @@ async def get_networks(current_user: dict = Depends(get_current_user)):
     return {"networks": networks}
 
 @router.get("/categories")
-async def get_categories(current_user: dict = Depends(get_current_user)):
+def get_categories(current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -51,7 +51,7 @@ async def get_categories(current_user: dict = Depends(get_current_user)):
     return {"categories": categories}
 
 @router.put("/{symbol}/network")
-async def update_coin_network(symbol: str, network: str, current_user: dict = Depends(get_current_user)):
+def update_coin_network(symbol: str, network: str, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE coin_info SET network = %s, updated_at = NOW() WHERE symbol = %s RETURNING symbol", (network, symbol))

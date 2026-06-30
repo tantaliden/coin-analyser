@@ -24,7 +24,7 @@ with open(ROOT_DIR / 'settings.json') as f:
 router = APIRouter(prefix="/api/v1/meta", tags=["meta"])
 
 @router.get("/health")
-async def health():
+def health():
     """Health Check für beide Datenbanken"""
     coins_ok = app_ok = False
     try:
@@ -64,7 +64,7 @@ async def health():
     }
 
 @router.get("/symbols")
-async def get_symbols(current_user: dict = Depends(get_current_user)):
+def get_symbols(current_user: dict = Depends(get_current_user)):
     """Alle verfügbaren Symbole aus klines"""
     with get_coins_db() as conn:
         with conn.cursor() as cur:
@@ -73,7 +73,7 @@ async def get_symbols(current_user: dict = Depends(get_current_user)):
     return {"symbols": symbols, "count": len(symbols)}
 
 @router.get("/stats")
-async def get_stats(current_user: dict = Depends(get_current_user)):
+def get_stats(current_user: dict = Depends(get_current_user)):
     """Datenbank-Statistiken"""
     with get_coins_db() as conn:
         with conn.cursor() as cur:

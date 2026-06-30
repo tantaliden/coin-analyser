@@ -19,7 +19,7 @@ class BotConfigUpdate(BaseModel):
     max_trades_limit: Optional[int] = None
 
 @router.get("/config")
-async def get_bot_config(current_user: dict = Depends(get_current_user)):
+def get_bot_config(current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
     with get_app_db() as conn:
         with conn.cursor() as cur:
@@ -34,7 +34,7 @@ async def get_bot_config(current_user: dict = Depends(get_current_user)):
         "max_trades_enabled": config.get('max_trades_enabled', False), "max_trades_limit": config.get('max_trades_limit', 10)}
 
 @router.put("/config")
-async def update_bot_config(request: BotConfigUpdate, current_user: dict = Depends(get_current_user)):
+def update_bot_config(request: BotConfigUpdate, current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
     if request.is_active:
         client = get_user_binance_client(user_id)
@@ -61,7 +61,7 @@ async def update_bot_config(request: BotConfigUpdate, current_user: dict = Depen
     return {"status": "updated"}
 
 @router.get("/upcoming")
-async def get_upcoming_events(current_user: dict = Depends(get_current_user)):
+def get_upcoming_events(current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT ue.event_id, ue.symbol, ue.expected_start, ue.expected_duration_min, ue.expected_target_pct,
@@ -73,7 +73,7 @@ async def get_upcoming_events(current_user: dict = Depends(get_current_user)):
     return {"events": events}
 
 @router.post("/execute/{event_id}")
-async def execute_bot_trade(event_id: int, current_user: dict = Depends(get_current_user)):
+def execute_bot_trade(event_id: int, current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
     with get_app_db() as conn:
         with conn.cursor() as cur:

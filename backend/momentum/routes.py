@@ -92,7 +92,7 @@ def _enrich_with_prices(predictions):
 # === CONFIG ===
 
 @router.get("/config")
-async def get_config(current_user: dict = Depends(get_current_user)):
+def get_config(current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM momentum_scan_config WHERE user_id = %s", (current_user['user_id'],))
@@ -107,7 +107,7 @@ async def get_config(current_user: dict = Depends(get_current_user)):
             return dict(config)
 
 @router.put("/config")
-async def update_config(data: ConfigUpdate, current_user: dict = Depends(get_current_user)):
+def update_config(data: ConfigUpdate, current_user: dict = Depends(get_current_user)):
     updates = {k: v for k, v in data.dict().items() if v is not None}
     if not updates:
         raise HTTPException(400, "Keine Änderungen")
@@ -125,7 +125,7 @@ async def update_config(data: ConfigUpdate, current_user: dict = Depends(get_cur
 # === PREDICTIONS ===
 
 @router.get("/predictions")
-async def get_predictions(
+def get_predictions(
     status: Optional[str] = Query(None),
     symbol: Optional[str] = Query(None),
     direction: Optional[str] = Query(None),
@@ -174,7 +174,7 @@ async def get_predictions(
     return {"predictions": predictions, "total": total}
 
 @router.delete("/predictions/{prediction_id}")
-async def cancel_prediction(prediction_id: int, current_user: dict = Depends(get_current_user)):
+def cancel_prediction(prediction_id: int, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -191,7 +191,7 @@ async def cancel_prediction(prediction_id: int, current_user: dict = Depends(get
 # === TRADE EXECUTION ===
 
 @router.post("/trade/{prediction_id}")
-async def execute_trade(prediction_id: int, req: TradeRequest, current_user: dict = Depends(get_current_user)):
+def execute_trade(prediction_id: int, req: TradeRequest, current_user: dict = Depends(get_current_user)):
     """
     Prediction an Tradebot übergeben:
     1. Market Buy in Höhe von amount_per_trade
@@ -349,7 +349,7 @@ async def execute_trade(prediction_id: int, req: TradeRequest, current_user: dic
 # === STATS ===
 
 @router.get("/stats")
-async def get_stats(scanner_type: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
+def get_stats(scanner_type: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
     st = scanner_type or 'default'
     with get_app_db() as conn:
@@ -484,7 +484,7 @@ async def get_stats(scanner_type: Optional[str] = Query(None), current_user: dic
 # === CORRECTIONS & OPTIMIZATIONS ===
 
 @router.get("/corrections")
-async def get_corrections(limit: int = Query(20, ge=1, le=100), current_user: dict = Depends(get_current_user)):
+def get_corrections(limit: int = Query(20, ge=1, le=100), current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -496,7 +496,7 @@ async def get_corrections(limit: int = Query(20, ge=1, le=100), current_user: di
             return [dict(r) for r in cur.fetchall()]
 
 @router.get("/optimizations")
-async def get_optimizations(limit: int = Query(10, ge=1, le=50), current_user: dict = Depends(get_current_user)):
+def get_optimizations(limit: int = Query(10, ge=1, le=50), current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -508,7 +508,7 @@ async def get_optimizations(limit: int = Query(10, ge=1, le=50), current_user: d
 # === 2h SCANNER CONFIG ===
 
 @router.get("/config/2h")
-async def get_config_2h(current_user: dict = Depends(get_current_user)):
+def get_config_2h(current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM momentum_scan_config_2h WHERE user_id = %s", (current_user['user_id'],))
@@ -524,7 +524,7 @@ async def get_config_2h(current_user: dict = Depends(get_current_user)):
             return dict(config)
 
 @router.put("/config/2h")
-async def update_config_2h(data: ConfigUpdate, current_user: dict = Depends(get_current_user)):
+def update_config_2h(data: ConfigUpdate, current_user: dict = Depends(get_current_user)):
     updates = {k: v for k, v in data.dict().items() if v is not None}
     if not updates:
         raise HTTPException(400, "Keine Änderungen")

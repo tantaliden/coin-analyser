@@ -34,7 +34,7 @@ class PasswordChangeRequest(BaseModel):
     new_password: str
 
 @router.post("/login")
-async def login(request: LoginRequest):
+def login(request: LoginRequest):
     """Login mit Email und Passwort"""
     user = get_user_by_email(request.email)
     
@@ -81,7 +81,7 @@ async def login(request: LoginRequest):
     }
 
 @router.post("/refresh")
-async def refresh_token_endpoint(refresh_token: str):
+def refresh_token_endpoint(refresh_token: str):
     """Refresh Access Token"""
     payload = decode_token(refresh_token)
     
@@ -142,7 +142,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
     }
 
 @router.post("/password")
-async def change_password(
+def change_password(
     request: PasswordChangeRequest,
     current_user: dict = Depends(get_current_user)
 ):
@@ -173,7 +173,7 @@ async def change_password(
     return {"message": "Password changed successfully"}
 
 @router.post("/logout")
-async def logout(current_user: dict = Depends(get_current_user)):
+def logout(current_user: dict = Depends(get_current_user)):
     """Logout - Sessions löschen"""
     with get_app_db() as conn:
         with conn.cursor() as cur:

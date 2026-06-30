@@ -3,6 +3,7 @@ SEARCH ROUTES - Event Search, Candles
 """
 
 import json
+import asyncio
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, List
@@ -56,7 +57,7 @@ def get_table_for_interval(interval: str) -> str:
 # === ROUTES ===
 
 @router.get("/events")
-async def search_events_get(
+def search_events_get(
     duration_minutes: int = 120,
     min_percent: float = 5.0,
     max_percent: float = 999999.0,
@@ -215,7 +216,7 @@ async def search_events_get(
     }
 
 @router.post("/events")
-async def search_events(request: EventSearchRequest, current_user: dict = Depends(get_current_user)):
+def search_events(request: EventSearchRequest, current_user: dict = Depends(get_current_user)):
     if request.duration_minutes not in ALLOWED_DURATIONS:
         raise HTTPException(status_code=400, detail=f"Invalid duration_minutes. Allowed: {ALLOWED_DURATIONS}")
     
@@ -362,52 +363,57 @@ async def get_candles(
         raise HTTPException(status_code=400, detail="Invalid datetime format")
     
     table = get_table_for_interval(interval)
-    with get_coins_db() as conn:
-        with conn.cursor() as cur:
-            query = f"""
-                SELECT open_time as time, open, high, low, close, volume, trades,
-                       quote_asset_volume, taker_buy_base, taker_buy_quote,
-                       funding, open_interest, premium, oracle_px, mark_px, mid_px,
-                       bbo_bid_px, bbo_ask_px, bbo_bid_sz, bbo_ask_sz,
-                       spread_bps, book_imbalance_5, book_depth_5
-                FROM {table}
-                WHERE symbol = %s AND open_time >= %s AND open_time <= %s
-                ORDER BY open_time
-            """
-            cur.execute(query, (symbol, start_dt, end_dt))
-            rows = cur.fetchall()
 
-    def _fnum(v):
-        return float(v) if v is not None else None
+    def _query():
+        with get_coins_db() as conn:
+            with conn.cursor() as cur:
+                query = f"""
+                    SELECT open_time as time, open, high, low, close, volume, trades,
+                           quote_asset_volume, taker_buy_base, taker_buy_quote,
+                           funding, open_interest, premium, oracle_px, mark_px, mid_px,
+                           bbo_bid_px, bbo_ask_px, bbo_bid_sz, bbo_ask_sz,
+                           spread_bps, book_imbalance_5, book_depth_5
+                    FROM {table}
+                    WHERE symbol = %s AND open_time >= %s AND open_time <= %s
+                    ORDER BY open_time
+                """
+                cur.execute(query, (symbol, start_dt, end_dt))
+                rows = cur.fetchall()
 
-    candles = []
-    for row in rows:
-        candles.append({
-            "time": int(row['time'].timestamp()),
-            "open": _fnum(row['open']),
-            "high": _fnum(row['high']),
-            "low": _fnum(row['low']),
-            "close": _fnum(row['close']),
-            "volume": _fnum(row['volume']),
-            "trades": int(row['trades'] or 0),
-            "quote_asset_volume": _fnum(row['quote_asset_volume']),
-            "taker_buy_base": _fnum(row['taker_buy_base']),
-            "taker_buy_quote": _fnum(row['taker_buy_quote']),
-            "funding": _fnum(row.get('funding')),
-            "open_interest": _fnum(row.get('open_interest')),
-            "premium": _fnum(row.get('premium')),
-            "oracle_px": _fnum(row.get('oracle_px')),
-            "mark_px": _fnum(row.get('mark_px')),
-            "mid_px": _fnum(row.get('mid_px')),
-            "bbo_bid_px": _fnum(row.get('bbo_bid_px')),
-            "bbo_ask_px": _fnum(row.get('bbo_ask_px')),
-            "bbo_bid_sz": _fnum(row.get('bbo_bid_sz')),
-            "bbo_ask_sz": _fnum(row.get('bbo_ask_sz')),
-            "spread_bps": _fnum(row.get('spread_bps')),
-            "book_imbalance_5": _fnum(row.get('book_imbalance_5')),
-            "book_depth_5": _fnum(row.get('book_depth_5')),
-        })
-    
+        def _fnum(v):
+            return float(v) if v is not None else None
+
+        candles = []
+        for row in rows:
+            candles.append({
+                "time": int(row['time'].timestamp()),
+                "open": _fnum(row['open']),
+                "high": _fnum(row['high']),
+                "low": _fnum(row['low']),
+                "close": _fnum(row['close']),
+                "volume": _fnum(row['volume']),
+                "trades": int(row['trades'] or 0),
+                "quote_asset_volume": _fnum(row['quote_asset_volume']),
+                "taker_buy_base": _fnum(row['taker_buy_base']),
+                "taker_buy_quote": _fnum(row['taker_buy_quote']),
+                "funding": _fnum(row.get('funding')),
+                "open_interest": _fnum(row.get('open_interest')),
+                "premium": _fnum(row.get('premium')),
+                "oracle_px": _fnum(row.get('oracle_px')),
+                "mark_px": _fnum(row.get('mark_px')),
+                "mid_px": _fnum(row.get('mid_px')),
+                "bbo_bid_px": _fnum(row.get('bbo_bid_px')),
+                "bbo_ask_px": _fnum(row.get('bbo_ask_px')),
+                "bbo_bid_sz": _fnum(row.get('bbo_bid_sz')),
+                "bbo_ask_sz": _fnum(row.get('bbo_ask_sz')),
+                "spread_bps": _fnum(row.get('spread_bps')),
+                "book_imbalance_5": _fnum(row.get('book_imbalance_5')),
+                "book_depth_5": _fnum(row.get('book_depth_5')),
+            })
+        return candles
+
+    candles = await asyncio.to_thread(_query)
+
     return {"symbol": symbol, "interval": interval, "candles": candles, "count": len(candles)}
 
 
@@ -426,7 +432,7 @@ class PreCandlesRequest(BaseModel):
     time_end_minutes: Optional[int] = None
 
 @router.post("/pre-candles")
-async def get_pre_event_candles(
+def get_pre_event_candles(
     request: PreCandlesRequest,
     current_user: dict = Depends(get_current_user)
 ):
@@ -556,7 +562,7 @@ async def cascade_filter(
 
 
 @router.get("/day-open")
-async def get_day_open(
+def get_day_open(
     symbol: str,
     date: str,  # YYYY-MM-DD in Berlin TZ
     current_user: dict = Depends(get_current_user)

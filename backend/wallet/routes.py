@@ -218,7 +218,7 @@ async def get_wallet_balance(current_user: dict = Depends(get_current_user)):
 
 
 @router.get("/positions")
-async def get_wallet_positions(current_user: dict = Depends(get_current_user)):
+def get_wallet_positions(current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
     client = get_user_binance_client(user_id)
     if not client:
@@ -382,7 +382,7 @@ async def create_order(request: CreateOrderRequest, current_user: dict = Depends
 
 
 @router.get("/history")
-async def get_trade_history(days: int = 30, limit: int = 500, current_user: dict = Depends(get_current_user)):
+def get_trade_history(days: int = 30, limit: int = 500, current_user: dict = Depends(get_current_user)):
     user_id = current_user['user_id']
     from datetime import datetime, timezone
     cutoff_ms = int((time.time() - days * 86400) * 1000)
@@ -648,7 +648,7 @@ class ConvertRequest(BaseModel):
 
 
 @router.post("/convert-usdc")
-async def convert_usdc_to_usdt(request: ConvertRequest, current_user: dict = Depends(get_current_user)):
+def convert_usdc_to_usdt(request: ConvertRequest, current_user: dict = Depends(get_current_user)):
     """USDC → USDT per Binance Convert API (gebührenfrei, EU-kompatibel)"""
     client = get_user_binance_client(current_user['user_id'])
     if not client:
@@ -789,7 +789,7 @@ async def get_hl_balance(current_user: dict = Depends(get_current_user)):
 
 
 @router.get("/hl/positions")
-async def get_hl_positions(current_user: dict = Depends(get_current_user)):
+def get_hl_positions(current_user: dict = Depends(get_current_user)):
     address = get_user_hl_address(current_user['user_id'])
     if not address:
         return {"error": "Kein gültiger Hyperliquid Key konfiguriert"}
@@ -938,7 +938,7 @@ class HLTimeoutToggle(BaseModel):
 
 
 @router.post("/hl/positions/{coin}/{side}/timeout")
-async def toggle_hl_position_timeout(coin: str, side: str, body: HLTimeoutToggle,
+def toggle_hl_position_timeout(coin: str, side: str, body: HLTimeoutToggle,
                                        current_user: dict = Depends(get_current_user)):
     """Toggelt timeout_enabled der offenen trader_positions-Row fuer (coin, side).
     Trader-Welt only — keine Auswirkung auf open_predictions oder HL-Orders."""
@@ -1050,7 +1050,7 @@ async def update_hl_tp(request: HLUpdateTPRequest, current_user: dict = Depends(
 
 
 @router.post("/hl/close")
-async def close_hl_positions(request: HLCloseRequest, current_user: dict = Depends(get_current_user)):
+def close_hl_positions(request: HLCloseRequest, current_user: dict = Depends(get_current_user)):
     """Schließt ausgewählte HL-Positionen manuell — alle Coins parallel.
 
     Nutzt safe_close_position_hl (10.05.2026): close + cancel_all_orders + verify.

@@ -20,7 +20,7 @@ class GroupUpdate(BaseModel):
     color: Optional[str] = None
 
 @router.get("")
-async def get_groups(current_user: dict = Depends(get_current_user)):
+def get_groups(current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -36,7 +36,7 @@ async def get_groups(current_user: dict = Depends(get_current_user)):
     return {"groups": [dict(g) for g in groups]}
 
 @router.post("")
-async def create_group(request: GroupCreate, current_user: dict = Depends(get_current_user)):
+def create_group(request: GroupCreate, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("INSERT INTO coin_groups (user_id, name, color) VALUES (%s, %s, %s) RETURNING group_id",
@@ -46,7 +46,7 @@ async def create_group(request: GroupCreate, current_user: dict = Depends(get_cu
     return {"id": group_id, "name": request.name, "color": request.color}
 
 @router.put("/{group_id}")
-async def update_group(group_id: int, request: GroupUpdate, current_user: dict = Depends(get_current_user)):
+def update_group(group_id: int, request: GroupUpdate, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT user_id FROM coin_groups WHERE group_id = %s", (group_id,))
@@ -67,7 +67,7 @@ async def update_group(group_id: int, request: GroupUpdate, current_user: dict =
     return {"message": "Group updated"}
 
 @router.delete("/{group_id}")
-async def delete_group(group_id: int, current_user: dict = Depends(get_current_user)):
+def delete_group(group_id: int, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM coin_groups WHERE group_id = %s AND user_id = %s RETURNING group_id",
@@ -78,7 +78,7 @@ async def delete_group(group_id: int, current_user: dict = Depends(get_current_u
     return {"message": "Group deleted"}
 
 @router.post("/{group_id}/coins")
-async def add_coins_to_group(group_id: int, symbols: List[str], current_user: dict = Depends(get_current_user)):
+def add_coins_to_group(group_id: int, symbols: List[str], current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT user_id FROM coin_groups WHERE group_id = %s", (group_id,))
@@ -91,7 +91,7 @@ async def add_coins_to_group(group_id: int, symbols: List[str], current_user: di
     return {"message": f"Added {len(symbols)} coins"}
 
 @router.delete("/{group_id}/coins/{symbol}")
-async def remove_coin_from_group(group_id: int, symbol: str, current_user: dict = Depends(get_current_user)):
+def remove_coin_from_group(group_id: int, symbol: str, current_user: dict = Depends(get_current_user)):
     with get_app_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT user_id FROM coin_groups WHERE group_id = %s", (group_id,))
