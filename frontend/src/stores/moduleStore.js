@@ -22,7 +22,8 @@ const AVAILABLE_MODULES = [
   { id: 'momentum', label: 'Momentum Scanner' },
   { id: 'rlagent', label: 'RL-Agent' },
   { id: 'seqshadow', label: 'Sequenz-Shadow' },
-  { id: 'reachshadow', label: 'Reach-Predictor' },
+  { id: 'nnfpredictor', label: 'nnf-Predictor (2 Varianten)' },
+  { id: 'claudewallet', label: 'Claude Wallet' },
 ]
 
 export const useModuleStore = create(persist((set, get) => ({

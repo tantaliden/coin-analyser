@@ -16,7 +16,8 @@ import BotModule from '../modules/bot/BotModule'
 import MomentumModule from '../modules/MomentumModule'
 import RLAgentModule from '../modules/RLAgentModule'
 import SeqShadowModule from '../modules/SeqShadowModule'
-import ReachShadowModule from '../modules/ReachShadowModule'
+import NnfPredictorModule from '../modules/NnfPredictorModule'
+import ClaudeWalletModule from '../modules/ClaudeWalletModule'
 
 const ResponsiveGridLayout = WidthProvider(Responsive)
 
@@ -31,7 +32,8 @@ const MODULE_COMPONENTS = {
   momentum: MomentumModule,
   rlagent: RLAgentModule,
   seqshadow: SeqShadowModule,
-  reachshadow: ReachShadowModule,
+  nnfpredictor: NnfPredictorModule,
+  claudewallet: ClaudeWalletModule,
 }
 
 const MODULE_TITLES = {
@@ -45,7 +47,8 @@ const MODULE_TITLES = {
   momentum: 'Momentum Scanner',
   rlagent: 'RL-Agent',
   seqshadow: 'Sequenz-Shadow',
-  reachshadow: 'Reach-Predictor',
+  nnfpredictor: 'nnf-Predictor (2 Varianten)',
+  claudewallet: 'Claude Wallet',
 }
 
 export default function Dashboard() {
