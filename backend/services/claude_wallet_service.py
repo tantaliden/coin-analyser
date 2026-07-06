@@ -161,6 +161,15 @@ def market_vola(coins, hours):
         log("FALLBACK_TRIGGERED market_vola: keine BTC-agg_1h -> Gate offen"); return None
     return float(r[0])
 
+def btc_trend(coins, hours):
+    """Trailing BTC-Return (%) ueber `hours` — RICHTUNG (nicht Range). Fuer Anti-Chase-Filter."""
+    cur=coins.cursor()
+    cur.execute("SELECT (last(close,bucket)/NULLIF(first(close,bucket),0)-1)*100 FROM agg_1h WHERE symbol='BTC' AND bucket>now()-make_interval(hours=>%s)",(hours,))
+    r=cur.fetchone()
+    if not r or r[0] is None:
+        log("FALLBACK_TRIGGERED btc_trend: keine BTC-agg_1h"); return None
+    return float(r[0])
+
 # ===== v6_squeeze: Funding-Extrem + OI-Anstieg -> overcrowded-Reversal (Derivate-Positionierung) =====
 # Hypothese (NICHT vorab validiert, Vergleichsmodell): funding_z>=+sigma & OI steigt -> Longs ueberfuellt
 # -> SHORT (Long-Squeeze); funding_z<=-sigma & OI steigt -> Shorts ueberfuellt -> LONG (Short-Squeeze).
@@ -346,6 +355,8 @@ def main():
                             if mvola<req: blocked.add(gst)
                     if blocked!=regime_note:
                         log(f"REGIME-GATE: BTC-Vola {mvola}% -> pausiert {sorted(blocked) or 'nichts'}"); regime_note=blocked
+                ac=C.get("anti_chase",{}); ac_on=bool(ac.get("enabled")); ac_skip=float(ac.get("skip_pct",0)) if ac_on else 0.0
+                bt=btc_trend(coins,int(ac["window_hours"])) if ac_on else None
                 opened=0
                 for st,maxo in active.items():
                     held_st=heldby.get(st,set())
@@ -363,6 +374,7 @@ def main():
                     for sym,side,tp_pct,sl_pct,trig in cand:
                         if free<=0: break
                         if sym in recent.get(st,set()): continue   # per-Coin-Cooldown
+                        if ac_on and bt is not None and ((side=='long' and bt>=ac_skip) or (side=='short' and bt<=-ac_skip)): continue   # Anti-Chase: nicht dem gelaufenen BTC-Trend folgen
                         lev=coin_lev(coins,sym,cap)
                         if lev is None: continue
                         px=price_now(coins,sym)
