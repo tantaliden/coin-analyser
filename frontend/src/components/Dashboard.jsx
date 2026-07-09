@@ -18,6 +18,7 @@ import RLAgentModule from '../modules/RLAgentModule'
 import SeqShadowModule from '../modules/SeqShadowModule'
 import NnfPredictorModule from '../modules/NnfPredictorModule'
 import ClaudeWalletModule from '../modules/ClaudeWalletModule'
+import GbmShadowModule from '../modules/GbmShadowModule'
 
 const ResponsiveGridLayout = WidthProvider(Responsive)
 
@@ -34,6 +35,7 @@ const MODULE_COMPONENTS = {
   seqshadow: SeqShadowModule,
   nnfpredictor: NnfPredictorModule,
   claudewallet: ClaudeWalletModule,
+  gbmshadow: GbmShadowModule,
 }
 
 const MODULE_TITLES = {
@@ -49,6 +51,7 @@ const MODULE_TITLES = {
   seqshadow: 'Sequenz-Shadow',
   nnfpredictor: 'nnf-Predictor (2 Varianten)',
   claudewallet: 'Claude Wallet',
+  gbmshadow: 'Cross-Sectional (marktneutral)',
 }
 
 export default function Dashboard() {
