@@ -48,6 +48,7 @@ from reach import router as reach_router
 from nnf import router as nnf_router
 from claudewallet import router as claudewallet_router
 from gbm import router as gbm_router
+from redcandle import router as redcandle_router
 
 # Include routers
 app.include_router(auth_router)
@@ -79,6 +80,7 @@ app.include_router(reach_router)
 app.include_router(nnf_router)
 app.include_router(claudewallet_router)
 app.include_router(gbm_router)
+app.include_router(redcandle_router)
 
 @app.on_event("startup")
 async def _start_hl_ws():

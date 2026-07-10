@@ -25,6 +25,7 @@ const AVAILABLE_MODULES = [
   { id: 'nnfpredictor', label: 'nnf-Predictor (2 Varianten)' },
   { id: 'claudewallet', label: 'Claude Wallet' },
   { id: 'gbmshadow', label: 'Cross-Sectional (marktneutral)' },
+  { id: 'redcandle', label: 'Kapitulations-Bounce (5 rote)' },
 ]
 
 export const useModuleStore = create(persist((set, get) => ({
